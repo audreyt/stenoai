@@ -1,55 +1,55 @@
 ---
 title: "Transcription models"
-description: "Steno transcribes on-device with one of two engines: Parakeet (the default) and Whisper (optional). Choose the engine that matches your language and workflow needs."
+description: "Apple SpeechTranscriber is the default on macOS 26+, with Parakeet and Whisper fallbacks for other systems and languages."
 ---
 
-Steno transcribes recordings entirely on your Mac -- no audio is sent to any server. There are two transcription engines: **Parakeet**, the default, and **Whisper**, an optional alternate you can switch to in Settings.
+Steno processes audio locally through Apple SpeechTranscriber, Parakeet, or Whisper.
 
-## The two engines
+## The three engines
 
-| Engine | Model | Size | Notes |
-|--------|-------|------|-------|
-| **Parakeet** (default) | `mlx-community/parakeet-tdt-0.6b-v3` | ~572MB | Live transcript while recording; 25 European languages, including English |
-| **Whisper** (optional) | `large-v3-turbo` | ~1.6GB | Full 99-language coverage; transcribes after you stop |
+| Engine | Model storage | Notes |
+|--------|---------------|-------|
+| **Apple SpeechTranscriber** (default on macOS 26+) | System-managed locale assets | Live and batch transcription; 45 locales on the current runtime; no app model download |
+| **Parakeet TDT v3** | ~572MB MLX on Apple Silicon; ~670MB ONNX on Windows | Live transcription; 25 European languages |
+| **Whisper Large V3 Turbo** | ~1.6GB local weight | Post-stop transcription; 99 languages |
 
-**Parakeet** is the default on new installs. It runs via MLX on Apple Silicon and shows a live transcript as you record.
+Apple SpeechTranscriber gives the fork its default path on current Macs. Parakeet and Whisper remain available in **Settings → Transcribe** for portability, unsupported locales, and older systems.
 
-**Whisper** is a single model, `large-v3-turbo`. Choose it in **Settings → Transcribe** when you need a language Parakeet does not cover. Whisper recordings are transcribed only after you stop the recording.
-
-Both engines run 100% on-device.
+All three engines keep audio on the device.
 
 ## How to change engines
 
 1. Open **Settings** in Steno
 2. Select **Transcribe**
-3. Choose **Parakeet** or **Whisper**
-4. If the engine's model is not yet downloaded, Steno will prompt you to download it
+3. Choose **Apple On-Device**, **Parakeet TDT v3**, or **Whisper Large V3 Turbo**
+4. Steno prepares the selected system asset or downloads the selected fallback model when required
 
-The engine is applied to all future recordings. Existing recordings are not re-transcribed automatically -- transcription only runs once, when the recording is first processed.
+The engine applies to future recordings. Changing the language during an active Apple recording restarts the live native lane with the new locale.
 
 ## Speed
 
-Transcription runs on-device and is fast on Apple Silicon. Parakeet additionally shows a live transcript while you record, so notes are ready shortly after you stop. Whisper transcribes after the recording ends rather than during it.
+Apple SpeechTranscriber and Parakeet both produce live text. Whisper transcribes after the recording ends.
 
 ## Language support
 
 Language coverage depends on the engine you choose.
 
-- **Parakeet (default)** transcribes 25 European languages, including English, French, German, Spanish, Italian, Portuguese, Dutch, Russian, and Polish. A curated subset of six (English, French, German, Spanish, Dutch, Portuguese) can be pinned as the summary output language.
-- **Whisper (optional)** covers the full set of **99 languages**, auto-detected. Switch to Whisper for Japanese, Chinese, Korean, Hindi, Arabic, and any language outside Parakeet's set.
+- **Apple SpeechTranscriber** supports 45 locales on the current macOS runtime, including Traditional Chinese (`zh_TW`), Simplified Chinese (`zh_CN`), Japanese, Korean, and multiple European and Indic locales.
+- **Parakeet** covers 25 European languages and remains the live engine on Windows.
+- **Whisper** covers 99 languages for post-stop transcription.
 
-Steno auto-detects the language from the audio -- you do not need to configure this manually.
+Apple `Auto` follows the system locale rather than detecting spoken language. Pin a concrete language when the meeting language differs from the Mac locale.
 
 ## Accuracy tips
 
-- **Record in a quiet environment** -- background noise is the biggest accuracy factor
-- **Use system audio capture** -- capturing both call sides is more accurate than microphone-only for virtual meetings
-- **Switch to Whisper for non-European languages** -- Parakeet covers 25 European languages, including English; Whisper covers the full 99-language set
+- Choose a concrete Apple locale for a consistent meeting language.
+- Capture system audio directly for virtual meetings instead of relying on speaker playback into the microphone.
+- Use Whisper when the required language is outside Apple and Parakeet coverage.
 
 ---
 
 <Accordion title="Which engine should I start with?">
-Start with **Parakeet** (the default). It runs on-device, shows a live transcript while you record, and covers 25 European languages, including English. Switch to **Whisper** in **Settings → Transcribe** if you need a language outside Parakeet's set.
+Start with **Apple On-Device** on macOS 26+. Use Parakeet for its European-language live fallback or Windows, and Whisper for broader post-stop language coverage.
 </Accordion>
 
 <Accordion title="Can I switch engines for future recordings?">
@@ -57,5 +57,5 @@ Yes. Change the engine in **Settings → Transcribe** -- it applies to recording
 </Accordion>
 
 <Accordion title="Does transcription accuracy vary by language?">
-Yes. Parakeet covers 25 European languages, including English, French, German, Spanish, Italian, Dutch, Portuguese, Russian, and Polish. For other languages -- including Japanese, Chinese, Korean, Hindi, and Arabic -- switch to the Whisper engine, which covers all 99 languages.
+Yes. Coverage and accuracy vary by locale and engine. Pin the Apple locale when you know the meeting language; switch to Parakeet or Whisper when that language is outside the available Apple set.
 </Accordion>

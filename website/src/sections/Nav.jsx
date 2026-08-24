@@ -5,7 +5,7 @@ import { StenoMark, Wordmark } from "../components/Brand";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { trackDownload, trackGitHub } from "../analytics";
 
-const GITHUB_URL = "https://github.com/stenolabs/stenoai";
+const GITHUB_URL = "https://github.com/audreyt/stenoai";
 
 // Plain in-page hash links. Product + Enterprise are dropdowns (below), so the
 // only flat top-level link left is FAQ. Compare lives in the footer only.
@@ -185,7 +185,7 @@ export function Nav({ subpage = false }) {
   }, []);
 
   useEffect(() => {
-    fetch("https://api.github.com/repos/stenolabs/stenoai")
+    fetch("https://api.github.com/repos/audreyt/stenoai")
       .then(r => r.json())
       .then(d => { if (d.stargazers_count != null) setStars(d.stargazers_count); })
       .catch(() => {});

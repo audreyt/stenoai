@@ -311,3 +311,49 @@ test('the mock sample clip is long enough for a playing state to be observable',
     `the fixture clip is ${match[1]}s; under ~2s the "toggling to stop" assertion races the ended event`,
   );
 });
+
+test('get-live-transcript-state and query-live-transcript-stream gate access to mainWindow.webContents', () => {
+  const getStateIndex = MAIN.indexOf("ipcMain.handle('get-live-transcript-state',");
+  assert.ok(getStateIndex >= 0, 'expected get-live-transcript-state handler in main.js');
+  const getStateBlock = MAIN.slice(getStateIndex, getStateIndex + 500);
+  assert.match(
+    getStateBlock,
+    /event\.sender\s*!==\s*mainWindow\.webContents/,
+    'get-live-transcript-state must verify event.sender === mainWindow.webContents',
+  );
+
+  const queryLiveIndex = MAIN.indexOf("ipcMain.on('query-live-transcript-stream',");
+  assert.ok(queryLiveIndex >= 0, 'expected query-live-transcript-stream handler in main.js');
+  const queryLiveBlock = MAIN.slice(queryLiveIndex, queryLiveIndex + 500);
+  assert.match(
+    queryLiveBlock,
+    /sender\s*!==\s*mainWindow\.webContents/,
+    'query-live-transcript-stream must verify event.sender === mainWindow.webContents',
+  );
+});
+
+test('query-live-transcript-stream passes no user question in argv', () => {
+  const queryLiveIndex = MAIN.indexOf("ipcMain.on('query-live-transcript-stream',");
+  const queryLiveBlock = MAIN.slice(queryLiveIndex, queryLiveIndex + 1600);
+  assert.match(
+    queryLiveBlock,
+    /\['query-live-streaming',\s*'--host',\s*LIVE_QUERY_HOST,\s*'--model',\s*LIVE_QUERY_MODEL\]/,
+    'query-live-streaming spawn must use fixed command, host, and model args without question in argv',
+  );
+  assert.doesNotMatch(
+    queryLiveBlock,
+    /\['query-live-streaming'.*?-q/,
+    'query-live-streaming spawn must not contain -q flag',
+  );
+});
+
+test('query-cancel enforces owner binding for live queries', () => {
+  const cancelIndex = MAIN.indexOf("ipcMain.on('query-cancel',");
+  assert.ok(cancelIndex >= 0, 'expected query-cancel handler in main.js');
+  const cancelBlock = MAIN.slice(cancelIndex, cancelIndex + 1000);
+  assert.match(
+    cancelBlock,
+    /activeLiveQuery\.sender\s*===\s*sender/,
+    'query-cancel must verify activeLiveQuery.sender === sender',
+  );
+});

@@ -2,7 +2,7 @@
 name: steno
 description: >
   Make the agent aware of the user's Steno meeting notes and able to pull them in
-  on request. Steno (https://github.com/stenolabs/stenoai) records, transcribes,
+  on request. Steno (https://github.com/audreyt/stenoai) records, transcribes,
   and summarizes meetings entirely on-device, storing each as a Markdown summary
   plus a transcript. This skill locates that store cross-platform (macOS,
   Windows, Linux, and a custom storage path like iCloud) and reads it — then uses

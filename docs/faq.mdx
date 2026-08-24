@@ -64,7 +64,7 @@ Steno's Windows alpha builds are not digitally signed yet. Windows SmartScreen f
 </Accordion>
 
 <Accordion title="How much disk space does Steno need?">
-The default setup uses roughly 7GB: the Parakeet transcription model (~572MB) plus the default Gemma summarization model. Plan for around 8GB free during install. Larger summarization models take more space. Recordings accumulate over time in `~/Library/Application Support/stenoai/recordings/` (macOS) or `%APPDATA%\stenoai\recordings\` (Windows).
+The maintained macOS 26+ profile needs roughly 6.1GB for `ornith-1.5:9b`; Apple manages SpeechTranscriber assets in system storage. Parakeet or Whisper add their own weights only when you select those fallbacks. Recordings accumulate under `~/Library/Application Support/stenoai/recordings/` (macOS) or `%APPDATA%\stenoai\recordings\` (Windows).
 </Accordion>
 
 <Accordion title="How do I update Steno?">
@@ -100,7 +100,7 @@ No. Steno captures audio from your Mac's audio system without joining the call a
 ## Transcription and summaries
 
 <Accordion title="Transcription is slow -- how do I speed it up?">
-Steno defaults to the Parakeet engine, which is fast on Apple Silicon and shows a live transcript while you record. If you have switched to the Whisper engine in **Settings → Transcribe**, switching back to Parakeet is usually faster; Whisper transcribes only after you stop recording.
+On macOS 26+, Apple SpeechTranscriber is the default and produces live text. Pin the meeting language instead of `Auto` when it differs from the Mac system locale. Parakeet is the live fallback on older macOS versions and Windows; Whisper runs post-stop.
 </Accordion>
 
 <Accordion title="The summary is missing key points from my meeting -- what should I try?">
@@ -108,13 +108,13 @@ Switch to a larger summarization model. In **Settings → AI**, try `qwen3.5:9b`
 </Accordion>
 
 <Accordion title="Can Steno transcribe recordings in languages other than English?">
-Yes. The default Parakeet engine transcribes 25 European languages, including English, French, German, Spanish, Italian, Dutch, Portuguese, Russian, and Polish. A curated subset of six (English, French, German, Spanish, Dutch, Portuguese) is available to pin as the summary output language. For Japanese, Chinese, Korean, Hindi, Arabic, and the full set of 99 languages, switch to the Whisper engine in **Settings → Transcribe**, which auto-detects the language from the audio.
+Yes. Apple SpeechTranscriber exposes 45 locales on the current runtime, including Traditional and Simplified Chinese, Japanese, Korean, several European languages, and several Indic languages. Parakeet covers 25 European languages; Whisper provides 99-language post-stop coverage. Choose the engine and language in **Settings → Transcribe**.
 </Accordion>
 
 ## Models
 
 <Accordion title="What models does Steno use?">
-Transcription: two on-device engines -- Parakeet (the default) and [Whisper](https://github.com/ggerganov/whisper.cpp) (optional, its single `large-v3-turbo` model), selected in **Settings → Transcribe**. Summarization: a local model via [Ollama](https://ollama.com), with `gemma4:e2b-it-qat` as the default. See [Transcription models](/models/transcription-models) and [Summarization models](/models/summarization-models) for the full comparison.
+Transcription: Apple SpeechTranscriber (default on macOS 26+), Parakeet (live fallback and Windows), or [Whisper](https://github.com/ggerganov/whisper.cpp) (99-language post-stop fallback). Summary and in-meeting chat: the maintained profile uses self-hosted `ornith-1.5:9b` at `127.0.0.1:11443`. See [Transcription models](/models/transcription-models) and [Summarization models](/models/summarization-models).
 </Accordion>
 
 <Accordion title="Can I use OpenAI or Claude for summarization?">

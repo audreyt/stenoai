@@ -1658,7 +1658,7 @@ def set_whisper_model_cmd(model_size: str):
 
 @cli.command(name='get-transcription-engine')
 def get_transcription_engine_cmd():
-    """Get the active ASR engine ('parakeet' or 'whisper')."""
+    """Get the active ASR engine."""
     from src.config import get_config
     config = get_config()
     print(json.dumps({
@@ -1682,6 +1682,29 @@ def set_transcription_engine_cmd(engine: str):
             "valid_engines": list(config.VALID_TRANSCRIPTION_ENGINES),
         }))
 
+
+@cli.command(name='apple-speech-status')
+@click.argument('language', required=False, default='auto')
+def apple_speech_status_cmd(language: str):
+    """Report Apple SpeechTranscriber availability and asset state."""
+    from src.apple_speech import status
+    try:
+        print(json.dumps(status(language)))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+        sys.exit(1)
+
+
+@cli.command(name='prepare-apple-speech')
+@click.argument('language', required=False, default='auto')
+def prepare_apple_speech_cmd(language: str):
+    """Install the system-managed Apple speech asset when needed."""
+    from src.apple_speech import prepare
+    try:
+        print(json.dumps(prepare(language)))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+        sys.exit(1)
 
 @cli.command(name='list-parakeet-models')
 def list_parakeet_models_cmd():
@@ -4028,6 +4051,186 @@ def query_streaming(transcript_file, question):
     except Exception as e:
         print(f"CHAT_STREAM_ERROR:{e}", flush=True)
 
+MAX_LIVE_QUERY_STDIN_BYTES = 105_000
+MAX_LIVE_QUERY_TRANSCRIPT_CHARS = 100_000
+MAX_LIVE_QUERY_QUESTION_CHARS = 2_000
+MAX_LIVE_QUERY_ANSWER_BYTES = 1024 * 1024  # 1 MiB
+
+
+class LiveQueryRemoteSummarizer(OllamaSummarizer):
+    """Summarizer bound to an explicit Ollama-compatible endpoint for the
+    live AskBar query path.
+
+    Reuses OllamaSummarizer's query-prompt building, per-model ``num_ctx``
+    options, and the remote-provider streaming path, but is pointed at a
+    caller-supplied host/model rather than the persisted remote-ollama config.
+    It therefore never warms the local 11434 server (``_ensure_ollama_ready``
+    is never called) and never reads or mutates any stored setting: the live
+    query is a throwaway, one-shot client.
+    """
+
+    def __init__(self, host: str, model: str, config=None):
+        from src.config import get_config
+        if config is None:
+            config = get_config()
+        self.client = None
+        self.ollama_process = None
+        # The explicit remote endpoint. `stream_live_query` builds the
+        # ollama.Client pointed at this host when it streams, so we never
+        # call the local default host (11434) here, and get_remote_ollama_url()
+        # is never read or changed — the live query never mutates persisted
+        # settings.
+        self.remote_url = host
+        self.ai_provider = "remote"
+        self.model_name = model
+        logger.info("Live query initialized: host=%s model=%s", host, model)
+
+    def stream_live_query(self, transcript: str, question: str, language: str = "en"):
+        """Direct Ollama stream without exception-swallowing or chunk conversion."""
+        try:
+            from src import summarizer
+            ollama_module = getattr(summarizer, "ollama", None)
+        except Exception:
+            ollama_module = None
+        if ollama_module is None:
+            import ollama as ollama_module
+        if ollama_module is None:
+            raise RuntimeError("Ollama module is not available")
+
+        prompt = self._build_query_prompt(transcript, question, language)
+        client = ollama_module.Client(host=self.remote_url)
+        stream = client.chat(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+            options=self._ollama_options(),
+        )
+        for chunk in stream:
+            if isinstance(chunk, dict):
+                message = chunk.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+            else:
+                message = getattr(chunk, "message", None)
+                content = getattr(message, "content", None)
+            if content is None:
+                raise ValueError("Malformed chunk from Ollama stream")
+            if not isinstance(content, str):
+                raise ValueError("Malformed content from Ollama stream")
+            if content:
+                yield content
+
+
+@cli.command(name='query-live-streaming')
+@click.option('--host', default='http://127.0.0.1:11443',
+              help='Ollama-compatible endpoint host for the live query')
+@click.option('--model', default='ornith-1.5:9b',
+              help='Ollama model name for the live query')
+def query_live_streaming(host, model):
+    """Answer a question from the finalized live transcript.
+
+    Reads a bounded JSON payload ``{"transcript": "...", "question": "..."}``
+    from stdin and asks the question via an explicit Ollama-compatible endpoint
+    (default http://127.0.0.1:11443, model ornith-1.5:9b). Streams the answer
+    as ``CHAT_CHUNK:<base64>`` lines, then ``CHAT_STREAM_COMPLETE`` (or
+    ``CHAT_STREAM_ERROR`` on failure). The transcript and question are passed
+    only via bounded stdin and are never written to argv, logs, or error text.
+    """
+    import sys
+    import json
+    import base64
+
+    try:
+        raw_payload = sys.stdin.read(MAX_LIVE_QUERY_STDIN_BYTES + 1)
+    except Exception:
+        raw_payload = ""
+
+    if not raw_payload or not raw_payload.strip():
+        print(
+            "CHAT_STREAM_ERROR:Empty live transcript (nothing to query)",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if len(raw_payload) > MAX_LIVE_QUERY_STDIN_BYTES:
+        print(
+            "CHAT_STREAM_ERROR:Live query payload exceeds maximum length",
+            flush=True,
+        )
+        sys.exit(1)
+
+    try:
+        data = json.loads(raw_payload)
+    except Exception:
+        print(
+            "CHAT_STREAM_ERROR:Invalid live query payload",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        print(
+            "CHAT_STREAM_ERROR:Invalid live query payload",
+            flush=True,
+        )
+        sys.exit(1)
+
+    transcript = data.get("transcript")
+    question = data.get("question")
+
+    if not isinstance(transcript, str) or not transcript.strip():
+        print(
+            "CHAT_STREAM_ERROR:Empty live transcript (nothing to query)",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if not isinstance(question, str) or not question.strip():
+        print(
+            "CHAT_STREAM_ERROR:Empty live query question",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if len(transcript) > MAX_LIVE_QUERY_TRANSCRIPT_CHARS:
+        print(
+            "CHAT_STREAM_ERROR:Live transcript exceeds maximum length",
+            flush=True,
+        )
+        sys.exit(1)
+
+    if len(question) > MAX_LIVE_QUERY_QUESTION_CHARS:
+        print(
+            "CHAT_STREAM_ERROR:Live query question exceeds maximum length",
+            flush=True,
+        )
+        sys.exit(1)
+
+    from src.config import get_config
+
+    # Reuse the same language resolution the query prompt uses so the live
+    # answer respects the user's language pin / detection like every other path.
+    language = resolve_output_language(
+        get_config().get_language(), None, transcript.strip()
+    )
+
+    try:
+        summarizer = LiveQueryRemoteSummarizer(host, model)
+        total_answer_bytes = 0
+        for chunk in summarizer.stream_live_query(
+            transcript.strip(), question.strip(), language=language
+        ):
+            chunk_bytes = chunk.encode('utf-8')
+            total_answer_bytes += len(chunk_bytes)
+            if total_answer_bytes > MAX_LIVE_QUERY_ANSWER_BYTES:
+                raise ValueError("Live query answer exceeded size limit")
+            encoded = base64.b64encode(chunk_bytes).decode('ascii')
+            sys.stdout.write(f"CHAT_CHUNK:{encoded}\n")
+            sys.stdout.flush()
+        print("CHAT_STREAM_COMPLETE", flush=True)
+    except Exception:
+        logger.error("Live query streaming failed")
+        print("CHAT_STREAM_ERROR:Live query failed", flush=True)
+        sys.exit(1)
 
 def _chat_corpus_char_budget(ai_provider: str, model: str) -> int:
     """Char budget for the cross-note chat corpus, sized to the active model.

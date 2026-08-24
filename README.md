@@ -3,79 +3,70 @@
 
   # Steno
 
-  *Your private stenographer*
+  *Apple-native meeting notes with live local AI*
 </div>
 
 <p align="center">
-  <a href="https://github.com/stenolabs/stenoai/actions/workflows/build-release.yml"><img src="https://img.shields.io/github/actions/workflow/status/stenolabs/stenoai/build-release.yml?style=for-the-badge" alt="Build"></a>
-  <a href="https://github.com/stenolabs/stenoai/releases"><img src="https://img.shields.io/github/v/release/stenolabs/stenoai?style=for-the-badge" alt="Release"></a>
-  <a href="https://discord.gg/DZ6vcQnxxu"><img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://github.com/audreyt/stenoai/actions/workflows/build-release.yml"><img src="https://img.shields.io/github/actions/workflow/status/audreyt/stenoai/build-release.yml?style=for-the-badge" alt="Build"></a>
+  <a href="https://github.com/audreyt/stenoai/releases"><img src="https://img.shields.io/github/v/release/audreyt/stenoai?style=for-the-badge" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="License"></a>
-  <img src="https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/macOS%2026+-Apple%20Speech-000000?style=for-the-badge&logo=apple&logoColor=white" alt="macOS 26+ Apple Speech">
   <img src="https://img.shields.io/badge/Windows-alpha-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Windows (alpha)">
-  <a href="#sponsors"><img src="https://img.shields.io/badge/Sponsors-%E2%9D%A4-EA4AAA?style=for-the-badge" alt="Sponsors"></a>
 </p>
 
-<p align="center">Steno is the privacy-first AI notepad for all your confidential conversations. No cloud, no usage limits and your private data never leaves your premises. Record, transcribe, summarize, and query your meetings using local AI models. Perfect for government, defence and C-suite professionals with confidential data needs.</p>
+> [!IMPORTANT]
+> This is [Audrey Tang's maintained fork](https://github.com/audreyt/stenoai) of [stenolabs/stenoai](https://github.com/stenolabs/stenoai). It keeps the upstream file format and cross-platform fallbacks while focusing on Apple-native transcription, Traditional Chinese, and live local AI during meetings.
 
-<p align="center"><sub>Trusted by teams at <b>AWS</b>, <b>Deliveroo</b>, <b>Tesco</b>, <b>Hashicorp</b>, <b>Rutgers</b> & <b>European Union</b>.</sub></p>
+Steno records microphone and system audio, builds a local transcript, and keeps the meeting open as a working surface while you talk. On macOS 26 and later, Apple's system-managed SpeechTranscriber handles live and batch transcription without downloading ASR weights. The Ask bar works during the meeting and queries finalized speech through a user-owned Ollama-compatible service.
+
+This fork's maintained local profile uses `ornith-1.5:9b` at `http://127.0.0.1:11443` for both summaries and live-meeting chat. Audio never goes to that service. Transcript text does, over loopback, when you request a summary or ask a question.
 
 <div align="center">
   <picture>
     <source srcset="website/public/demo.gif" type="image/gif">
     <img src="website/public/readme.png" alt="Steno" width="800">
   </picture>
-
-  <br>
-
-  [![Twitter Follow](https://img.shields.io/twitter/follow/ruzin?style=social)](https://x.com/ruzin_saleem)
 </div>
 
-<p align="center"><sub>Sponsored by <b>Gitlab Founder's Open Core Ventures</b>.</sub></p>
+## Fork focus
 
-<p align="center"><sub><i>Disclaimer: This is an independent open-source project for meeting-notes productivity and is not affiliated with, endorsed by, or associated with any similarly named company.</i></sub></p>
+- **Apple SpeechTranscriber** on macOS 26+, with no application-managed transcription model.
+- **Traditional Chinese that switches live** by restarting the active native speech lane on `zh_TW`.
+- **Ask while recording** over the finalized live transcript, with streaming answers and cancellation.
+- **Self-hosted Ornith** for summary and chat through a fixed loopback endpoint.
+- **Upstream compatibility** for Markdown notes, Parakeet and Whisper fallbacks, Windows, and organisation adapters.
 
-## Sponsors
+## Upstream credit
 
-### Recall.ai - API for desktop recording
+Steno was created by the [Steno team](https://github.com/stenolabs/stenoai) and remains available under the MIT license. This fork preserves upstream notices and contribution history. Report fork-specific issues at [audreyt/stenoai/issues](https://github.com/audreyt/stenoai/issues).
 
-If you're looking for a hosted desktop recording API, consider checking out [Recall.ai](https://www.recall.ai/product/desktop-recording-sdk?utm_source=github&utm_medium=sponsorship&utm_campaign=ruzin-stenoai), an API that records Zoom, Google Meet, Microsoft Teams, in-person meetings, and more.
+## What's new in this fork
 
-## 📢 What's New
-- **2026-08-04** 💎 Sync to Obsidian — mirror your notes into an Obsidian vault folder as Markdown. Turn it on in Settings → Integrations and pick a vault folder. One-way (Steno → vault); notes you edit in Obsidian are never overwritten.
-- **2026-08-03** 🔔 One-tap meeting notes — "Take Notes" starts recording instantly, meetings auto-stop when they end, and a single "Summarise?" tap opens the note and generates it. Recordings are transcript-first now — turn on auto-summarise in Settings → AI for automatic notes.
-- **2026-07-26** 🎙️ System audio without Screen Recording — record both sides of a call with no Screen Recording permission. Now requires macOS 14.4 or later.
-- **2026-07-26** ⬇️ Automatic updates — Steno installs a downloaded update while you're idle and relaunches, never mid-recording. Turn it off in Settings to keep the manual prompt.
-
+- **2026-08-24: Apple-native transcription.** SpeechTranscriber is the default on supported Macs. The system manages its locale assets, so setup does not pull Parakeet.
+- **2026-08-24: Traditional Chinese live switching.** Changing the language during a recording drains and restarts the native sidecar with `zh_TW`; punctuation-only hypotheses are discarded.
+- **2026-08-24: Chat during meetings.** The existing Ask bar now streams answers from the finalized live transcript while recording or paused.
+- **2026-08-24: Ornith local profile.** Summaries and live chat share `ornith-1.5:9b` at `127.0.0.1:11443`.
+- **2026-08-04: Obsidian sync.** Mirror notes into an Obsidian vault as Markdown without overwriting edits made in Obsidian.
 
 ## Features
 
-- **Privacy-first** — 100% on-device; your recordings, transcripts, and summaries never leave your Mac.
-- **Live transcription with speaker labels** — Real-time on-screen text as you speak via Parakeet TDT v3 on Apple Silicon (MLX). Granola-style chat-bubble view with `[You]` vs `[Others]` attribution live during the recording and on the final transcript.
-- **Auto start/stop meetings** — Steno notices when a meeting starts and offers to take notes, then offers to summarise when it ends. Granola-style frictionless capture.
-- **System audio capture** — Record both sides of virtual meetings, headphones on, no extra setup or virtual cable. Native Core Audio Tap on macOS 14.4+, with selectable microphone input.
-- **Recording that coexists** — A compact transcription pill docks beside the app instead of taking over; Stop lands you on the note instantly and you can resume recording into an existing note (it appends and re-generates on demand).
-- **Global record shortcut** — Start or stop recording from anywhere with `⌘⇧R` (`Ctrl+Shift+R` on Windows). Toggle it off in Settings if it clashes with another app. On macOS, power users can additionally bind any key of their own via the `stenoai://record/start` / `record/stop` deep links (Shortcuts app).
-- **In-app note-taking** — Jot notes while you record, or keep a dedicated **My notes** tab that stays editable alongside the AI summary; your notes are folded straight into the summary.
-- **Ask your meetings** — Natural-language Q&A across a single note *or* your entire library via the Chat tab. Pulls from summary, key topics, and the full transcript.
-- **Multi-language (25 live, 99 total)** — Parakeet covers 25 European languages with live transcription; Whisper handles 99 languages including Chinese, Japanese, Arabic, and Hindi post-stop.
-- **Markdown ownership** — Summaries and transcripts save as clean Markdown you can edit, search, or sync to whatever knowledge base you live in.
-- **Report templates** — Define custom report styles and generate them per meeting; a note can hold multiple reports (the structured summary plus template-driven ones), switchable in the detail view.
-- **Transcript export** — Copy the full transcript or save it as Markdown (with metadata, notes, and speaker labels) to drop into any external tool.
-- **Bring your own cloud model** — Optional OpenAI, Anthropic, AWS Bedrock (Claude — including application inference profile ARNs for governed AWS environments), or custom API endpoint for users who prefer a hosted LLM.
-- **Organisation AI** — On managed deployments, sign in to your org's Steno adapter and AI routes through it automatically — no local API key, no per-user setup.
+- **Local audio and transcription:** microphone and system audio stay on your machine. Apple's speech service runs outside the app process but on the same Mac.
+- **Apple-native live transcription:** SpeechTranscriber provides volatile and final text, timestamps, confidence, and system-managed locale assets on macOS 26+.
+- **Traditional and Simplified Chinese:** explicit `zh_TW` and `zh_CN` locale selection; changing the live language restarts the active native lane instead of leaving it on the previous model.
+- **Chat during the meeting:** ask about decisions, names, and follow-ups before the call ends. Each request snapshots finalized segments, keeps partial hypotheses out, and streams the answer into the existing meeting chat.
+- **Bounded live-query transport:** one trusted main-window query at a time, owner-bound cancellation, recent-first transcript context, fixed size and duration limits, and no question text in process arguments or logs.
+- **Ornith summary and chat:** use the same self-hosted `ornith-1.5:9b` model for both paths through `http://127.0.0.1:11443`.
+- **Speaker-aware capture:** microphone and system channels remain structurally separate as `[You]` and `[Others]`, with optional local diarization.
+- **Recording that coexists:** a compact pill and Ask bar stay available while you work elsewhere in the app.
+- **Parakeet and Whisper fallbacks:** retain upstream engines for older macOS versions, Windows, unsupported Apple locales, and portable deployments.
+- **Markdown ownership:** transcripts, summaries, notes, and reports remain ordinary files under the local Steno data directory.
+- **Obsidian sync, templates, export, calendar automation, and organisation adapters:** upstream workflows remain compatible.
 
 ## Coming from Granola?
 
-If you already use Claude Code / Cowork with a connected Granola MCP, the
-[`granola-to-steno`](skills/granola-to-steno/README.md) skill syncs your Granola
-meeting notes (titles, dates, participants, summaries, and transcripts) into
-Steno's file-based store. It is idempotent and re-runnable, so you can backfill
-your history once and keep it in sync on a schedule. This is an agent skill you
-drop into your skills folder and invoke conversationally ("sync Granola to
-Steno"), not an in-app feature. See
-[`skills/granola-to-steno/README.md`](skills/granola-to-steno/README.md) for
-setup and limitations.
+The [`granola-to-steno`](skills/granola-to-steno/README.md) skill imports Granola titles, dates, participants, summaries, and transcripts into Steno's file store. The import is idempotent and safe to schedule.
+
+This fork also implements Granola's defining in-meeting interaction directly: the Ask bar stays active while recording. It queries only finalized live transcript segments, so you can ask what the group decided without waiting for post-processing.
 
 ## Use your notes from an agent (`/steno`)
 
@@ -164,18 +155,25 @@ This addon uses:
 Have questions or suggestions? [Join our Discord](https://discord.gg/DZ6vcQnxxu) to chat with the community.
 </details>
 
-## Models & Performance
+## Models and routing
 
-**Transcription Models:**
-- `Parakeet TDT v3` (572 MB): Highest quality, supports live transcription, 25 European languages (English, Spanish, French, German, Italian, Portuguese, Dutch, Russian, Polish, Czech, and 15 others). Apple Silicon only via MLX. **(default on fresh installs)**
-- `Whisper Large V3 Turbo` (1.6 GB): Best-accuracy Whisper engine for the languages Parakeet can't speak (Chinese, Japanese, Korean, Arabic, Hindi, and 94 others). Post-stop only.
+**Transcription**
 
-**Summarization Models** (Ollama):
-- `gemma4:e2b-it-qat` (4.3GB): Lightest Gemma 4, quantization-aware, with a real 128K context **(default)**
-- `gemma4:e4b-it-qat` (6.1GB): Quantization-aware E4B — higher quality than E2B at a modest footprint
-- `qwen3.5:9b` (6.6GB): Excellent at structured output and action items
-- `gemma4:12b-it-qat` (7.2GB): Gemma 4 (quantization-aware) with a 256K context — best for long meetings
-- `gpt-oss:20b` (14GB): OpenAI open-weight model with reasoning capabilities
+- **Apple SpeechTranscriber:** default on macOS 26+. System-managed, live and batch, no application model download. The current runtime exposes 45 locales.
+- **Parakeet TDT v3:** downloadable fallback for Apple Silicon and the live engine on Windows through ONNX Runtime.
+- **Whisper Large V3 Turbo:** post-stop fallback for broader language coverage.
+
+**Summary and live-meeting chat**
+
+This fork uses one Ollama-compatible profile for both:
+
+```text
+Provider: remote
+URL:      http://127.0.0.1:11443
+Model:    ornith-1.5:9b
+```
+
+Steno sends only transcript-derived prompts to this endpoint. The live-query path accepts requests only from the trusted main window, caps transcript/question/answer sizes, and reports fixed errors without exposing meeting content in logs.
 
 ## Future Roadmap
 
@@ -184,80 +182,91 @@ Have questions or suggestions? [Join our Discord](https://discord.gg/DZ6vcQnxxu)
 
 ## Installation
 
-Download the latest release (**Apple Silicon Mac, macOS 14.4 or later**):
+Release artifacts will be published at [github.com/audreyt/stenoai/releases](https://github.com/audreyt/stenoai/releases). Until the first fork tag is available, use the local build below.
 
-- [Apple Silicon (M1-M5)](https://github.com/stenolabs/stenoai/releases/latest/download/stenoAI-macos-arm64.dmg)
+Expected artifact names:
 
-> **Intel Mac users**: v0.4.0 is Apple Silicon only. Stay on [v0.3.8](https://github.com/stenolabs/stenoai/releases/tag/v0.3.8) — the last release supporting Intel Macs. Auto-update on existing Intel installs will not push v0.4.0 to those machines.
+- Apple Silicon DMG: `stenoAI-macos-arm64.dmg`
+- Windows x64 installer: `stenoAI-windows-x64.exe` (alpha)
 
-### Installing on macOS
+The app still runs on macOS 14.4 and later, but Apple SpeechTranscriber requires macOS 26. Older systems use the Parakeet or Whisper fallback. Intel users should stay on the upstream project's [v0.3.8](https://github.com/stenolabs/stenoai/releases/tag/v0.3.8).
 
-1. **Download and open the DMG file**
-2. **Drag the app to Applications**
-3. **When you first launch the app**, macOS may show a security warning
-4. **To fix this warning:**
-   - Go to **System Settings > Privacy & Security** and click **"Open Anyway"**
+### Local build
 
-   **Alternatively:**
-   - Right-click Steno in Applications and select **"Open"**
-   - Or run in Terminal: `xattr -cr /Applications/Steno.app`
-5. **The app will work normally on subsequent launches**
+The local artifact is ad-hoc signed and is not a notarized release:
 
-You can run it locally as well (see below) if you don't want to install a DMG.
+```bash
+open app/dist/mac-arm64/Steno.app
+```
 
-### Windows (alpha)
+For a downloaded unsigned build, macOS may require **System Settings → Privacy & Security → Open Anyway**, or:
 
-Windows 10/11 (x64) is supported in **alpha**, with the full pipeline verified working: record → live Parakeet transcription → batch transcript → Ollama summary, **including system-audio loopback capture with `[You]`/`[Others]` diarisation**.
+```bash
+xattr -cr /Applications/Steno.app
+```
 
-**Install:** download **`stenoAI-windows-x64.exe`** from the [latest release](https://github.com/stenolabs/stenoai/releases/latest) and run it — it installs per-user (no admin needed) and creates Start-menu/desktop shortcuts. On first launch, Windows SmartScreen warns because the alpha is unsigned — click **More info → Run anyway**. The first-run setup wizard then downloads the transcription model (~670 MB) and the default summarisation model, Gemma 4 E2B (~4.3 GB).
-
-> Before the first tagged Windows release lands, grab the installer from the [Windows build workflow](https://github.com/stenolabs/stenoai/actions/workflows/build-windows.yml): sign in to GitHub, open the latest green run, download the `stenoai-windows` artifact, and run the `.exe` inside.
-
-Known alpha limitations:
+### Windows alpha
 
 - **Unsigned** — SmartScreen warns on first launch; we'll code-sign before 1.0.
 - **CPU-only summarisation** — the bundled Ollama runs on CPU (the NVIDIA GPU libraries are excluded to keep the download small); a separate GPU build is a follow-up. Transcription is CPU on every platform regardless.
 - **Auto-update** is wired (NSIS + `latest.yml`) but updates are unsigned until code signing is in place.
 - **Transcription** runs through `onnx-asr` (ONNX Runtime) instead of MLX, with the same Parakeet model and behaviour as macOS. Whisper is also available as an engine option.
 
-Issues + feedback welcome on the GitHub issues tracker.
+Issues and feedback belong on the [fork issue tracker](https://github.com/audreyt/stenoai/issues).
 
-## Local Development/Use Locally
+## Local development
 
 ### Prerequisites
-- Python 3.9+
-- Node.js 18+
 
-### Setup
-```bash
-git clone https://github.com/stenolabs/stenoai.git
-cd stenoai
-
-# Backend setup
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Download bundled binaries (Ollama, ffmpeg)
-./scripts/download-ollama.sh
-
-# Build the Python backend
-pip install pyinstaller
-pyinstaller stenoai.spec --noconfirm
-
-# Frontend
-cd app
-npm install
-npm start
-```
-
-Note: Ollama and ffmpeg are bundled - no system installation needed. The setup wizard in the app will download the required AI models automatically.
+- Apple Silicon Mac
+- macOS 26+ and Xcode 26+ for the Apple SpeechTranscriber sidecar
+- Python 3.11 or 3.12
+- Node.js 22
+- Swift toolchain
 
 ### Build
+
 ```bash
+git clone https://github.com/audreyt/stenoai.git
+cd stenoai
+
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt pyinstaller
+
+./scripts/download-ollama.sh
+./scripts/build-mic-monitor.sh arm64
+./scripts/build-diarize-sidecar.sh arm64
+./scripts/build-transcribe-sidecar.sh arm64
+
+PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller" \
+  python -m PyInstaller stenoai.spec --noconfirm
+
+npm --prefix app install
+npm --prefix app run build:renderer
+
 cd app
-npm run build
+ELECTRON_CACHE="$PWD/../.electron-cache" \
+ELECTRON_BUILDER_CACHE="$PWD/../.electron-builder-cache" \
+npm_config_userconfig=/dev/null \
+./node_modules/.bin/electron-builder \
+  --dir --publish=never \
+  --config.mac.identity=- \
+  --config.mac.notarize=false \
+  --config.directories.output=dist
 ```
+
+### Ornith profile
+
+Run an Ollama-compatible service on the fork's dedicated loopback port:
+
+```bash
+ollama pull ornith-1.5:9b
+OLLAMA_HOST=127.0.0.1:11443 ollama serve
+```
+
+Then choose **Private Server** in Settings and set the URL to `http://127.0.0.1:11443`, with `ornith-1.5:9b` as the model. The same route serves summaries and chat during recording.
+
 
 ## Project Structure
 

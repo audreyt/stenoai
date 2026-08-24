@@ -179,6 +179,7 @@ const stenoai = {
   query: {
     ask: (file, q) => invoke('query-transcript', file, q),
     askStream: (id, file, q) => send('query-transcript-stream', id, file, q),
+    askLiveStream: (id, sessionName, q) => send('query-live-transcript-stream', id, sessionName, q),
     chatGlobalStream: (id, q, folderId) => send('chat-global-stream', id, q, folderId ?? null),
     cancel: (id) => send('query-cancel', id),
   },
@@ -253,6 +254,11 @@ const stenoai = {
     list: () => invoke('list-parakeet-models'),
     pull: (id) => invoke('pull-parakeet-model', id ?? null),
     status: () => invoke('parakeet-status'),
+  },
+
+  appleSpeech: {
+    status: (language) => invoke('apple-speech-status', language ?? 'auto'),
+    prepare: (language) => invoke('prepare-apple-speech', language ?? 'auto'),
   },
 
   transcriptionEngine: {

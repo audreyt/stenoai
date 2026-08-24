@@ -69,6 +69,26 @@ const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
 const { userNotesFilePath } = require('./notes-file');
 const { buildNoteReadyNotificationOptions, buildTranscriptReadyBody } = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
+const {
+  MAX_LIVE_QUERY_QUESTION_CHARS,
+  MAX_LIVE_TRANSCRIPT_CHARS,
+  MAX_PROTOCOL_LINE_BYTES,
+  MAX_DECODED_ANSWER_BYTES,
+  LIVE_QUERY_TIMEOUT_MS,
+  LIVE_QUERY_HOST,
+  LIVE_QUERY_MODEL,
+  FIXED_LIVE_QUERY_ERRORS,
+  formatLiveQueryTimestamp,
+  isMeaningfulLiveQueryText,
+  formatLiveTranscriptSegments,
+  validateLiveQueryInputs,
+  buildLiveTranscriptQuerySnapshot,
+} = require('./live-query-helpers');
+const {
+  defaultTranscriptionEngine,
+  normalizeTranscriptionEngine,
+  isLiveTranscriptionEngine,
+} = require('./transcription-engine');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
 // notifications — stays here and calls parseShortcutUrl().
@@ -556,6 +576,19 @@ function getMicMonitorPath() {
   } else {
     return path.join(__dirname, '..', 'bin', binName);
   }
+}
+
+// macOS SpeechTranscriber helper. The PyInstaller COLLECT stage places it
+// beside the backend's other native binaries under _internal; source runs use
+// repo-root bin/. The override keeps T2 tests model-free.
+function getAppleTranscribePath() {
+  if (process.env.STENOAI_TRANSCRIBE_SIDECAR_PATH) {
+    return process.env.STENOAI_TRANSCRIBE_SIDECAR_PATH;
+  }
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'stenoai', '_internal', 'steno-transcribe');
+  }
+  return path.join(__dirname, '..', 'bin', 'steno-transcribe');
 }
 
 function ensureMainWindow() {
@@ -2010,7 +2043,7 @@ if (!gotSingleInstanceLock) {
     const helpSubmenu = {
       role: 'help',
       submenu: [
-        { label: 'Learn More', click: () => shell.openExternal('https://github.com/stenolabs/stenoai') },
+        { label: 'Learn More', click: () => shell.openExternal('https://github.com/audreyt/stenoai') },
         { label: 'Report a Bug', click: () => shell.openExternal('https://discord.gg/DZ6vcQnxxu') }
       ]
     };
@@ -3447,7 +3480,265 @@ ipcMain.handle('query-transcript', async (event, summaryFile, question) => {
   }
 });
 
+
 const activeQueryProcs = new Map();
+let activeLiveQuery = null;
+
+function safeSendQueryPayload(sender, channel, payload) {
+  try {
+    if (sender && !sender.isDestroyed()) sender.send(channel, payload);
+  } catch (_) { /* renderer gone — nothing to notify */ }
+}
+
+function handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup) {
+  if (state.done) return;
+
+  if (line.startsWith('CHAT_CHUNK:')) {
+    try {
+      const chunk = Buffer.from(line.slice('CHAT_CHUNK:'.length), 'base64').toString('utf-8');
+      state.totalDecodedBytes += Buffer.byteLength(chunk, 'utf-8');
+      if (state.totalDecodedBytes > MAX_DECODED_ANSWER_BYTES) {
+        state.done = true;
+        try { proc.kill(); } catch (_) {}
+        safeSendQueryPayload(sender, 'query-done', {
+          queryId,
+          success: false,
+          error: FIXED_LIVE_QUERY_ERRORS.RESPONSE_LIMIT_EXCEEDED,
+        });
+        cleanup();
+        return;
+      }
+      state.chunkCount += 1;
+      safeSendQueryPayload(sender, 'query-chunk', { queryId, chunk });
+      if (sender.isDestroyed()) {
+        state.done = true;
+        try { proc.kill(); } catch (_) {}
+        cleanup();
+      }
+    } catch (_) { /* ignore malformed chunks */ }
+    return;
+  }
+  if (line === 'CHAT_STREAM_COMPLETE') {
+    if (!state.done) {
+      state.done = true;
+      safeSendQueryPayload(sender, 'query-done', { queryId, success: true });
+      cleanup();
+    }
+    return;
+  }
+  if (line.startsWith('CHAT_STREAM_ERROR:')) {
+    if (!state.done) {
+      state.done = true;
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId,
+        success: false,
+        error: line.slice('CHAT_STREAM_ERROR:'.length),
+      });
+      cleanup();
+    }
+  }
+}
+
+ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, question) => {
+  const sender = event?.sender;
+  const done = (payload) => safeSendQueryPayload(sender, 'query-done', { queryId: typeof queryId === 'string' ? queryId : '', ...payload });
+
+  // Gate to trusted mainWindow.webContents
+  if (!mainWindow || mainWindow.isDestroyed() || !sender || sender !== mainWindow.webContents) {
+    done({ success: false, error: FIXED_LIVE_QUERY_ERRORS.UNAUTHORIZED });
+    return;
+  }
+
+  // Validate inputs
+  const validation = validateLiveQueryInputs({ queryId, sessionName, question });
+  if (!validation.valid) {
+    done({ success: false, error: validation.error });
+    return;
+  }
+
+  // Enforce one active live query per trusted sender / global live path
+  if (activeLiveQuery !== null) {
+    done({ success: false, error: FIXED_LIVE_QUERY_ERRORS.QUERY_ALREADY_ACTIVE });
+    return;
+  }
+
+  const snapshot = buildLiveTranscriptQuerySnapshot({
+    sessionName,
+    activeSessionName: currentRecordingSessionName,
+    systemAudioRecordingActive,
+    liveTranscriptState,
+  });
+  if (snapshot.error) {
+    done({ success: false, error: snapshot.error });
+    return;
+  }
+  if (sender.isDestroyed()) return;
+
+  let proc;
+  try {
+    proc = require('child_process').spawn(
+      getBackendPath(),
+      ['query-live-streaming', '--host', LIVE_QUERY_HOST, '--model', LIVE_QUERY_MODEL],
+      {
+        env: { ...process.env },
+        cwd: getBackendCwd(),
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+    );
+  } catch (err) {
+    done({ success: false, error: err.message });
+    return;
+  }
+
+  const state = { done: false, chunkCount: 0, totalDecodedBytes: 0 };
+  let killTimer = null;
+
+  const cleanup = () => {
+    if (killTimer) {
+      clearTimeout(killTimer);
+      killTimer = null;
+    }
+    try {
+      if (!sender.isDestroyed()) sender.removeListener('destroyed', onSenderDestroyed);
+    } catch (_) {}
+    if (activeLiveQuery && activeLiveQuery.queryId === queryId) {
+      activeLiveQuery = null;
+    }
+  };
+
+  const onSenderDestroyed = () => {
+    if (activeLiveQuery && activeLiveQuery.queryId === queryId) {
+      state.done = true;
+      try { proc.kill(); } catch (_) {}
+      cleanup();
+    }
+  };
+  sender.once('destroyed', onSenderDestroyed);
+
+  if (sender.isDestroyed()) {
+    state.done = true;
+    try { proc.kill(); } catch (_) {}
+    cleanup();
+    return;
+  }
+
+  killTimer = setTimeout(() => {
+    if (!state.done) {
+      state.done = true;
+      try { proc.kill('SIGKILL'); } catch (_) {}
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId,
+        success: false,
+        error: FIXED_LIVE_QUERY_ERRORS.TIMEOUT,
+      });
+      cleanup();
+    }
+  }, LIVE_QUERY_TIMEOUT_MS);
+
+  activeLiveQuery = {
+    queryId,
+    sender,
+    proc,
+    state,
+    killTimer,
+    cleanup,
+  };
+
+  let buf = '';
+
+  proc.stdout.on('data', (data) => {
+    if (state.done) return;
+    buf += data.toString();
+    if (Buffer.byteLength(buf, 'utf-8') > MAX_PROTOCOL_LINE_BYTES && !buf.includes('\n')) {
+      state.done = true;
+      try { proc.kill(); } catch (_) {}
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId,
+        success: false,
+        error: FIXED_LIVE_QUERY_ERRORS.LINE_LIMIT_EXCEEDED,
+      });
+      cleanup();
+      return;
+    }
+
+    const lines = buf.split(/\r?\n/);
+    buf = lines.pop();
+    for (const line of lines) {
+      if (state.done) break;
+      if (Buffer.byteLength(line, 'utf-8') > MAX_PROTOCOL_LINE_BYTES) {
+        state.done = true;
+        try { proc.kill(); } catch (_) {}
+        safeSendQueryPayload(sender, 'query-done', {
+          queryId,
+          success: false,
+          error: FIXED_LIVE_QUERY_ERRORS.LINE_LIMIT_EXCEEDED,
+        });
+        cleanup();
+        return;
+      }
+      handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup);
+    }
+  });
+
+  proc.stderr.on('data', () => {
+    // Backend stderr can contain prompt/transcript context; never log it.
+  });
+
+  proc.stdin.on('error', (err) => {
+    if (err && err.code === 'EPIPE') return;
+    if (!state.done) {
+      state.done = true;
+      try { proc.kill(); } catch (_) {}
+      safeSendQueryPayload(sender, 'query-done', { queryId, success: false, error: err.message });
+      cleanup();
+    }
+  });
+
+  try {
+    const payload = JSON.stringify({
+      transcript: snapshot.transcript,
+      question,
+    });
+    proc.stdin.end(payload, 'utf-8');
+  } catch (err) {
+    if (!state.done) {
+      state.done = true;
+      try { proc.kill(); } catch (_) {}
+      safeSendQueryPayload(sender, 'query-done', { queryId, success: false, error: err.message });
+      cleanup();
+    }
+  }
+
+  proc.on('close', (code) => {
+    if (!state.done) {
+      const remainder = buf.trim();
+      if (remainder) {
+        handleLiveQueryProtocolLine(remainder, queryId, sender, proc, state, cleanup);
+      }
+    }
+    if (!state.done) {
+      state.done = true;
+      const payload = code !== 0 && code !== null
+        ? { success: false, error: `Process exited with code ${code}` }
+        : { success: false, error: FIXED_LIVE_QUERY_ERRORS.STREAM_CLOSED };
+      safeSendQueryPayload(sender, 'query-done', { queryId, ...payload });
+    }
+    cleanup();
+  });
+
+  proc.on('error', (err) => {
+    if (!state.done) {
+      state.done = true;
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId,
+        success: false,
+        error: err.message,
+      });
+    }
+    cleanup();
+  });
+});
 
 // Cancellation intent for streaming queries that are still in their pre-spawn
 // async window. query-transcript-stream now `await`s validateMeetingFilePath
@@ -3459,7 +3750,24 @@ const activeQueryProcs = new Map();
 // that flag on every exit path so it never spawns-then-orphans a proc.
 const pendingQueryCancels = new Map();
 
-ipcMain.on('query-cancel', (_event, queryId) => {
+ipcMain.on('query-cancel', (event, queryId) => {
+  const sender = event?.sender;
+
+  // Live query path: owner-bound cancellation
+  if (activeLiveQuery && activeLiveQuery.queryId === queryId) {
+    if (activeLiveQuery.sender === sender) {
+      console.log(`[LIVE-QUERY] Cancelling queryId=${queryId}`);
+      activeLiveQuery.state.done = true;
+      if (activeLiveQuery.killTimer) clearTimeout(activeLiveQuery.killTimer);
+      try { activeLiveQuery.proc.kill(); } catch (_) {}
+      activeLiveQuery.cleanup();
+      activeLiveQuery = null;
+    } else {
+      console.warn(`[LIVE-QUERY] Rejected cancel for queryId=${queryId} from unauthorized sender`);
+    }
+    return;
+  }
+
   const proc = activeQueryProcs.get(queryId);
   if (proc) {
     console.log(`[QUERY] Cancelling queryId=${queryId}`);
@@ -3486,7 +3794,7 @@ ipcMain.on('query-cancel', (_event, queryId) => {
 });
 
 ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, question) => {
-  console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
+  console.log(`[QUERY] IPC received: questionLen=${String(question || '').length} file="${summaryFile}"`);
   sendDebugLog(`🤖 Streaming query (${String(question || '').length} chars)`);
   const env = { ...process.env, ...getAiEnv() };
 
@@ -3640,9 +3948,8 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
     }
   });
 
-  proc.stderr.on('data', (data) => {
-    const msg = data.toString().trim();
-    if (msg) console.log(`[QUERY stderr] ${msg.substring(0, 200)}`);
+  proc.stderr.on('data', () => {
+    // Backend stderr can include prompt/transcript context; never log it.
   });
 
   proc.on('close', (code) => {
@@ -3650,7 +3957,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
     if (!event.sender.isDestroyed()) {
       event.sender.removeListener('destroyed', onSenderDestroyed);
     }
-    console.log(`[QUERY] Process closed, code=${code}, chunks=${chunkCount}, bufRemainder=${buf.length > 0 ? JSON.stringify(buf.substring(0, 100)) : 'empty'}`);
+    console.log(`[QUERY] Process closed, code=${code}, chunks=${chunkCount}, bufRemainderBytes=${Buffer.byteLength(buf)}`);
     if (buf.trim() === 'CHAT_STREAM_COMPLETE' || buf.trim() === 'STREAM_COMPLETE') {
       console.log(`[QUERY] STREAM_COMPLETE was in buf remainder — sending done now`);
       if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, success: true });
@@ -4760,7 +5067,13 @@ ipcMain.on('live-transcribe-stop', () => {
 // and back during recording) to backfill segments before subscribing to
 // `live-transcript-chunk` for the tail. Returns an empty array when no
 // recording is active.
-ipcMain.handle('get-live-transcript-state', async () => {
+ipcMain.handle('get-live-transcript-state', async (event) => {
+  if (!mainWindow || mainWindow.isDestroyed() || !event || event.sender !== mainWindow.webContents) {
+    return {
+      success: false,
+      error: FIXED_LIVE_QUERY_ERRORS.UNAUTHORIZED,
+    };
+  }
   return {
     success: true,
     sessionName: liveTranscriptState.sessionName,
@@ -4771,10 +5084,10 @@ ipcMain.handle('get-live-transcript-state', async () => {
   };
 });
 
-// Spawn the Python transcribe-stream sidecar that produces live partials for
-// the renderer-driven capture (Parakeet engine only). Wires its stdout NDJSON
-// to the live-transcript-{ready,chunk,error} IPC events the renderer consumes.
-function spawnLiveTranscribe(sessionName) {
+// Spawn the active live ASR sidecar. Parakeet uses the Python backend;
+// Apple uses the native SpeechTranscriber helper. Both emit the same
+// LIVE_READY / LIVE_SEG / LIVE_ERROR line protocol.
+function spawnLiveTranscribe(sessionName, options = {}) {
   if (liveTranscribeProcess) {
     // Race-safe restart: a quick stop→start can land here while the
     // previous subprocess is still draining its stdin. Skipping the
@@ -4791,12 +5104,18 @@ function spawnLiveTranscribe(sessionName) {
   const env = Object.keys(aiEnv).length > 0
     ? { ...require('process').env, ...aiEnv }
     : undefined;
-  parakeetLoadStartedAt = Date.now();
-  liveTranscribeProcess = spawn(getBackendPath(), ['transcribe-stream'], {
+  const transcription = loadTranscriptionContext();
+  const usesAppleSpeech = transcription.engine === 'apple';
+  const executable = usesAppleSpeech ? getAppleTranscribePath() : getBackendPath();
+  const args = usesAppleSpeech
+    ? ['stream', transcription.language || 'auto']
+    : ['transcribe-stream'];
+  parakeetLoadStartedAt = usesAppleSpeech ? 0 : Date.now();
+  liveTranscribeProcess = spawn(executable, args, {
     cwd: getBackendCwd(),
     env,
-    // Default {pipe, pipe, pipe} — we need stdin to push audio in and
-    // stdout to parse the LIVE_* protocol.
+    // Default {pipe, pipe, pipe} — audio enters stdin and the shared live
+    // protocol is read from stdout.
   });
   liveTranscribeSessionName = sessionName;
   liveTranscribeStdoutBuf = '';
@@ -4806,6 +5125,11 @@ function spawnLiveTranscribe(sessionName) {
   // the resolver to `proc` so a quick stop→start can't have the old process's
   // teardown resolve/null the NEW process's state (#207 review-2, Finding 2).
   const proc = liveTranscribeProcess;
+  proc._usesAppleSpeech = usesAppleSpeech;
+  proc._liveLanguage = usesAppleSpeech ? (transcription.language || 'auto') : null;
+  proc._timelineOffset = typeof options.timelineOffset === 'number' && Number.isFinite(options.timelineOffset) && options.timelineOffset > 0
+    ? options.timelineOffset
+    : 0;
   proc._drainResolve = null;
   proc._drainPromise = new Promise((resolve) => {
     proc._drainResolve = resolve;
@@ -4847,7 +5171,7 @@ function spawnLiveTranscribe(sessionName) {
     while ((nl = liveTranscribeStdoutBuf.indexOf('\n')) !== -1) {
       const line = liveTranscribeStdoutBuf.slice(0, nl);
       liveTranscribeStdoutBuf = liveTranscribeStdoutBuf.slice(nl + 1);
-      handleLiveTranscribeLine(line);
+      handleLiveTranscribeLine(line, proc);
     }
   });
 
@@ -4924,7 +5248,7 @@ function spawnLiveTranscribe(sessionName) {
 // Keeps the per-line semantics (buffer mutation + IPC emit) in one place
 // so the legacy `record --live` path and this sidecar path stay in lock
 // step if we ever extend the protocol.
-function handleLiveTranscribeLine(line) {
+function handleLiveTranscribeLine(line, proc = liveTranscribeProcess) {
   const sessionName = liveTranscribeSessionName;
   if (line.startsWith('LIVE_READY:')) {
     if (parakeetLoadStartedAt) {
@@ -4940,10 +5264,15 @@ function handleLiveTranscribeLine(line) {
   if (line.startsWith('LIVE_SEG:')) {
     try {
       const seg = JSON.parse(line.slice('LIVE_SEG:'.length));
+      const offset = (proc && typeof proc._timelineOffset === 'number' && Number.isFinite(proc._timelineOffset))
+        ? proc._timelineOffset
+        : 0;
+      const rawStart = typeof seg.start === 'number' ? seg.start : 0;
+      const rawEnd = typeof seg.end === 'number' ? seg.end : rawStart;
       const segment = {
         text: seg.text,
-        start: seg.start,
-        end: seg.end,
+        start: rawStart + offset,
+        end: rawEnd + offset,
         isFinal: !!seg.is_final,
         // 'You' | 'Others', set directly by the Python sidecar from which
         // channel (mic vs system) produced this segment — a structural
@@ -5049,45 +5378,74 @@ function stopLiveTranscribe() {
   return exited;
 }
 
-// Sync read of the active ASR engine. Reads the JSON directly so we don't
-// spawn a Python subprocess on
-// every recording start just to ask. Default 'parakeet' matches the
-// Python migration (fresh installs default to Parakeet); existing users
-// will have had transcription_engine written on their first launch by
-// Config._migrate_transcription_engine.
-function loadTranscriptionEngine() {
-  try {
-    const cfgPath = path.join(getUserDataDir(), 'config.json');
-    if (!fs.existsSync(cfgPath)) return 'parakeet';
-    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-    const engine = cfg.transcription_engine;
-    return engine === 'whisper' ? 'whisper' : 'parakeet';
-  } catch (_) {
-    return 'parakeet';
+async function restartActiveAppleLiveTranscribeAfterLanguageChange() {
+  const proc = liveTranscribeProcess;
+  const sessionName = liveTranscribeSessionName;
+  if (!proc || !proc._usesAppleSpeech || !systemAudioRecordingActive || !sessionName) {
+    return;
+  }
+
+  sendDebugLog('Language changed; restarting active Apple live transcribe sidecar');
+  liveTranscriptState.ready = false;
+  liveTranscriptState.error = null;
+
+  await stopLiveTranscribe();
+
+  // Filter to retained final segments and compute timeline offset from maximum end time
+  const retainedFinals = (liveTranscriptState.segments || [])
+    .filter((segment) => segment && segment.isFinal);
+  liveTranscriptState.segments = retainedFinals;
+
+  let timelineOffset = 0;
+  for (const seg of retainedFinals) {
+    if (typeof seg.end === 'number' && Number.isFinite(seg.end) && seg.end > timelineOffset) {
+      timelineOffset = seg.end;
+    }
+  }
+
+  if (
+    systemAudioRecordingActive
+    && currentRecordingSessionName === sessionName
+    && liveTranscribeProcess === null
+  ) {
+    spawnLiveTranscribe(sessionName, { timelineOffset });
   }
 }
 
-// Sync read of the transcription engine + model + language for
-// transcription_completed's analytics properties. One config.json read
-// (mirrors loadTranscriptionEngine's no-subprocess approach) rather than
-// three separate ones on this hot path.
+
+
+// Sync read avoids spawning a backend process on every recording start.
+function loadTranscriptionEngine() {
+  try {
+    const cfgPath = path.join(getUserDataDir(), 'config.json');
+    if (!fs.existsSync(cfgPath)) return defaultTranscriptionEngine();
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    return normalizeTranscriptionEngine(cfg.transcription_engine);
+  } catch (_) {
+    return defaultTranscriptionEngine();
+  }
+}
+
+// Sync read of engine/model/language for live setup and analytics.
 function loadTranscriptionContext() {
   try {
     const cfgPath = path.join(getUserDataDir(), 'config.json');
     if (!fs.existsSync(cfgPath)) {
-      return { engine: 'parakeet', model: 'parakeet', language: 'auto' };
+      const engine = defaultTranscriptionEngine();
+      return { engine, model: engine, language: 'auto' };
     }
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-    const engine = cfg.transcription_engine === 'whisper' ? 'whisper' : 'parakeet';
+    const engine = normalizeTranscriptionEngine(cfg.transcription_engine);
     return {
       engine,
-      // Parakeet has no separate user-selectable model today (single bundled
-      // default) -- report the engine name rather than guess a variant id.
-      model: engine === 'whisper' ? sanitizeModelForAnalytics(cfg.whisper_model) : 'parakeet',
+      model: engine === 'whisper'
+        ? sanitizeModelForAnalytics(cfg.whisper_model)
+        : engine,
       language: cfg.language || 'auto',
     };
   } catch (_) {
-    return { engine: 'parakeet', model: 'parakeet', language: 'auto' };
+    const engine = defaultTranscriptionEngine();
+    return { engine, model: engine, language: 'auto' };
   }
 }
 
@@ -6082,7 +6440,7 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     // so the renderer can show real-time text. Cached read — avoids a
     // Python subprocess on every recording start.
     const engine = loadTranscriptionEngine();
-    const liveEnabled = engine === 'parakeet';
+    const liveEnabled = isLiveTranscriptionEngine(engine);
 
     // Renderer-driven capture (useSystemAudioCapture) is the ONLY recording
     // path: it captures the mic (+ system loopback when the Settings toggle is
@@ -6314,7 +6672,7 @@ ipcMain.handle('stop-recording-ui', async () => {
       const sessionName = currentRecordingSessionName || 'Note';
       if (currentRecordingAppendTarget) {
         instantSummaryFile = currentRecordingAppendTarget;
-      } else if (loadTranscriptionEngine() === 'parakeet' && activeSysAudioSummaryFile) {
+      } else if (isLiveTranscriptionEngine(loadTranscriptionEngine()) && activeSysAudioSummaryFile) {
         const transcriptText = liveTranscriptTextForPlaceholder(sessionName);
         const notesFile = userNotesFilePath(getOutputDir(), sessionName);
         let notesText = '';
@@ -8040,6 +8398,33 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
   } catch (e) { return { success: false, error: e.message }; }
 });
 
+ipcMain.handle('apple-speech-status', async (_event, language = 'auto') => {
+  try {
+    const requested = typeof language === 'string' ? language : 'auto';
+    const result = await runPythonScript(
+      'simple_recorder.py',
+      ['apple-speech-status', requested],
+      true,
+    );
+    return JSON.parse(result.trim());
+  } catch (e) {
+    return parsePythonFailureJson(e);
+  }
+});
+
+ipcMain.handle('prepare-apple-speech', async (_event, language = 'auto') => {
+  try {
+    const requested = typeof language === 'string' ? language : 'auto';
+    const result = await runPythonScript(
+      'simple_recorder.py',
+      ['prepare-apple-speech', requested],
+    );
+    return JSON.parse(result.trim());
+  } catch (e) {
+    return parsePythonFailureJson(e);
+  }
+});
+
 ipcMain.handle('list-parakeet-models', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['list-parakeet-models'], true);
@@ -8287,7 +8672,12 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
 // behavior are identical to the inline handlers this replaces. Settings-shaped
 // handlers coupled to another domain (telemetry, models, mic-monitor, calendar,
 // tray) deliberately stay in main.js until that domain's own extraction.
-registerSettingsIpc({ ipcMain, runPythonScript, sendDebugLog });
+registerSettingsIpc({
+  ipcMain,
+  runPythonScript,
+  sendDebugLog,
+  onLanguageChanged: restartActiveAppleLiveTranscribeAfterLanguageChange,
+});
 registerPersonSampleIpc({ ipcMain, runPythonScript });
 registerSpeakerIpc({ ipcMain, runPythonScript, parsePythonFailureJson });
 
@@ -9557,7 +9947,7 @@ ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, se
     const engine = loadTranscriptionEngine();
     const jobSummaryFile = appendTo
       ? appendTo
-      : engine === 'parakeet'
+      : isLiveTranscriptionEngine(engine)
         ? summaryFileForAudio(audioFilePath)
         : undefined;
 
@@ -9856,7 +10246,7 @@ async function findOllamaExecutable() {
 // named constant so the repo path has a single source of truth (and is the one
 // line to change if the repo is renamed/transferred — though the redirect
 // following below means an old build keeps working through GitHub's 301 too).
-const UPDATE_CHECK_URL = 'https://api.github.com/repos/stenolabs/stenoai/releases/latest';
+const UPDATE_CHECK_URL = 'https://api.github.com/repos/audreyt/stenoai/releases/latest';
 
 // Update checking functionality. Follows HTTP redirects (301/302/307/308):
 // GitHub's REST API returns a 301 to the new owner/repo path when a repo is

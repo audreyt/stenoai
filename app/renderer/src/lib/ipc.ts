@@ -9,11 +9,13 @@
  */
 
 // ---------- shared result envelope ----------
-export type Result<T> = ({ success: true } & T) | {
-  success: false;
-  error: string;
-  error_code?: string;
-};
+export type Result<T> =
+  | ({ success: true } & T)
+  | {
+      success: false;
+      error: string;
+      error_code?: string;
+    };
 
 // ---------- domain types ----------
 export interface SessionInfo {
@@ -701,7 +703,16 @@ export type ParakeetStatusResponse = Result<{
   installed: boolean;
 }>;
 
-export type TranscriptionEngine = 'parakeet' | 'whisper';
+export type AppleSpeechStatusResponse = Result<{
+  available: boolean;
+  supported: boolean;
+  installed: boolean;
+  locale: string | null;
+  display_name: string;
+  system_managed: boolean;
+}>;
+
+export type TranscriptionEngine = 'apple' | 'parakeet' | 'whisper';
 
 export type GetTranscriptionEngineResponse = Result<{
   engine: TranscriptionEngine;
@@ -1115,10 +1126,7 @@ export interface StenoaiBridge {
       [defaultFilename: string, content: string],
       Result<{ path: string }>
     >;
-    exportNotePdf: RequestFn<
-      [defaultFilename: string, html: string],
-      Result<{ path: string }>
-    >;
+    exportNotePdf: RequestFn<[defaultFilename: string, html: string], Result<{ path: string }>>;
     regenTitle: RequestFn<[summaryFile: string, name: string], Result<Record<string, never>>>;
     generateReport: RequestFn<
       [summaryFile: string, templateId: string],
@@ -1134,6 +1142,7 @@ export interface StenoaiBridge {
   query: {
     ask: RequestFn<[file: string, q: string], QueryResponse>;
     askStream: SendFn<[id: string, file: string, q: string]>;
+    askLiveStream: SendFn<[id: string, sessionName: string, q: string]>;
     chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null]>;
     cancel: SendFn<[id: string]>;
   };
@@ -1215,6 +1224,11 @@ export interface StenoaiBridge {
     list: RequestFn<[], ListParakeetModelsResponse>;
     pull: RequestFn<[id?: string | null], Result<{ model?: string; already_installed?: boolean }>>;
     status: RequestFn<[], ParakeetStatusResponse>;
+  };
+
+  appleSpeech: {
+    status: RequestFn<[language?: string], AppleSpeechStatusResponse>;
+    prepare: RequestFn<[language?: string], AppleSpeechStatusResponse>;
   };
 
   transcriptionEngine: {

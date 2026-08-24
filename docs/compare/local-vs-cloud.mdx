@@ -13,7 +13,7 @@ Your audio or a live audio stream is sent to the vendor's servers. Transcription
 
 **Local meeting AI** (Steno)
 
-By default, all processing happens on your Mac using models downloaded during setup. No audio leaves your device. Transcription uses two on-device engines -- Parakeet (the default, with a live transcript while you record) and Whisper (optional, chosen in Settings). Summarization uses a local language model running via [Ollama](https://ollama.com) by default, with an optional cloud model (OpenAI, Anthropic, or AWS Bedrock -- each billed by that provider) or a custom endpoint (which may be a paid API or your own self-hosted server) as an alternative -- in which case your transcript is sent to it. In the default local configuration there are no ongoing costs and no vendor relationship for your audio data.
+Steno keeps audio and speech recognition on your machine. Apple SpeechTranscriber is the default on macOS 26+; Parakeet and Whisper remain local fallbacks. The maintained fork profile sends transcript-derived summary/chat prompts to a self-hosted Ornith service on `127.0.0.1:11443`. Optional cloud and organisation routes remain available when you configure them.
 
 ## Side-by-side comparison
 
@@ -53,7 +53,7 @@ Cloud tools have real advantages in certain situations:
 
 ## Accuracy
 
-Steno transcribes on-device with two engines: Parakeet (the default) and Whisper (optional, selected in **Settings → Transcribe**). Accuracy is high across common recording conditions. Parakeet covers 25 European languages, including English, and produces a live transcript while you record; switch to Whisper when you need one of its 99 supported languages.
+Steno transcribes on-device with Apple SpeechTranscriber, Parakeet, or Whisper. Apple is the default on macOS 26+ and exposes 45 locales on the current runtime; Parakeet is the live fallback on older systems and Windows; Whisper supplies broader post-stop coverage.
 
 ---
 
@@ -62,7 +62,7 @@ Yes. Steno is independent of your call platform. You can run Steno for local not
 </Accordion>
 
 <Accordion title="Is local processing slower than cloud?">
-On Apple Silicon, transcription is fast and runs entirely on-device, and the default Parakeet engine shows a live transcript while you record. Cloud tools also return transcripts in roughly real-time. Local processing is fast enough for most workflows, and everything stays on your Mac.
+On current Apple Silicon Macs, Apple SpeechTranscriber produces live text without application-managed ASR weights. Parakeet also runs faster than real time on supported hardware. Cloud tools return transcripts in roughly real time, but they require sending audio to the vendor.
 </Accordion>
 
 <Accordion title="What about privacy policies for cloud recorders?">
