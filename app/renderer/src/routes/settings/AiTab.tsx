@@ -62,28 +62,22 @@ import { COMPACT_BTN, COMPACT_INPUT, COMPACT_TRIGGER, SectionHeading, SettingRow
 import { ModelCard, formatModelSize, isDefaultModel, parsePullPercent } from './model-card';
 import { modelMayExceedMemory } from './model-memory';
 import { LANGUAGES_PARAKEET, LANGUAGES_WHISPER } from './languages';
+import { t } from '@/i18n';
 
 export function AiTab() {
   return (
     <section data-settings-tab="ai">
-      <SectionHeading>Transcription</SectionHeading>
-      <p
-        className="text-[13px] leading-[1.5]"
-        style={{ color: 'var(--fg-2)', marginBottom: 4 }}
-      >
-        Speech-to-text always runs on your device — your audio never leaves
-        your computer.
+      <SectionHeading>{t('settings.ai.sectionTranscription')}</SectionHeading>
+      <p className="text-[13px] leading-[1.5]" style={{ color: 'var(--fg-2)', marginBottom: 4 }}>
+        Speech-to-text always runs on your device — your audio never leaves your computer.
       </p>
       <TranscriptionSection />
 
-      <SectionHeading>Summarisation &amp; Chat</SectionHeading>
-      <p
-        className="text-[13px] leading-[1.5]"
-        style={{ color: 'var(--fg-2)', marginBottom: 4 }}
-      >
-        Turns your transcript into notes and answers your questions. This is
-        the one step that can run locally or in the cloud — if you choose a
-        cloud provider, only the text transcript is sent, never audio.
+      <SectionHeading>{t('settings.ai.sectionSummarization')}</SectionHeading>
+      <p className="text-[13px] leading-[1.5]" style={{ color: 'var(--fg-2)', marginBottom: 4 }}>
+        Turns your transcript into notes and answers your questions. This is the one step that can
+        run locally or in the cloud — if you choose a cloud provider, only the text transcript is
+        sent, never audio.
       </p>
       <SummarisationSection />
     </section>
@@ -112,10 +106,7 @@ function TranscriptionSection() {
     // Retains the pre-merge data-settings-tab="transcription" identity as a
     // nested wrapper (the page-level section is now data-settings-tab="ai").
     <div data-settings-tab="transcription">
-      <SettingRow
-        label="Language"
-        description="Auto-detects by default. Pick one to pin it."
-      >
+      <SettingRow label={t('settings.ai.transcriptionLanguage')} description={t('settings.ai.transcriptionLanguageDesc')}>
         <Select
           value={displayValue}
           onValueChange={(v) => setLanguage.mutate(v)}
@@ -138,8 +129,8 @@ function TranscriptionSection() {
       </SettingRow>
 
       <SettingRow
-        label="Save recordings"
-        description="Save audio files to your storage location (see Advanced) after processing. Uses 1–10 MB per minute depending on capture mode."
+        label={t('settings.ai.keepRecordings')}
+        description={t('settings.ai.keepRecordingsDesc')}
       >
         <Switch
           checked={keepRecordings.data ?? false}
@@ -183,8 +174,8 @@ export function SpeakerIdentificationSetting() {
 // one supported model today (see SUPPORTED_PARAKEET_MODELS /
 // SUPPORTED_WHISPER_MODELS in the Python registries).
 const ENGINE_TAGLINE: Record<'parakeet' | 'whisper', string> = {
-  parakeet: 'Fastest — English + European languages',
-  whisper: 'Most accurate — 99 languages',
+  get parakeet() { return t('settings.ai.engineParakeetTag'); },
+  get whisper() { return t('settings.ai.engineWhisperTag'); },
 };
 
 /**

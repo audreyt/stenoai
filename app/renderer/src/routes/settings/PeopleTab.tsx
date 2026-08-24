@@ -10,7 +10,7 @@ import {
 import type { PersonProfile } from '@/lib/ipc';
 import { useBlobAudioPlayback } from '@/hooks/useBlobAudioPlayback';
 import { SettingRow, COMPACT_BTN } from './primitives';
-
+import { t } from '@/i18n';
 // ---------------------------------------------------------------------------
 // People - the one place a voice profile can be deleted.
 //
@@ -43,8 +43,8 @@ function describeSamples(profile: PersonProfile): string {
   // creates the profile before any voice has been attached to it, and every
   // enrollment path can leave one behind. Saying "0 voice samples" would
   // read as damage; naming it as not-yet-learned is what it is.
-  if (n === 0) return 'No voice samples yet - Steno cannot recognise them automatically.';
-  return `${n} voice sample${n === 1 ? '' : 's'}`;
+  if (n === 0) return t('speaker.noSamples');
+  return t('speaker.samplesCount', { count: n, plural: n === 1 ? '' : 's' });
 }
 
 export function PeopleTab() {
@@ -70,7 +70,7 @@ export function PeopleTab() {
     return (
       <div className="flex items-center gap-2 py-6 text-[13px]" style={{ color: 'var(--fg-2)' }}>
         <Loader2 className="size-[14px] animate-spin" />
-        Loading people…
+        {t('speaker.loadingPeople')}
       </div>
     );
   }
@@ -78,7 +78,7 @@ export function PeopleTab() {
   if (profilesQuery.isError) {
     return (
       <div className="py-6 text-[13px]" style={{ color: 'var(--fg-2)' }} data-testid="people-error">
-        Could not load people.
+        {t('speaker.couldNotLoadPeople')}
       </div>
     );
   }
@@ -87,7 +87,7 @@ export function PeopleTab() {
     <div data-testid="people-tab">
       {profiles.length === 0 ? (
         <div className="py-6 text-[13px]" style={{ color: 'var(--fg-2)' }} data-testid="people-empty">
-          No people yet. Name a speaker in a meeting and they will appear here.
+          {t('speaker.noPeopleYet')}
         </div>
       ) : (
         profiles.map((profile, i) => (
@@ -131,7 +131,7 @@ export function PeopleTab() {
                   ) : (
                     <Play className="size-[13px]" />
                   )}
-                  {playback.playingKey === profile.person_id ? 'Stop' : 'Play'}
+                  {playback.playingKey === profile.person_id ? t('common.stop') : t('common.start')}
                 </Button>
               )}
               <Button
@@ -147,7 +147,7 @@ export function PeopleTab() {
                 data-testid={`people-delete-${profile.person_id}`}
               >
                 <Trash2 className="size-[13px]" />
-                Delete
+                {t('common.delete')}
               </Button>
             </div>
           </SettingRow>
@@ -181,7 +181,7 @@ export function PeopleTab() {
             )}
           </span>
         )}
-        confirmLabel="Delete"
+        confirmLabel={t('common.delete')}
         destructive
         isPending={deleteProfile.isPending}
         onConfirm={async () => {

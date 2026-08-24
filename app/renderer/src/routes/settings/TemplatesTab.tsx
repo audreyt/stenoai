@@ -21,6 +21,7 @@ import {
 } from '@/hooks/useTemplates';
 import { COMPACT_BTN } from './primitives';
 import { LANGUAGES_WHISPER, type LangOption } from './languages';
+import { t } from '@/i18n';
 
 // ---------------------------------------------------------------------------
 // Templates tab — manage summary report templates (CRUD + default pick) as a
@@ -89,10 +90,10 @@ export function TemplatesTab({
           <Plus size={16} className="shrink-0" />
           <div className="min-w-0 flex-1">
             <span className="text-[13px] font-medium" style={{ color: 'var(--fg-1)' }}>
-              New Template
+              {t('settings.templates.newTemplate')}
             </span>
             <div className="truncate text-[12px] mt-0.5">
-              Create custom prompts to tailor how your meetings are summarised.
+              {t('settings.templates.subtitle')}
             </div>
           </div>
         </button>
@@ -342,10 +343,10 @@ function TemplateEditor({
           </button>
           <div>
             <h2 className="text-[20px] font-medium" style={{ color: 'var(--fg-1)' }}>
-              {editing?.id ? 'Edit template' : 'New template'}
+              {editing?.id ? t('settings.templates.editTemplate') : t('settings.templates.newTemplate')}
             </h2>
             <p className="text-[13px] mt-1" style={{ color: 'var(--fg-muted)' }}>
-              Configure how your meetings should be summarized
+              {t('settings.templates.subtitle')}
             </p>
           </div>
         </div>
@@ -361,7 +362,7 @@ function TemplateEditor({
                 if (editing.id) setDefault.mutate(editing.id);
               }}
             >
-              Make Default
+              {t('settings.templates.setAsDefault')}
             </Button>
           )}
           {editing?.id && editing.builtin && !editing.locked && (
@@ -375,7 +376,7 @@ function TemplateEditor({
                 if (editing.id) reset.mutate(editing.id, { onSuccess: () => onClose() });
               }}
             >
-              Reset
+              {t('settings.templates.resetToDefault')}
             </Button>
           )}
           <Button
@@ -387,10 +388,10 @@ function TemplateEditor({
             {save.isPending ? (
               <>
                 <Loader2 className="mr-1.5 size-3 animate-spin" />
-                Saving…
+                {t('common.loading')}
               </>
             ) : (
-              'Save Template'
+              t('common.save')
             )}
           </Button>
         </div>

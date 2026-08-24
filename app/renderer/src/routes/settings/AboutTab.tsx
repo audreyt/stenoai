@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button';
 import { ipc } from '@/lib/ipc';
 import { useAppVersion } from '@/hooks/useSettings';
 import { COMPACT_BTN, SettingRow } from './primitives';
-
+import { t } from '@/i18n';
 /** Plain external-link text (matches TemplatesTab's "learn more" link) for
  *  rows that just navigate out, rather than a bordered Button — keeps the
  *  bordered-button treatment reserved for in-page actions (Check for
@@ -250,20 +250,20 @@ export function AboutTab() {
             {checkState.kind === 'checking' ? (
               <>
                 <Loader2 className="mr-1.5 size-3 animate-spin" />
-                Checking for Updates
+                {t('settings.about.checkingUpdates')}
               </>
             ) : checkState.kind === 'up-to-date' ? (
               <>
                 <Check className="mr-1.5 size-3" />
-                You're on the latest version
+                {t('settings.about.upToDate')}
               </>
             ) : checkState.kind === 'error' ? (
               <>
                 <X className="mr-1.5 size-3" />
-                Check failed
+                {t('common.error')}
               </>
             ) : (
-              'Check for Updates'
+              t('settings.about.checkForUpdates')
             )}
           </Button>
         </div>
@@ -304,12 +304,12 @@ export function AboutTab() {
       {downloadedVersion && (
         <div className="py-3">
           <Button className="w-full" onClick={() => ipc().updates.install()}>
-            Restart to Update (v{downloadedVersion})
+            {t('settings.about.restartToUpdate')} (v{downloadedVersion})
           </Button>
         </div>
       )}
 
-      <SettingRow label="Release notes" description="See what's new">
+      <SettingRow label={t('settings.about.viewReleaseNotes')} description={t('settings.about.whatsNew')}>
         <ExternalLinkAction
           label="View"
           onClick={() => void ipc().shell.openExternal(CHANGELOG_URL)}
@@ -345,7 +345,7 @@ export function AboutTab() {
           onClick={() => void ipc().shell.openExternal(TERMS_URL)}
           className="hover:underline"
         >
-          Terms of Service
+          {t('settings.about.termsOfService')}
         </button>
         <span aria-hidden="true">·</span>
         <button
@@ -353,7 +353,7 @@ export function AboutTab() {
           onClick={() => void ipc().shell.openExternal(PRIVACY_URL)}
           className="hover:underline"
         >
-          Privacy Policy
+          {t('settings.about.privacyPolicy')}
         </button>
       </div>
     </section>

@@ -2,7 +2,7 @@ import * as React from 'react';
 import { createPortal } from 'react-dom';
 import { CircleAlert } from 'lucide-react';
 import { ipc } from '@/lib/ipc';
-
+import { t } from '@/i18n';
 interface DialogState {
   type: 'recording' | 'processing';
   jobCount?: number;
@@ -48,12 +48,14 @@ export function QuitDialog() {
   if (!host) return null;
 
   const isRecording = state.type === 'recording';
-  const title = isRecording ? 'Recording in progress' : 'Processing in progress';
+  const title = isRecording ? t('dialogs.quitWhileRecordingTitle') : t('dialogs.quitWhileProcessingTitle');
   const count = state.jobCount ?? 1;
   const body = isRecording
-    ? 'Quitting will stop and save the current recording.'
-    : `${count} recording${count !== 1 ? 's are' : ' is'} still being processed. Quitting will cancel processing.`;
-  const confirmLabel = isRecording ? 'Stop & quit' : 'Quit anyway';
+    ? t('dialogs.quitWhileRecordingBody')
+    : count === 1
+      ? t('dialogs.quitWhileProcessingBodySingle')
+      : t('dialogs.quitWhileProcessingBodyPlural', { count });
+  const confirmLabel = isRecording ? t('dialogs.quitWhileRecordingConfirm') : t('dialogs.quitWhileProcessingConfirm');
 
   return createPortal(
     <div
@@ -133,7 +135,7 @@ function CancelButton({ onClick }: { onClick: () => void }) {
         transition: 'background 120ms cubic-bezier(0.2,0,0,1)',
       }}
     >
-      Cancel
+      {t('common.cancel')}
     </button>
   );
 }

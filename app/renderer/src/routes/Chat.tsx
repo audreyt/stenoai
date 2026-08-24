@@ -24,7 +24,7 @@ import { useOrgSession } from '@/hooks/useOrg';
 import { navigate } from '@/lib/router';
 import { GLOBAL_SCOPE, bucketKey, deriveSessionName, toBucketLabel, formatActiveModel, chatProviderReady } from '@/lib/chat';
 import { PRESETS, PresetGlyph, PRESET_COLORS } from '@/lib/chatPresets';
-
+import { t } from '@/i18n';
 function TypewriterPlaceholder({ index, setIndex }: { index: number, setIndex: React.Dispatch<React.SetStateAction<number>> }) {
   const [text, setText] = React.useState('');
   const [isDeleting, setIsDeleting] = React.useState(false);
@@ -421,7 +421,7 @@ export function Chat() {
                   className="inline-flex items-center gap-0.5 text-[12px] transition-colors hover:text-[color:var(--fg-1)]"
                   style={{ color: 'var(--fg-2)' }}
                 >
-                  {recentsExpanded ? 'Show less' : 'See all'}
+                  {recentsExpanded ? t('common.options') : t('common.search')}
                   <ChevronRight
                     className={`size-[12px] transition-transform ${recentsExpanded ? 'rotate-90' : ''}`}
                   />
@@ -439,7 +439,7 @@ export function Chat() {
               <div className="mb-3 flex justify-center">
                 <History className="size-4 text-muted-foreground" />
               </div>
-              Your past chats will show up here.
+              {t('chat.noConversations')}
             </div>
           ) : recentsExpanded && groupedRecents ? (
             <div className="flex flex-col">
