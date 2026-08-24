@@ -206,8 +206,8 @@ def apple_speech_supported(
 
 
 def default_transcription_engine() -> str:
-    """Keep the existing Parakeet default until the Apple UI is enabled."""
-    return "parakeet"
+    """Fresh installs use Apple's system model where the API exists."""
+    return "apple" if apple_speech_supported() else "parakeet"
 
 
 class Config:

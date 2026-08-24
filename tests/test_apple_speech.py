@@ -86,12 +86,12 @@ class AppleSpeechConfigTests(unittest.TestCase):
             apple_speech_supported(platform_name="win32", mac_version="27.0")
         )
 
-    def test_backend_foundation_preserves_existing_parakeet_default(self):
+    def test_fresh_supported_mac_defaults_to_apple(self):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "src.config.apple_speech_supported", return_value=True
         ):
             config = Config(Path(tmp) / "config.json")
-            self.assertEqual(config.get_transcription_engine(), "parakeet")
+            self.assertEqual(config.get_transcription_engine(), "apple")
 
     def test_existing_explicit_engine_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp, patch(
