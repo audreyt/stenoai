@@ -4500,15 +4500,22 @@ def setup_check(as_json):
     else:
         checks.append(("⚠️ whisper-model", "will download on first use (~500MB)"))
 
-    # Check if LLM model is downloaded (check ~/.ollama/models/)
-    ollama_models_path = Path.home() / ".ollama" / "models" / "manifests" / "registry.ollama.ai" / "library"
-    if ollama_models_path.exists() and any(ollama_models_path.iterdir()):
-        model_names = [d.name for d in ollama_models_path.iterdir() if d.is_dir()]
-        checks.append(("✅ llm-model", ", ".join(model_names[:2])))
+    # Check if LLM model is available (Apple System Language Model or ~/.ollama/models/)
+    from src.apple_lm import apple_lm_available, apple_lm_status
+    if sys.platform == "darwin" and apple_lm_available():
+        status = apple_lm_status()
+        variant = status.get("variant") or "available"
+        checks.append(("✅ llm-model", f"Apple System Language Model ({variant})"))
     else:
-        checks.append(("❌ llm-model", "no model installed - needed for summaries"))
-
-    # Derive a structured, machine-readable view of the checks. This is the
+        try:
+            ollama_models_path = Path.home() / ".ollama" / "models" / "manifests" / "registry.ollama.ai" / "library"
+            if ollama_models_path.exists() and any(ollama_models_path.iterdir()):
+                model_names = [d.name for d in ollama_models_path.iterdir() if d.is_dir()]
+                checks.append(("✅ llm-model", ", ".join(model_names[:2])))
+            else:
+                checks.append(("❌ llm-model", "no model installed - needed for summaries"))
+        except Exception:
+            checks.append(("❌ llm-model", "no model installed - needed for summaries"))
     # single source of truth for each check's (name, status, detail) and for the
     # overall verdict; both the JSON output and the human summary below read from
     # it, so the pass/fail logic is never duplicated. Status is decoded from the
@@ -4671,6 +4678,20 @@ def list_models():
                     # "Select" re-offered.
                     if info['mlx_installed']:
                         info['installed'] = True
+        from src.apple_lm import (
+            APPLE_SYSTEM_MODEL,
+            apple_lm_available,
+            apple_system_model_info,
+            is_apple_system_model,
+        )
+        if provider == "local" and (apple_lm_available() or is_apple_system_model(current_model)):
+            is_def = (current_model == APPLE_SYSTEM_MODEL)
+            apple_info = {
+                **apple_system_model_info(is_default=is_def),
+                "installed": apple_lm_available(),
+                "gguf_installed": False,
+            }
+            models = {APPLE_SYSTEM_MODEL: apple_info, **models}
         result = {
             "current_model": current_model,
             "supported_models": models,
@@ -8190,11 +8211,15 @@ def download_whisper_model():
 @cli.command()
 @click.argument('model_name')
 def check_model(model_name):
-    """Check if a model is installed in Ollama (uses HTTP API)."""
+    """Check if a model is installed in Ollama or available in Apple Intelligence."""
+    from src.apple_lm import is_apple_system_model, apple_lm_available
+    if is_apple_system_model(model_name):
+        print(json.dumps({"installed": apple_lm_available(), "model": model_name}))
+        return
+
     from src.config import get_config
     config = get_config()
     provider = config.get_ai_provider()
-
     if provider == "remote":
         remote_url = config.get_remote_ollama_url()
         if not remote_url:
@@ -8228,6 +8253,14 @@ def check_model(model_name):
 @click.argument('model_name')
 def pull_model(model_name):
     """Download an Ollama model (uses HTTP API)."""
+    from src.apple_lm import is_apple_system_model, apple_lm_available
+    if is_apple_system_model(model_name):
+        if apple_lm_available():
+            print(json.dumps({"success": True, "model": model_name}))
+        else:
+            print(json.dumps({"success": False, "error": "Apple Intelligence is not available on this system"}))
+        return
+
     from src.ollama_manager import start_ollama_server
     start_ollama_server()
     try:
@@ -8266,14 +8299,16 @@ def pull_model(model_name):
 @cli.command(name='verify-model')
 @click.argument('model_name')
 def verify_model(model_name):
-    """Smoke-test a just-pulled model with a 1-token chat call (uses HTTP API).
+    """Smoke-test a model with a 1-token chat call."""
+    from src.apple_lm import is_apple_system_model, complete
+    if is_apple_system_model(model_name):
+        try:
+            complete("hi", timeout=10)
+            print(json.dumps({"success": True, "error": None}))
+        except Exception as e:
+            print(json.dumps({"success": False, "error": str(e)}))
+        return
 
-    Used only by the Settings "switch to faster build" flow, to prove an
-    MLX/NVFP4 tag actually loads and responds before offering to delete the
-    old GGUF build. A generous timeout accounts for MLX cold-load (several
-    seconds after a fresh pull, per local benchmarking) -- a slow-but-working
-    model must not be reported as a failure.
-    """
     from src.ollama_manager import start_ollama_server
     start_ollama_server()
     try:
@@ -8292,16 +8327,12 @@ def verify_model(model_name):
 @cli.command(name='delete-model')
 @click.argument('model_name')
 def delete_model(model_name):
-    """Delete a locally-pulled Ollama model (uses HTTP API).
+    """Delete a locally-pulled Ollama model (uses HTTP API)."""
+    from src.apple_lm import is_apple_system_model
+    if is_apple_system_model(model_name):
+        print(json.dumps({"success": False, "error": "Cannot delete built-in Apple System model"}))
+        return
 
-    Called by the Settings "switch to faster build" flow (the old GGUF tag,
-    after its NVFP4 sibling has been pulled and verified) and by the general
-    "delete this model to free up disk space" action (either the GGUF id or
-    its NVFP4 sibling) -- never a tag currently in active use. Restricted to
-    supported GGUF ids and their NVFP4 siblings: this is a destructive
-    IPC-reachable operation, so it must not delete an arbitrary
-    caller-supplied model name.
-    """
     from src.config import get_config, Config
 
     allowed = set(get_config().list_supported_models()) | set(Config._MLX_EQUIVALENTS.values())
@@ -8357,6 +8388,12 @@ def resolve_setup_model():
     whether to download. Uses the HTTP API (ollama package), not the binary.
     """
     from src.config import get_config, Config
+    from src.apple_lm import apple_lm_available, APPLE_SYSTEM_MODEL
+
+    if apple_lm_available():
+        print(json.dumps({"installed": APPLE_SYSTEM_MODEL, "pull_target": None}))
+        return
+
     from src.ollama_manager import start_ollama_server
     from src.config import is_apple_silicon
 
@@ -8407,6 +8444,13 @@ def resolve_setup_model():
         result["error"] = str(e)
     print(json.dumps(result))
 
+
+
+@cli.command(name='apple-lm-status')
+def apple_lm_status_cmd():
+    """Inspect Apple SystemLanguageModel status and availability."""
+    from src.apple_lm import apple_lm_status
+    print(json.dumps(apple_lm_status()))
 
 @cli.command(name='check-adapter')
 @click.argument('url')

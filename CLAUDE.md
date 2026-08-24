@@ -71,6 +71,27 @@ back to channel labels when the cache is unavailable. The cache lives below
 the Steno user-data directory and therefore honors `STENOAI_USER_DATA_DIR` in
 tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 
+### Apple System Language Model (macOS only)
+On-device summarization uses `bin/steno-apple-lm`, a Swift sidecar
+(`apple-lm-sidecar/`) wrapping `FoundationModels.SystemLanguageModel.default`.
+The OS serves Advanced when the Mac has it and otherwise 3B Core; there is no
+`init(variant:)`. Python talks to the sidecar via `src.apple_lm` (`status` /
+`complete` / `stream`); prompts go on stdin, and errors are fixed strings.
+Build it before `pyinstaller` when the macOS 26+ SDK is present:
+
+```
+scripts/build-apple-lm-sidecar.sh   # outputs bin/steno-apple-lm
+```
+
+`stenoai.spec` bundles the binary only when it exists and only on Darwin. A
+build host without the SDK omits it and the app keeps Ollama
+`gemma4:e2b-it-qat`. Official `macos-14` release runners cannot compile
+FoundationModels; a real sidecar in the notarized DMG needs a macOS 26+
+build image. Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; a fake binary
+can be injected via `STENOAI_APPLE_LM_BIN`. Windows/Linux never resolve the
+sidecar.
+
+
 ### End-to-end tests (Playwright)
 The e2e suite drives the **real Electron app** (real window, real clicks) to catch
 full-app regressions like the org-provider reset before they reach users. It lives

@@ -359,6 +359,7 @@ class Config:
         self._migrate_cloud_model_map()
         self._migrate_whisper_model()
         self._migrate_summary_model()
+        self._adopt_apple_system_default()
         self._migrate_transcription_engine()
         self._migrate_language_zh()
         self._migrate_privacy_notice_seen()
@@ -599,6 +600,34 @@ class Config:
         elif current in self._RETIRED_SUMMARY_MODELS:
             self._config["model"] = self.DEFAULT_MODEL
             self._save()
+
+
+    def _adopt_apple_system_default(self) -> None:
+        """On Darwin, adopt Apple System Language Model when available and unset/auto."""
+        if self._load_failed:
+            return
+        if self.get_ai_provider() != "local":
+            return
+        source = self._config.get("summary_model_source")
+        current = self._config.get("model", self.DEFAULT_MODEL)
+        from src.apple_lm import (
+            APPLE_SYSTEM_MODEL,
+            apple_lm_available,
+        )
+
+        if source is None:
+            source = (
+                "auto"
+                if current in (self.DEFAULT_MODEL, APPLE_SYSTEM_MODEL)
+                else "user"
+            )
+            self._config["summary_model_source"] = source
+
+        if source == "auto":
+            target = APPLE_SYSTEM_MODEL if apple_lm_available() else self.DEFAULT_MODEL
+            if current != target:
+                self._config["model"] = target
+                self._save()
 
     def _migrate_cloud_model_map(self) -> None:
         """One-shot migration from legacy single 'cloud_model' to per-provider
@@ -853,8 +882,10 @@ class Config:
 
     def _get_default_config(self) -> Dict[str, Any]:
         """Get default configuration."""
+        from src.apple_lm import resolve_default_summary_model
         return {
-            "model": self.DEFAULT_MODEL,
+            "model": resolve_default_summary_model(),
+            "summary_model_source": "auto",
             "notifications_enabled": True,
             # Default ON — the calendar-based pre-meeting heads-up, independent
             # of notifications_enabled (which now only covers note-ready/
@@ -972,21 +1003,24 @@ class Config:
         """Get the configured model name."""
         return self._config.get("model", self.DEFAULT_MODEL)
 
-    def set_model(self, model_name: str) -> bool:
+    def set_model(self, model_name: str, *, source: str = "user") -> bool:
         """
         Set the model to use for summarization.
 
         Args:
-            model_name: Name of the model (e.g., "llama3.1:8b")
+            model_name: Name of the model (e.g., "llama3.1:8b" or "apple:system")
+            source: "user" (explicit user pick) or "auto" (implicit/system default resolution)
 
         Returns:
             True if saved successfully, False otherwise
         """
         # Validate model name
-        if model_name not in self.SUPPORTED_MODELS:
+        from src.apple_lm import is_apple_system_model
+        if model_name not in self.SUPPORTED_MODELS and not is_apple_system_model(model_name):
             logger.warning(f"Model {model_name} not in supported list, but allowing anyway")
 
         self._config["model"] = model_name
+        self._config["summary_model_source"] = source
         return self._save()
 
     # --- Report templates ---------------------------------------------------
@@ -1780,8 +1814,10 @@ class Config:
         Returns:
             Dictionary with model metadata or None if not found
         """
+        from src.apple_lm import is_apple_system_model, apple_system_model_info
+        if is_apple_system_model(model_name):
+            return apple_system_model_info(is_default=self.get_model() == model_name)
         return self.SUPPORTED_MODELS.get(model_name)
-
     def list_supported_models(self) -> Dict[str, Dict[str, str]]:
         """Get all supported models with their metadata."""
         return self.SUPPORTED_MODELS.copy()

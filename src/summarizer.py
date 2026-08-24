@@ -125,6 +125,9 @@ def resolve_num_ctx(model_name: str) -> int:
     canonicalize back to the GGUF id first so both runtime variants share the
     same window.
     """
+    from src.apple_lm import is_apple_system_model, APPLE_LM_NUM_CTX
+    if is_apple_system_model(model_name):
+        return APPLE_LM_NUM_CTX
     model_name = Config._MLX_TO_GGUF.get(model_name, model_name)
     base = _OLLAMA_MODEL_NUM_CTX.get(model_name, OLLAMA_NUM_CTX_DEFAULT)
     return max(OLLAMA_NUM_CTX_FLOOR, min(base, OLLAMA_NUM_CTX_CEILING))
@@ -234,10 +237,7 @@ class OllamaSummarizer:
             logger.info(f"Remote Ollama initialized: host={self.remote_url}, model={self.model_name}")
 
         else:
-            # Local mode: existing behavior
-            if not OLLAMA_AVAILABLE:
-                raise ImportError("Ollama is not installed. Please install ollama-python.")
-
+            # Local mode: existing behavior or Apple SystemLanguageModel
             if model_name is None:
                 try:
                     model_name = config.get_model()
@@ -246,10 +246,28 @@ class OllamaSummarizer:
                     logger.warning(f"Failed to load model from config: {e}, using default")
                     model_name = config.DEFAULT_MODEL
 
-            self.model_name = resolve_runtime_tag(model_name)
-            self._ensure_ollama_ready()
-            self.client = ollama.Client()
-    
+            from src.apple_lm import is_apple_system_model, AppleLMClient, apple_lm_available
+            if is_apple_system_model(model_name) and apple_lm_available():
+                self.model_name = model_name
+                self.client = AppleLMClient()
+                logger.info("Apple System Language Model initialized")
+            else:
+                if is_apple_system_model(model_name):
+                    logger.warning(
+                        "Apple System Language Model configured but not available on this platform/device; falling back to %s",
+                        config.DEFAULT_MODEL,
+                    )
+                    model_name = config.DEFAULT_MODEL
+                if not OLLAMA_AVAILABLE:
+                    raise ImportError("Ollama is not installed. Please install ollama-python.")
+                self.model_name = resolve_runtime_tag(model_name)
+                self._ensure_ollama_ready()
+                self.client = ollama.Client()
+
+    def _using_apple_lm(self) -> bool:
+        """True when local provider is routed through Apple SystemLanguageModel."""
+        from src.apple_lm import is_apple_system_model
+        return self.ai_provider == "local" and is_apple_system_model(self.model_name)
     def _is_ollama_running(self) -> bool:
         """Check if Ollama service is running."""
         return ollama_manager.is_ollama_running()
@@ -744,6 +762,8 @@ class OllamaSummarizer:
     
     def _ensure_ollama_ready(self) -> bool:
         """Ensure Ollama service is running and model is available."""
+        if self._using_apple_lm():
+            return True
         logger.info("Checking Ollama service...")
         
         # Step 1: Check if Ollama is running
@@ -1444,16 +1464,13 @@ TRANSCRIPT:
 
     def _stream_direct(self, prompt: str):
         """Stream a single non-chunked completion for ``prompt`` via local/remote
-        Ollama, yielding content chunks. ``think=False`` so a thinking-capable
-        model emits answer text directly instead of spending tokens reasoning
-        into a separate channel before the first content token (see
-        _summarize_chunk for the full rationale).
-
-        Cloud/adapter providers keep their own inline streaming in
-        ``summarize_transcript_streaming`` and never reach here — this is the
-        minimal extraction of just the local/remote Ollama path, shared by the
-        markdown and free-form template routes.
+        Ollama or Apple Intelligence, yielding content chunks.
         """
+        if self._using_apple_lm():
+            from src.apple_lm import stream_complete
+            yield from stream_complete(prompt)
+            return
+
         if self.ai_provider != "remote":
             self._ensure_ollama_ready()
         # Via _chat_stream_no_think so a remote server that rejects `think`
@@ -1723,6 +1740,9 @@ TITLE:"""
                 response_text = self._adapter_chat(prompt, 30)
             elif self.ai_provider == "cloud":
                 response_text = self._cloud_chat(prompt, 30)
+            elif self._using_apple_lm():
+                from src.apple_lm import complete
+                response_text = complete(prompt, timeout=90).strip()
             else:
                 # HTTP-level timeout must account for model cold-start (~10s Metal init)
                 title_client = ollama.Client(
@@ -1739,7 +1759,6 @@ TITLE:"""
                     options=self._ollama_options(),
                 )
                 response_text = ollama_response['message']['content'].strip()
-
             # Clean up the response. Reasoning models (e.g. deepseek-r1) can
             # ignore the "just the title" instruction and wrap the answer in a
             # <think> block, a "TITLE:" label on its own line, or markdown
@@ -1861,6 +1880,9 @@ ANSWER:"""
                         content = chunk.choices[0].delta.content
                         if content:
                             yield content
+            elif self._using_apple_lm():
+                from src.apple_lm import stream_complete
+                yield from stream_complete(prompt, timeout=300)
             else:
                 if self.ai_provider == "remote":
                     self.client = ollama.Client(host=self.remote_url)
@@ -1908,6 +1930,9 @@ ANSWER:"""
                 response_text = self._adapter_chat(prompt, 120)
             elif self.ai_provider == "cloud":
                 response_text = self._cloud_chat(prompt, 120)
+            elif self._using_apple_lm():
+                from src.apple_lm import complete
+                response_text = complete(prompt, timeout=120)
             else:
                 # Retry logic for Ollama API calls (local or remote)
                 max_retries = 2
