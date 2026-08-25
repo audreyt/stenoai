@@ -561,6 +561,12 @@ function install({ ipcMain }) {
     );
   }
 
+  // User-authored chat recipes, per launch. Seeded with one so a spec can see
+  // a saved recipe alongside the built-in presets without saving first.
+  const mockRecipes = [
+    { id: 'weekly-status', label: 'Weekly status', prompt: 'Summarise this week across my meetings.' },
+  ];
+
   // Channels with behaviour a test depends on. Each is (event, ...args) like a
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
@@ -864,6 +870,58 @@ function install({ ipcMain }) {
       if (!seamPath) return { success: false, error: EXPORT_CANCELED };
       fs.writeFileSync(seamPath, content, 'utf-8');
       return { success: true, path: seamPath };
+    },
+
+    // Chat recipes (user-authored saved prompts). Backed by a module-level
+    // array so a T1 spec sees save/list/delete round-trip within one launch,
+    // mirroring the real config-backed handlers' result shapes.
+    'list-recipes': async () => ({ success: true, recipes: mockRecipes.slice() }),
+    'save-recipe': async (_event, recipe) => {
+      if (!recipe || typeof recipe.label !== 'string' || !recipe.label.trim()) {
+        return { success: false, error: 'Recipe needs a label.' };
+      }
+      if (typeof recipe.prompt !== 'string' || !recipe.prompt.trim()) {
+        return { success: false, error: 'Recipe needs a prompt.' };
+      }
+      const id = recipe.id || recipe.label.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const saved = { id, label: recipe.label.trim(), prompt: recipe.prompt };
+      const at = mockRecipes.findIndex((r) => r.id === id);
+      if (at >= 0) mockRecipes[at] = saved;
+      else mockRecipes.push(saved);
+      return { success: true, recipe: saved };
+    },
+    'delete-recipe': async (_event, id) => {
+      const at = mockRecipes.findIndex((r) => r.id === id);
+      if (at < 0) return { success: false, error: 'Unknown recipe' };
+      mockRecipes.splice(at, 1);
+      return { success: true };
+    },
+
+    // Bulk export. Same seam idea as export-transcript: no dialog under mock
+    // IPC, so STENOAI_E2E_EXPORT_PATH stands in for the chosen destination and
+    // the stub reports the count a real run would.
+    'export-all-notes': async (_event, payload) => {
+      const format = payload && payload.format;
+      if (format !== 'md' && format !== 'csv') {
+        return { success: false, error: 'Unsupported export format' };
+      }
+      const seamPath = process.env.STENOAI_E2E_EXPORT_PATH;
+      if (!seamPath) return { success: false, error: EXPORT_CANCELED };
+      global.__stenoai_e2e_export_all_calls.push({ format, targetPath: seamPath });
+      return { success: true, count: 3 };
+    },
+
+    // Mid-recording template switch. Records the calls so a T1 spec can assert
+    // the id the live dock sent, and mirrors the real handler's refusal when no
+    // recording is active.
+    'set-recording-template': async (_event, templateId) => {
+      if (typeof templateId !== 'string' || !templateId.trim()) {
+        return { success: false, error: 'Invalid template' };
+      }
+      const active = (global.__stenoai_e2e_recording_start_calls || []).length > 0;
+      if (!active) return { success: false, error: 'No active recording' };
+      global.__stenoai_e2e_set_template_calls.push(templateId);
+      return { success: true };
     },
 
     // Notification handlers — the real ones return { success, shown } after the
@@ -1430,7 +1488,36 @@ function install({ ipcMain }) {
       },
     },
     'list-folders': { success: true, folders: [] },
-    'get-calendar-events': { success: true, events: [] },
+    // Empty by default so no spec grows an upcoming card it did not ask for.
+    // STENOAI_E2E_SEED_CALENDAR=1 seeds one event starting shortly, carrying
+    // attendees with BOTH a name and an email so a spec can prove the renderer
+    // forwards display names only. A function-valued default is evaluated per
+    // invoke, so the start time is always relative to now.
+    'get-calendar-events': () => {
+      if (process.env.STENOAI_E2E_SEED_CALENDAR !== '1') {
+        return { success: true, events: [] };
+      }
+      const start = new Date(Date.now() + 10 * 60 * 1000);
+      const end = new Date(start.getTime() + 30 * 60 * 1000);
+      return {
+        success: true,
+        events: [
+          {
+            id: 'evt-parity-1',
+            title: 'Weekly Engineering Sync',
+            start: start.toISOString(),
+            end: end.toISOString(),
+            attendees: [
+              { email: 'alice@example.com', name: 'Alice Smith' },
+              { email: 'bob@example.com', name: 'Bob Jones' },
+              { email: 'nameless@example.com' },
+            ],
+            meeting_url: 'https://meet.example.com/parity',
+            response_status: 'accepted',
+          },
+        ],
+      };
+    },
     // Without these, both new toggles fall through to the permissive
     // {success:true} default (no show_menu_bar_icon/premeeting_notifications_enabled
     // field), and GeneralTab's disabled={...data === undefined} leaves both
@@ -1630,6 +1717,15 @@ function install({ ipcMain }) {
   if (!global.__stenoai_e2e_recording_start_calls) {
     global.__stenoai_e2e_recording_start_calls = [];
   }
+  if (!global.__stenoai_e2e_export_all_calls) {
+    global.__stenoai_e2e_export_all_calls = [];
+  }
+  if (!global.__stenoai_e2e_set_template_calls) {
+    global.__stenoai_e2e_set_template_calls = [];
+  }
+  if (!global.__stenoai_e2e_brief_queries) {
+    global.__stenoai_e2e_brief_queries = [];
+  }
   ipcMain.on = (channel, listener) => {
     if (channel === 'query-live-transcript-stream') {
       return originalOn(channel, (event, queryId, sessionName, question, history) => {
@@ -1724,6 +1820,65 @@ function install({ ipcMain }) {
           return;
         }
         return listener(event, queryId, question, folderId, meetingFiles);
+      });
+    }
+    // Pre-meeting brief: same multiplexed query-chunk/query-done wire as the
+    // live and cross-note streams, so a T1 spec can drive the upcoming card's
+    // brief with no backend. STENOAI_E2E_MOCK_BRIEF_EMPTY=1 exercises the
+    // no-history path the real backend signals with
+    // CHAT_STREAM_ERROR:No related notes yet.
+    if (channel === 'pre-meeting-brief-stream') {
+      return originalOn(channel, (event, queryId, title, attendees) => {
+        if (process.env.STENOAI_E2E_MOCK_BRIEF === '1') {
+          global.__stenoai_e2e_brief_queries.push({
+            queryId,
+            title,
+            attendees: Array.isArray(attendees) ? attendees : [],
+          });
+          const sender = event.sender;
+          if (!queryId || typeof queryId !== 'string') return;
+          if (sender.isDestroyed()) return;
+
+          if (activeLiveStreams.has(queryId)) {
+            for (const t of activeLiveStreams.get(queryId)) clearTimeout(t);
+            activeLiveStreams.delete(queryId);
+          }
+
+          const empty = process.env.STENOAI_E2E_MOCK_BRIEF_EMPTY === '1';
+          const timers = [];
+          if (!empty) {
+            timers.push(
+              setTimeout(() => {
+                if (!sender.isDestroyed()) {
+                  sender.send('query-chunk', { queryId, chunk: '- Last time you agreed to ' });
+                }
+              }, 50),
+            );
+            timers.push(
+              setTimeout(() => {
+                if (!sender.isDestroyed()) {
+                  sender.send('query-chunk', { queryId, chunk: 'ship the parity build.' });
+                }
+              }, 150),
+            );
+          }
+          timers.push(
+            setTimeout(() => {
+              if (!sender.isDestroyed()) {
+                sender.send(
+                  'query-done',
+                  empty
+                    ? { queryId, success: false, error: 'No related notes yet' }
+                    : { queryId, success: true },
+                );
+              }
+              activeLiveStreams.delete(queryId);
+            }, 250),
+          );
+          activeLiveStreams.set(queryId, timers);
+          return;
+        }
+        return listener(event, queryId, title, attendees);
       });
     }
     if (channel === 'query-cancel') {

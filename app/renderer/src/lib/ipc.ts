@@ -450,6 +450,16 @@ export type ListTemplatesResponse = Result<{
 }>;
 export type SaveTemplateResponse = Result<{ template: Template }>;
 
+export interface ChatRecipe {
+  id: string;
+  label: string;
+  prompt: string;
+}
+export type ListRecipesResponse = Result<{ recipes: ChatRecipe[] }>;
+export type SaveRecipeResponse = Result<{ recipe: ChatRecipe }>;
+export type ExportAllFormat = 'md' | 'csv';
+export type ExportAllNotesResponse = Result<{ count: number }>;
+
 export interface PersonProfile {
   person_id: string;
   display_name: string;
@@ -1056,6 +1066,7 @@ export interface StenoaiBridge {
       StartRecordingResponse
     >;
     stop: RequestFn<[], StopRecordingResponse>;
+    setTemplate: RequestFn<[templateId?: string | null], Result<{ templateId: string | null }>>;
     pause: RequestFn<[], PauseRecordingResponse>;
     resume: RequestFn<[], ResumeRecordingResponse>;
     reportSystemAudioState: SendFn<[active: boolean]>;
@@ -1128,6 +1139,7 @@ export interface StenoaiBridge {
       [defaultFilename: string, html: string],
       Result<{ path: string }>
     >;
+    exportAll: RequestFn<[format: ExportAllFormat, targetPath?: string | null], ExportAllNotesResponse>;
     regenTitle: RequestFn<[summaryFile: string, name: string], Result<Record<string, never>>>;
     generateReport: RequestFn<
       [summaryFile: string, templateId: string],
@@ -1145,6 +1157,7 @@ export interface StenoaiBridge {
     askStream: SendFn<[id: string, file: string, q: string]>;
     askLiveStream: SendFn<[id: string, sessionName: string, q: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>]>;
     chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null, meetingFiles?: string[] | null]>;
+    briefStream: SendFn<[id: string, title: string, attendees?: string[] | null]>;
     cancel: SendFn<[id: string]>;
   };
 
@@ -1181,6 +1194,12 @@ export interface StenoaiBridge {
     remove: RequestFn<[id: string], Result<Record<string, never>>>;
     setDefault: RequestFn<[id: string], Result<Record<string, never>>>;
     reset: RequestFn<[id: string], Result<Record<string, never>>>;
+  };
+
+  recipes: {
+    list: RequestFn<[], ListRecipesResponse>;
+    save: RequestFn<[recipe: Partial<ChatRecipe>], SaveRecipeResponse>;
+    delete: RequestFn<[id: string], Result<Record<string, never>>>;
   };
 
   speakers: {

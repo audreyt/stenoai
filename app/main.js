@@ -2506,6 +2506,44 @@ function parsePythonFailureJson(error) {
   return { success: false, error: error.message };
 }
 
+function runBackendCommandQuiet(args, { stdin, env = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    let proc;
+    try {
+      proc = spawn(getBackendPath(), args, {
+        cwd: getBackendCwd(),
+        env: Object.keys(env).length > 0 ? { ...process.env, ...env } : undefined,
+        stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      const error = new Error('Backend command failed');
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+    });
+    proc.on('error', (error) => reject(error));
+    if (stdin !== undefined && proc.stdin) {
+      proc.stdin.on('error', (err) => {
+        if (!err || err.code !== 'EPIPE') reject(err);
+      });
+      proc.stdin.end(stdin, 'utf-8');
+    }
+  });
+}
+
 async function getBackendStatusInternal(silent = true) {
   const result = await runPythonScript('simple_recorder.py', ['status'], silent);
   return { success: true, status: result };
@@ -3465,7 +3503,7 @@ function safeSendQueryPayload(sender, channel, payload) {
   } catch (_) { /* renderer gone — nothing to notify */ }
 }
 
-function handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup) {
+function handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup, options = {}) {
   if (state.done) return;
 
   if (line.startsWith('CHAT_CHUNK:')) {
@@ -3502,14 +3540,51 @@ function handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup
   }
   if (line.startsWith('CHAT_STREAM_ERROR:')) {
     if (!state.done) {
+      const mappedError = typeof options.mapStreamError === 'function'
+        ? options.mapStreamError(line)
+        : FIXED_LIVE_QUERY_ERRORS.FAILED;
       state.done = true;
       safeSendQueryPayload(sender, 'query-done', {
         queryId,
         success: false,
-        error: FIXED_LIVE_QUERY_ERRORS.FAILED,
+        error: mappedError,
       });
       cleanup();
     }
+  }
+}
+
+function handleQueryProtocolOutputChunk(data, queryId, sender, proc, state, cleanup, options = {}) {
+  if (state.done) return;
+  state.buf = (state.buf || '') + data.toString();
+  if (Buffer.byteLength(state.buf, 'utf-8') > MAX_PROTOCOL_LINE_BYTES && !state.buf.includes('\n')) {
+    state.done = true;
+    try { proc.kill(); } catch (_) {}
+    safeSendQueryPayload(sender, 'query-done', {
+      queryId,
+      success: false,
+      error: FIXED_LIVE_QUERY_ERRORS.LINE_LIMIT_EXCEEDED,
+    });
+    cleanup();
+    return;
+  }
+
+  const lines = state.buf.split(/\r?\n/);
+  state.buf = lines.pop();
+  for (const line of lines) {
+    if (state.done) break;
+    if (Buffer.byteLength(line, 'utf-8') > MAX_PROTOCOL_LINE_BYTES) {
+      state.done = true;
+      try { proc.kill(); } catch (_) {}
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId,
+        success: false,
+        error: FIXED_LIVE_QUERY_ERRORS.LINE_LIMIT_EXCEEDED,
+      });
+      cleanup();
+      return;
+    }
+    handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup, options);
   }
 }
 
@@ -3568,7 +3643,7 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
     return;
   }
 
-  const state = { done: false, totalDecodedBytes: 0 };
+  const state = { done: false, totalDecodedBytes: 0, buf: '' };
   let killTimer = null;
 
   const cleanup = () => {
@@ -3622,40 +3697,8 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
     cleanup,
   };
 
-  let buf = '';
-
   proc.stdout.on('data', (data) => {
-    if (state.done) return;
-    buf += data.toString();
-    if (Buffer.byteLength(buf, 'utf-8') > MAX_PROTOCOL_LINE_BYTES && !buf.includes('\n')) {
-      state.done = true;
-      try { proc.kill(); } catch (_) {}
-      safeSendQueryPayload(sender, 'query-done', {
-        queryId,
-        success: false,
-        error: FIXED_LIVE_QUERY_ERRORS.LINE_LIMIT_EXCEEDED,
-      });
-      cleanup();
-      return;
-    }
-
-    const lines = buf.split(/\r?\n/);
-    buf = lines.pop();
-    for (const line of lines) {
-      if (state.done) break;
-      if (Buffer.byteLength(line, 'utf-8') > MAX_PROTOCOL_LINE_BYTES) {
-        state.done = true;
-        try { proc.kill(); } catch (_) {}
-        safeSendQueryPayload(sender, 'query-done', {
-          queryId,
-          success: false,
-          error: FIXED_LIVE_QUERY_ERRORS.LINE_LIMIT_EXCEEDED,
-        });
-        cleanup();
-        return;
-      }
-      handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup);
-    }
+    handleQueryProtocolOutputChunk(data, queryId, sender, proc, state, cleanup);
   });
 
   proc.stderr.on('data', () => {
@@ -3701,7 +3744,7 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
 
   proc.on('close', (code) => {
     if (!state.done) {
-      const remainder = buf.trim();
+      const remainder = (state.buf || '').trim();
       if (remainder) {
         handleLiveQueryProtocolLine(remainder, queryId, sender, proc, state, cleanup);
       }
@@ -3721,6 +3764,158 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
       state.done = true;
       safeSendQueryPayload(sender, 'query-done', {
         queryId,
+        success: false,
+        error: FIXED_LIVE_QUERY_ERRORS.FAILED,
+      });
+    }
+    cleanup();
+  });
+});
+
+// Pre-meeting brief input caps: title <= 200 chars, at most 25 attendees,
+// each attendee <= 120 chars. These keep untrusted renderer input bounded
+// before it reaches child-process argv while still fitting real calendar data.
+const PRE_MEETING_BRIEF_MAX_TITLE_CHARS = 200;
+const PRE_MEETING_BRIEF_MAX_ATTENDEES = 25;
+const PRE_MEETING_BRIEF_MAX_ATTENDEE_CHARS = 120;
+
+function validatePreMeetingBriefInputs(queryId, title, attendees) {
+  const responseQueryId = typeof queryId === 'string' && queryId.length <= 256 ? queryId : '';
+  if (!responseQueryId) {
+    return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+  }
+  if (typeof title !== 'string') {
+    return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+  }
+  const trimmedTitle = title.trim();
+  if (!trimmedTitle || trimmedTitle.length > PRE_MEETING_BRIEF_MAX_TITLE_CHARS) {
+    return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+  }
+  if (attendees !== undefined && attendees !== null && !Array.isArray(attendees)) {
+    return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+  }
+  const cleanedAttendees = [];
+  for (const attendee of Array.isArray(attendees) ? attendees : []) {
+    if (cleanedAttendees.length >= PRE_MEETING_BRIEF_MAX_ATTENDEES) {
+      return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+    }
+    if (typeof attendee !== 'string') {
+      return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+    }
+    const trimmed = attendee.trim();
+    if (!trimmed) continue;
+    if (trimmed.length > PRE_MEETING_BRIEF_MAX_ATTENDEE_CHARS) {
+      return { valid: false, queryId: responseQueryId, error: 'Invalid request' };
+    }
+    cleanedAttendees.push(trimmed);
+  }
+  return { valid: true, queryId: responseQueryId, title: trimmedTitle, attendees: cleanedAttendees };
+}
+
+function mapPreMeetingBriefStreamError(line) {
+  const msg = line.slice('CHAT_STREAM_ERROR:'.length).trim();
+  return msg === 'No related notes yet' ? msg : FIXED_LIVE_QUERY_ERRORS.FAILED;
+}
+
+ipcMain.on('pre-meeting-brief-stream', (event, queryId, title, attendees) => {
+  const sender = event?.sender;
+  const responseQueryId =
+    typeof queryId === 'string' && queryId.length <= 256 ? queryId : '';
+  const done = (payload) =>
+    safeSendQueryPayload(sender, 'query-done', { queryId: responseQueryId, ...payload });
+
+  // Gate to trusted mainWindow.webContents
+  if (!mainWindow || mainWindow.isDestroyed() || !sender || sender !== mainWindow.webContents) {
+    done({ success: false, error: FIXED_LIVE_QUERY_ERRORS.UNAUTHORIZED });
+    return;
+  }
+
+  const validation = validatePreMeetingBriefInputs(queryId, title, attendees);
+  if (!validation.valid) {
+    done({ success: false, error: validation.error });
+    return;
+  }
+
+  const args = ['pre-meeting-brief', '--title', validation.title];
+  for (const attendee of validation.attendees) {
+    args.push('--attendee', attendee);
+  }
+
+  let proc;
+  try {
+    proc = spawn(
+      getBackendPath(),
+      args,
+      { env: { ...process.env, ...getAiEnv() }, cwd: getBackendCwd(), windowsHide: true },
+    );
+  } catch {
+    done({ success: false, error: FIXED_LIVE_QUERY_ERRORS.FAILED });
+    return;
+  }
+
+  const state = { done: false, totalDecodedBytes: 0, buf: '' };
+  const cleanup = () => {
+    activeQueryProcs.delete(validation.queryId);
+    try {
+      if (!sender.isDestroyed()) sender.removeListener('destroyed', onSenderDestroyed);
+    } catch (_) {}
+  };
+  const onSenderDestroyed = () => {
+    if (activeQueryProcs.has(validation.queryId)) {
+      state.done = true;
+      try { proc.kill(); } catch (_) {}
+      cleanup();
+    }
+  };
+  sender.once('destroyed', onSenderDestroyed);
+
+  if (sender.isDestroyed()) {
+    state.done = true;
+    try { proc.kill(); } catch (_) {}
+    cleanup();
+    return;
+  }
+
+  activeQueryProcs.set(validation.queryId, proc);
+
+  proc.stdout.on('data', (data) => {
+    handleQueryProtocolOutputChunk(data, validation.queryId, sender, proc, state, cleanup, {
+      mapStreamError: mapPreMeetingBriefStreamError,
+    });
+  });
+
+  proc.stderr.on('data', () => {
+    // Backend stderr can include note context; never log it.
+  });
+
+  proc.on('close', (code) => {
+    if (!state.done) {
+      const remainder = (state.buf || '').trim();
+      if (remainder) {
+        handleLiveQueryProtocolLine(remainder, validation.queryId, sender, proc, state, cleanup, {
+          mapStreamError: mapPreMeetingBriefStreamError,
+        });
+      }
+    }
+    if (!state.done && code !== null) {
+      state.done = true;
+      const error = code === 0
+        ? FIXED_LIVE_QUERY_ERRORS.STREAM_CLOSED
+        : FIXED_LIVE_QUERY_ERRORS.FAILED;
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId: validation.queryId,
+        success: false,
+        error,
+      });
+    }
+    cleanup();
+  });
+
+  proc.on('error', () => {
+    if (!state.done) {
+      state.done = true;
+      safeSendQueryPayload(sender, 'query-done', {
+        queryId: validation.queryId,
         success: false,
         error: FIXED_LIVE_QUERY_ERRORS.FAILED,
       });
@@ -4473,6 +4668,76 @@ ipcMain.handle('export-note-pdf', async (event, defaultFilename, html) => {
       throw writeErr;
     }
     return { success: true, path: targetPath };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+});
+
+const EXPORT_ALL_FORMATS = new Set(['md', 'csv']);
+
+function isPathWithinDir(candidatePath, dirPath) {
+  const rel = path.relative(dirPath, candidatePath);
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+async function normalizedExportAllTarget(format, targetPath) {
+  let resolvedTarget = typeof targetPath === 'string' && targetPath.trim() ? targetPath : '';
+
+  if (!resolvedTarget) {
+    if (format === 'md') {
+      const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ['openDirectory', 'createDirectory'],
+      });
+      if (result.canceled || !result.filePaths || !result.filePaths[0]) {
+        return { error: EXPORT_CANCELED };
+      }
+      resolvedTarget = result.filePaths[0];
+    } else {
+      const result = await dialog.showSaveDialog(mainWindow, {
+        defaultPath: 'stenoai-notes.csv',
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+      });
+      if (result.canceled || !result.filePath) {
+        return { error: EXPORT_CANCELED };
+      }
+      resolvedTarget = result.filePath;
+    }
+  }
+
+  const absoluteTarget = path.resolve(resolvedTarget);
+  const outputDir = getOutputDir();
+  const outputReal = await fs.promises.realpath(outputDir).catch(() => path.resolve(outputDir));
+  const targetForContainment = format === 'csv' ? path.dirname(absoluteTarget) : absoluteTarget;
+  const targetReal = await fs.promises.realpath(targetForContainment)
+    .catch(async () => {
+      const parentReal = await fs.promises.realpath(path.dirname(targetForContainment))
+        .catch(() => path.resolve(path.dirname(targetForContainment)));
+      return path.join(parentReal, path.basename(targetForContainment));
+    });
+
+  if (isPathWithinDir(targetReal, outputReal)) {
+    return { error: 'Cannot export into the notes directory.' };
+  }
+  return { path: absoluteTarget };
+}
+
+ipcMain.handle('export-all-notes', async (_event, payload) => {
+  try {
+    const format = payload && typeof payload.format === 'string' ? payload.format : '';
+    if (!EXPORT_ALL_FORMATS.has(format)) {
+      return { success: false, error: 'Invalid export format' };
+    }
+
+    const target = await normalizedExportAllTarget(format, payload ? payload.targetPath : undefined);
+    if (target.error) {
+      return { success: false, error: target.error };
+    }
+    const out = await runBackendCommandQuiet(['export-all', '--format', format, '--out', target.path]);
+    const parsed = JSON.parse(out);
+    if (parsed.success === false) {
+      return { success: false, error: parsed.error || 'Export failed' };
+    }
+    return { success: true, count: Number(parsed.count || 0) };
   } catch (err) {
     return { success: false, error: String(err && err.message ? err.message : err) };
   }
@@ -6642,6 +6907,20 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo, t
   }
 });
 
+ipcMain.handle('set-recording-template', async (_event, templateId) => {
+  if (currentRecordingProcess === null && !systemAudioRecordingActive) {
+    return { success: false, error: 'No active recording' };
+  }
+  currentRecordingTemplateId = null;
+  if (templateId && typeof templateId === 'string') {
+    const trimmed = templateId.trim();
+    if (trimmed.length > 0 && trimmed.length <= 128) {
+      currentRecordingTemplateId = trimmed;
+    }
+  }
+  return { success: true, templateId: currentRecordingTemplateId };
+});
+
 // ── Auto-pause on system sleep ──
 // Closing the laptop lid (or any suspend) used to leave an active recording
 // "running" with a broken audio stream. We pause on suspend and deliberately
@@ -8317,6 +8596,7 @@ async function ensureOllamaRunning() {
     ollamaStartedByUs = true;
 
     // Wait for service to start
+
     await new Promise(resolve => setTimeout(resolve, 2000));
     return true;
   } catch (error) {
@@ -8472,6 +8752,34 @@ ipcMain.handle('delete-template', async (_e, id) => {
     return JSON.parse(out);
   } catch (error) {
     return { success: false, error: error.message };
+  }
+});
+ipcMain.handle('list-recipes', async () => {
+  try {
+    const out = await runBackendCommandQuiet(['list-recipes']);
+    return { success: true, ...JSON.parse(out) };
+  } catch (error) {
+    return parsePythonFailureJson(error);
+  }
+});
+
+ipcMain.handle('save-recipe', async (_e, recipe) => {
+  try {
+    const out = await runBackendCommandQuiet(['save-recipe'], {
+      stdin: JSON.stringify(recipe),
+    });
+    return JSON.parse(out);
+  } catch (error) {
+    return parsePythonFailureJson(error);
+  }
+});
+
+ipcMain.handle('delete-recipe', async (_e, id) => {
+  try {
+    const out = await runBackendCommandQuiet(['delete-recipe', id]);
+    return JSON.parse(out);
+  } catch (error) {
+    return parsePythonFailureJson(error);
   }
 });
 

@@ -4653,6 +4653,144 @@ def chat_global_streaming(question, folder, meeting):
         print(f"CHAT_STREAM_ERROR:{e}", flush=True)
 
 
+@cli.command(name='pre-meeting-brief')
+@click.pass_context
+@click.option('--title', '-t', default='', help='Meeting title to match related notes')
+@click.option('--attendee', '-a', multiple=True, help='Attendee name to match related notes (repeatable)')
+def pre_meeting_brief(ctx, title, attendee):
+    """Pre-meeting brief: find related prior notes by title match or shared attendee,
+    synthesise 2-3 bullets on what happened last time, what's open, and who owes what,
+    and stream the answer."""
+    import sys
+    import base64
+    from pathlib import Path
+    from src.config import get_config, get_data_dirs
+
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    ctx.call_on_close(lambda: logging.disable(previous_logging_disable))
+
+    config = get_config()
+    dirs = get_data_dirs()
+    output_dir = dirs["output"]
+
+    target_title = (title or "").strip().lower()
+    target_attendees = {a.strip().lower() for a in attendee if a and a.strip()}
+
+    # Collect notes
+    summaries: list[tuple[Path, dict]] = []
+    seen = set()
+    for f in sorted(output_dir.glob("*_summary.md")):
+        try:
+            data = _parse_meeting_markdown(f)
+            summaries.append((f, data))
+            seen.add(f.stem.replace('_summary', ''))
+        except Exception:
+            continue
+    for f in sorted(output_dir.glob("*_summary.json")):
+        if f.stem.replace('_summary', '') in seen:
+            continue
+        try:
+            with open(f, 'r', encoding='utf-8') as fh:
+                summaries.append((f, json.load(fh)))
+        except (OSError, ValueError):
+            continue
+
+    matched_notes = []
+    for path, data in summaries:
+        info = data.get("session_info", {}) or {}
+        name = (info.get("name") or "").strip()
+        note_title = name.lower()
+        title_match = False
+        if target_title:
+            title_match = bool(target_title in note_title or (note_title and note_title in target_title))
+
+        attendee_match = False
+        if target_attendees:
+            raw_attendees = data.get("attendees") or []
+            note_attendees = {att.strip().lower() for att in raw_attendees if isinstance(att, str) and att.strip()}
+            attendee_match = bool(target_attendees & note_attendees)
+
+        if title_match or attendee_match:
+            processed_at = info.get("processed_at") or ""
+            transcript = data.get("transcript") or ""
+            if not transcript:
+                stem = path.stem.replace('_summary', '')
+                t_path = dirs["transcripts"] / f"{stem}_transcript.txt"
+                if t_path.exists():
+                    try:
+                        transcript = t_path.read_text(encoding='utf-8')
+                    except OSError:
+                        pass
+            matched_notes.append((processed_at, path, data, transcript))
+
+    if not matched_notes:
+        print("CHAT_STREAM_ERROR:No related notes yet", flush=True)
+        sys.exit(1)
+
+    # Sort newest-first (processed_at DESC)
+    matched_notes.sort(key=lambda x: x[0], reverse=True)
+
+    CORPUS_CHAR_BUDGET = _chat_corpus_char_budget(
+        config.get_ai_provider(), config.get_model()
+    )
+    blocks = []
+    used_chars = 0
+    truncated = 0
+    for idx, (processed_at, path, data, transcript) in enumerate(matched_notes):
+        info = data.get("session_info", {}) or {}
+        name = info.get("name") or "Untitled"
+        date = (info.get("processed_at") or "")[:10]
+        summary = (data.get("summary") or "").strip()
+        key_points = data.get("key_points") or []
+        action_items = data.get("action_items") or []
+        block = [f"## {name}" + (f" — {date}" if date else "")]
+        if summary:
+            block.append(summary)
+        if key_points:
+            block.append("Key points:\n" + "\n".join(f"- {p}" for p in key_points))
+        if action_items:
+            block.append("Action items:\n" + "\n".join(f"- {a}" for a in action_items))
+        if idx < 3 and transcript:
+            excerpt = _extract_transcript_excerpt(target_title or "status update", transcript, max_chars=1500)
+            if excerpt:
+                block.append(f"Transcript excerpt:\n{excerpt}")
+        block_text = "\n".join(block)
+        if used_chars + len(block_text) + 5 > CORPUS_CHAR_BUDGET:
+            if not blocks:
+                budget_left = max(0, CORPUS_CHAR_BUDGET - used_chars - 80)
+                if budget_left > 0:
+                    truncated_block = block_text[:budget_left].rstrip() + "\n…(truncated)"
+                    blocks.append(truncated_block)
+                    used_chars += len(truncated_block) + 5
+            truncated = len(matched_notes) - len(blocks)
+            break
+        blocks.append(block_text)
+        used_chars += len(block_text) + 5
+
+    corpus = "\n\n---\n\n".join(blocks)
+    if truncated:
+        corpus += (
+            f"\n\n---\n\n_Note: {truncated} older note(s) omitted to stay within"
+            " the model's context window._"
+        )
+
+    language = config.get_language()
+    if language == "auto":
+        language = "en"
+
+    try:
+        summarizer = OllamaSummarizer()
+        for chunk in summarizer.pre_meeting_brief_streaming_strict(corpus, language=language):
+            encoded = base64.b64encode(chunk.encode('utf-8')).decode('ascii')
+            sys.stdout.write(f"CHAT_CHUNK:{encoded}\n")
+            sys.stdout.flush()
+        print("CHAT_STREAM_COMPLETE", flush=True)
+    except Exception:
+        print("CHAT_STREAM_ERROR:Pre-meeting brief failed", flush=True)
+        sys.exit(1)
+
+
 @cli.command()
 def list_failed():
     """List summary files that failed processing (have fallback summaries)"""
@@ -5286,6 +5424,187 @@ def reset_template(template_id):
     print(json.dumps({"success": ok}))
     if not ok:
         sys.exit(1)
+
+
+@cli.command(name='list-recipes')
+def list_recipes():
+    """List all saved chat recipes."""
+    from src.config import get_config
+    config = get_config()
+    print(json.dumps({
+        "recipes": config.get_chat_recipes(),
+    }))
+
+
+@cli.command(name='save-recipe')
+def save_recipe():
+    """Create or update a chat recipe from stdin JSON."""
+    import sys
+    from src.config import get_config
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw)
+    except Exception as e:
+        print(json.dumps({"success": False, "error": f"Invalid JSON: {e}"}))
+        sys.exit(1)
+    ok, err, saved = get_config().save_chat_recipe(payload)
+    print(json.dumps({"success": ok, "recipe": saved} if ok
+                     else {"success": False, "error": err}))
+
+
+@cli.command(name='delete-recipe')
+@click.argument('recipe_id')
+def delete_recipe(recipe_id):
+    """Delete a chat recipe by id."""
+    from src.config import get_config
+    ok = get_config().delete_chat_recipe(recipe_id)
+    print(json.dumps({"success": ok}))
+    if not ok:
+        sys.exit(1)
+
+
+@cli.command(name='export-all')
+@click.option('--format', '-f', 'export_format', type=click.Choice(['md', 'csv'], case_sensitive=False), required=True, help='Export format: md or csv')
+@click.option('--out', '-o', required=True, help='Target output path (directory for md, file or directory for csv)')
+def export_all(export_format, out):
+    """Bulk export all notes to Markdown or CSV."""
+    import sys
+    import csv
+    from pathlib import Path
+    from src.config import get_data_dirs
+
+    dirs = get_data_dirs()
+    output_dir = dirs["output"].resolve()
+
+    if not out or not str(out).strip():
+        print(json.dumps({"success": False, "error": "Output path is required"}))
+        sys.exit(1)
+
+    out_path = Path(out).resolve()
+
+    # Reject writing into notes output directory or its subdirectories
+    if out_path == output_dir or output_dir in out_path.parents:
+        print(json.dumps({"success": False, "error": "Cannot export directly into the StenoAI notes directory"}))
+        sys.exit(1)
+
+    # Collect all notes
+    summaries: list[tuple[str, Path, dict]] = []
+    seen = set()
+    for f in sorted(output_dir.glob("*_summary.md")):
+        stem = f.stem.replace('_summary', '')
+        try:
+            data = _parse_meeting_markdown(f)
+            summaries.append((stem, f, data))
+            seen.add(stem)
+        except Exception:
+            continue
+    for f in sorted(output_dir.glob("*_summary.json")):
+        stem = f.stem.replace('_summary', '')
+        if stem in seen:
+            continue
+        try:
+            with open(f, 'r', encoding='utf-8') as fh:
+                summaries.append((stem, f, json.load(fh)))
+                seen.add(stem)
+        except (OSError, ValueError):
+            continue
+
+    # Sort notes newest-first
+    summaries.sort(
+        key=lambda x: (x[2].get("session_info", {}) or {}).get("processed_at") or "",
+        reverse=True,
+    )
+
+    fmt = export_format.lower()
+    if fmt == 'md':
+        target_dir = out_path
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(json.dumps({"success": False, "error": f"Failed to create target directory: {e}"}))
+            sys.exit(1)
+
+        count = 0
+        used_filenames = set()
+        for stem, src_file, data in summaries:
+            safe_name = re.sub(r"[^\w\-.]+", "_", stem).strip("._") or "note"
+            filename = f"{safe_name}.md"
+            idx = 2
+            while filename in used_filenames:
+                filename = f"{safe_name}_{idx}.md"
+                idx += 1
+            used_filenames.add(filename)
+
+            dest_file = (target_dir / filename).resolve()
+            if target_dir not in dest_file.parents and dest_file.parent != target_dir:
+                continue
+
+            try:
+                if src_file.suffix == '.md':
+                    content = src_file.read_text(encoding='utf-8')
+                else:
+                    info = data.get("session_info", {}) or {}
+                    title = info.get("name") or stem
+                    date = info.get("processed_at") or ""
+                    summary = data.get("summary") or ""
+                    transcript = data.get("transcript") or ""
+                    content = f"# {title}\n\nDate: {date}\n\n## Summary\n\n{summary}\n\n## Transcript\n\n{transcript}\n"
+                dest_file.write_text(content, encoding='utf-8')
+                count += 1
+            except Exception:
+                continue
+
+        print(json.dumps({"success": True, "count": count}))
+
+    elif fmt == 'csv':
+        if out_path.is_dir():
+            csv_file = out_path / "stenoai_export.csv"
+        else:
+            csv_file = out_path
+
+        try:
+            csv_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(csv_file, 'w', encoding='utf-8', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["title", "date", "duration", "folders", "attendees", "summary", "transcript"])
+                count = 0
+                for stem, src_file, data in summaries:
+                    info = data.get("session_info", {}) or {}
+                    title = info.get("name") or stem
+                    date = info.get("processed_at") or ""
+                    duration = info.get("duration_seconds")
+                    duration_str = str(duration) if duration is not None else ""
+
+                    folders = data.get("folders") or []
+                    folders_str = ", ".join(str(f) for f in folders) if isinstance(folders, list) else str(folders)
+
+                    attendees = data.get("attendees") or []
+                    attendees_str = ", ".join(str(a) for a in attendees) if isinstance(attendees, list) else str(attendees)
+
+                    summary = (data.get("summary") or "").strip()
+                    transcript = data.get("transcript") or ""
+                    if not transcript:
+                        t_path = dirs["transcripts"] / f"{stem}_transcript.txt"
+                        if t_path.exists():
+                            try:
+                                transcript = t_path.read_text(encoding='utf-8')
+                            except OSError:
+                                pass
+
+                    writer.writerow([
+                        title,
+                        date,
+                        duration_str,
+                        folders_str,
+                        attendees_str,
+                        summary,
+                        transcript,
+                    ])
+                    count += 1
+            print(json.dumps({"success": True, "count": count}))
+        except Exception as e:
+            print(json.dumps({"success": False, "error": f"Failed to export CSV: {e}"}))
+            sys.exit(1)
 
 
 @cli.command(name='enroll-voiceprint')

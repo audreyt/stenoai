@@ -366,6 +366,7 @@ class Config:
         self._migrate_identity_matching_privacy_default()
         self._normalize_templates()
         self._seed_sample_template()
+        self._normalize_recipes()
         self._normalize_voiceprints()
 
     def _migrate_language_zh(self) -> None:
@@ -961,6 +962,7 @@ class Config:
                 self.IDENTITY_MATCHING_PRIVACY_DEFAULT_VERSION,
             "whisper_model": "large-v3-turbo",
             "transcription_engine": "parakeet",
+            "chat_recipes": [],
             "version": "1.0"
         }
 
@@ -1145,6 +1147,65 @@ class Config:
         if template_id not in overrides:
             return True  # already at shipped default — no-op success
         del overrides[template_id]
+        return self._save()
+
+    # --- Chat recipes -------------------------------------------------------
+    def _normalize_recipes(self) -> None:
+        """Coerce persisted chat recipes state into a list of dicts on every load."""
+        if self._load_failed:
+            return
+        recipes_raw = self._config.get("chat_recipes", [])
+        self._config["chat_recipes"] = (
+            [r for r in recipes_raw if isinstance(r, dict)]
+            if isinstance(recipes_raw, list)
+            else []
+        )
+
+    def get_chat_recipes(self) -> list:
+        """Return the list of chat recipes."""
+        return [dict(r) for r in self._config.get("chat_recipes", []) or []]
+
+    def get_chat_recipe(self, recipe_id: str) -> Optional[dict]:
+        """Return the chat recipe with the given id, or None if not found."""
+        return next((r for r in self.get_chat_recipes() if r.get("id") == recipe_id), None)
+
+    def save_chat_recipe(self, r: dict) -> tuple:
+        """Upsert a chat recipe. Returns (ok, error, saved_recipe)."""
+        if not isinstance(r, dict):
+            return False, "Invalid recipe payload", {}
+        ok, err = _templates.validate_recipe(r)
+        if not ok:
+            return False, err, {}
+
+        recipes = self._config.setdefault("chat_recipes", [])
+        rid = r.get("id")
+        existing = next((item for item in recipes if isinstance(item, dict) and item.get("id") == rid), None) if rid else None
+        if existing is not None:
+            existing.update({
+                "label": r["label"].strip(),
+                "prompt": r["prompt"].strip(),
+            })
+            saved = dict(existing)
+        else:
+            existing_ids = {item.get("id") for item in recipes if isinstance(item, dict)}
+            new_id = _templates.new_template_id(r["label"], existing_ids)
+            saved = {
+                "id": new_id,
+                "label": r["label"].strip(),
+                "prompt": r["prompt"].strip(),
+            }
+            recipes.append(saved)
+        if not self._save():
+            return False, "Failed to save config", {}
+        return True, "", dict(saved)
+
+    def delete_chat_recipe(self, recipe_id: str) -> bool:
+        """Delete a chat recipe by id. Returns True if deleted, False if not found."""
+        recipes = self._config.get("chat_recipes", [])
+        remaining = [item for item in recipes if isinstance(item, dict) and item.get("id") != recipe_id]
+        if len(remaining) == len(recipes):
+            return False
+        self._config["chat_recipes"] = remaining
         return self._save()
 
     def _normalize_voiceprints(self) -> None:

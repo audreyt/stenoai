@@ -394,3 +394,103 @@ test('chat-sessions-migrated is emitted by main.js when live sessions are migrat
     'chat-sessions-migrated payload must include fromKey and toKey',
   );
 });
+
+test('pre-meeting brief stream is trusted-renderer gated and uses the shared query stream channels', () => {
+  const briefIndex = MAIN.indexOf("ipcMain.on('pre-meeting-brief-stream',");
+  assert.ok(briefIndex >= 0, 'expected pre-meeting-brief-stream handler in main.js');
+  const briefBlock = MAIN.slice(briefIndex, briefIndex + 5200);
+  assert.match(
+    briefBlock,
+    /sender\s*!==\s*mainWindow\.webContents/,
+    'pre-meeting-brief-stream must verify event.sender === mainWindow.webContents',
+  );
+  assert.match(
+    briefBlock,
+    /safeSendQueryPayload\(sender,\s*'query-done'/,
+    'pre-meeting-brief-stream must finish on the existing query-done channel',
+  );
+  assert.match(
+    briefBlock,
+    /handleQueryProtocolOutputChunk/,
+    'pre-meeting-brief-stream must use the shared decoder that emits query-chunk',
+  );
+  assert.match(
+    briefBlock,
+    /activeQueryProcs\.set\(validation\.queryId,\s*proc\)/,
+    'pre-meeting-brief-stream must register in activeQueryProcs so query-cancel can kill it',
+  );
+});
+
+test('pre-meeting brief argv uses title flag and repeated attendee flags', () => {
+  const briefIndex = MAIN.indexOf("ipcMain.on('pre-meeting-brief-stream',");
+  assert.ok(briefIndex >= 0, 'expected pre-meeting-brief-stream handler in main.js');
+  const briefBlock = MAIN.slice(briefIndex, briefIndex + 3000);
+  assert.match(
+    briefBlock,
+    /const args = \['pre-meeting-brief',\s*'--title',\s*validation\.title\]/,
+    'brief stream must call pre-meeting-brief --title <title>',
+  );
+  assert.match(
+    briefBlock,
+    /for \(const attendee of validation\.attendees\)\s*{\s*args\.push\('--attendee',\s*attendee\);/s,
+    'brief stream must emit one --attendee flag per attendee',
+  );
+});
+
+test('save-recipe sends recipe JSON on stdin rather than argv', () => {
+  const saveIndex = MAIN.indexOf("ipcMain.handle('save-recipe',");
+  assert.ok(saveIndex >= 0, 'expected save-recipe handler in main.js');
+  const saveBlock = MAIN.slice(saveIndex, saveIndex + 500);
+  assert.match(
+    saveBlock,
+    /runBackendCommandQuiet\(\['save-recipe'\],\s*{\s*stdin:\s*JSON\.stringify\(recipe\),/s,
+    'save-recipe must pass only the command in argv and write the recipe JSON to stdin',
+  );
+  assert.doesNotMatch(
+    saveBlock,
+    /\['save-recipe',\s*JSON\.stringify\(recipe\)\]/,
+    'save-recipe must not put recipe JSON in argv',
+  );
+});
+
+test('export-all-notes validates format and rejects destinations inside notes output', () => {
+  const exportIndex = MAIN.indexOf("ipcMain.handle('export-all-notes',");
+  assert.ok(exportIndex >= 0, 'expected export-all-notes handler in main.js');
+  const exportBlock = MAIN.slice(exportIndex - 2400, exportIndex + 1400);
+  assert.match(
+    exportBlock,
+    /const EXPORT_ALL_FORMATS = new Set\(\['md',\s*'csv'\]\)/,
+    'export-all-notes must allowlist md/csv only',
+  );
+  assert.match(
+    exportBlock,
+    /if \(!EXPORT_ALL_FORMATS\.has\(format\)\)\s*{\s*return { success: false, error: 'Invalid export format' };/s,
+    'export-all-notes must reject unknown formats before spawning the backend',
+  );
+  assert.match(
+    exportBlock,
+    /isPathWithinDir\(targetReal,\s*outputReal\)/,
+    'export-all-notes must reject destinations inside the app notes directory',
+  );
+});
+
+test('set-recording-template rejects cleanly when no recording is active', () => {
+  const setIndex = MAIN.indexOf("ipcMain.handle('set-recording-template',");
+  assert.ok(setIndex >= 0, 'expected set-recording-template handler in main.js');
+  const setBlock = MAIN.slice(setIndex, setIndex + 900);
+  assert.match(
+    setBlock,
+    /currentRecordingProcess\s*===\s*null\s*&&\s*!systemAudioRecordingActive/,
+    'set-recording-template must check both recording activity flags',
+  );
+  assert.match(
+    setBlock,
+    /return \{ success: false, error: 'No active recording' \}/,
+    'set-recording-template must return a clear no-active-recording error',
+  );
+  assert.match(
+    setBlock,
+    /currentRecordingTemplateId\s*=\s*trimmed/,
+    'set-recording-template must update currentRecordingTemplateId with the accepted id',
+  );
+});

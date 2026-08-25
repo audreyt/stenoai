@@ -113,6 +113,7 @@ const stenoai = {
       invoke('start-recording-ui', name, trigger, appendTo, templateId),
     stop: () => invoke('stop-recording-ui'),
     pause: () => invoke('pause-recording-ui'),
+    setTemplate: (templateId) => invoke('set-recording-template', templateId),
     resume: () => invoke('resume-recording-ui'),
     reportSystemAudioState: (active) => send('system-audio-recording-state', active),
     enableLoopbackAudio: () => invoke('enable-loopback-audio'),
@@ -174,6 +175,8 @@ const stenoai = {
       invoke('export-transcript', defaultFilename, content),
     exportNotePdf: (defaultFilename, html) =>
       invoke('export-note-pdf', defaultFilename, html),
+    exportAll: (format, targetPath) =>
+      invoke('export-all-notes', { format, targetPath }),
   },
 
   query: {
@@ -191,6 +194,7 @@ const stenoai = {
       meetingFiles === undefined || meetingFiles === null
         ? send('chat-global-stream', id, q, folderId ?? null)
         : send('chat-global-stream', id, q, folderId ?? null, meetingFiles),
+    briefStream: (id, title, attendees) => send('pre-meeting-brief-stream', id, title, attendees),
     cancel: (id) => send('query-cancel', id),
   },
 
@@ -219,6 +223,12 @@ const stenoai = {
     setDefault: (id) => invoke('set-default-template', id),
     reset: (id) => invoke('reset-template', id),
   },
+  recipes: {
+    list: () => invoke('list-recipes'),
+    save: (recipe) => invoke('save-recipe', recipe),
+    delete: (id) => invoke('delete-recipe', id),
+  },
+
 
   speakers: {
     listProfiles: () => invoke('list-person-profiles'),

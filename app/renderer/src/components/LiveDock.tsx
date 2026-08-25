@@ -1,5 +1,8 @@
 import * as React from 'react';
-import { ChevronUp, Play, Square } from 'lucide-react';
+import { Check, ChevronUp, Play, Square } from 'lucide-react';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { ipc } from '@/lib/ipc';
+import { cn } from '@/lib/utils';
 import { AudioWave } from '@/components/AudioWave';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { useRecording } from '@/hooks/useRecording';
@@ -36,6 +39,7 @@ export function LiveDock() {
     const found = templates.find((t) => t.id === targetId);
     return found?.name ?? 'Standard Summary';
   }, [templates, defaultId, activeTemplateId]);
+  const [templateOpen, setTemplateOpen] = React.useState(false);
 
   // recording/paused, so this branch is normally unreachable — it only
   // covers a same-render race between the queue poll and the unmount.
@@ -112,13 +116,68 @@ export function LiveDock() {
           {prepareLabel}
         </span>
       ) : activeTemplateName ? (
-        <span
-          data-testid="live-dock-template-label"
-          className="max-w-[120px] truncate px-1.5 text-xs text-[color:var(--fg-muted)]"
-          title={`Template: ${activeTemplateName}`}
-        >
-          {activeTemplateName}
-        </span>
+        <Popover open={templateOpen} onOpenChange={setTemplateOpen}>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              data-testid="live-dock-template-label"
+              aria-label={`Change template: ${activeTemplateName}`}
+              title={`Template: ${activeTemplateName}`}
+              className="max-w-[120px] truncate rounded px-1.5 py-0.5 text-xs text-[color:var(--fg-muted)] hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)] transition-colors cursor-pointer border-0 outline-none focus-visible:ring-1 focus-visible:ring-[color:var(--focus-ring)]"
+            >
+              {activeTemplateName}
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            align="start"
+            side="top"
+            sideOffset={8}
+            className="z-50 w-60 rounded-xl border p-1.5 shadow-lg outline-none"
+            style={{
+              background: 'var(--surface-raised)',
+              borderColor: 'var(--border-subtle)',
+              boxShadow: 'var(--shadow-lg)',
+            }}
+            data-testid="live-dock-template-menu"
+          >
+            <div className="px-2 py-1 text-[11px] font-semibold text-[color:var(--fg-muted)]">
+              Change template
+            </div>
+            <div className="flex flex-col gap-0.5" role="listbox" aria-label="Summary templates">
+              {templates.map((tpl) => {
+                const isSelected = tpl.id === (activeTemplateId || defaultId);
+                return (
+                  <button
+                    key={tpl.id}
+                    type="button"
+                    role="option"
+                    aria-selected={isSelected}
+                    onClick={() => {
+                      const recordingBridge = ipc().recording;
+                      if (
+                        'setTemplate' in recordingBridge &&
+                        typeof recordingBridge.setTemplate === 'function'
+                      ) {
+                        void recordingBridge.setTemplate(tpl.id);
+                      }
+                      useRecordTemplateStore.getState().setActiveTemplateId(tpl.id);
+                      setTemplateOpen(false);
+                    }}
+                    className={cn(
+                      'flex items-center justify-between rounded-lg px-2 py-1.5 text-left text-xs transition-colors cursor-pointer border-0',
+                      isSelected
+                        ? 'bg-[color:var(--surface-active)] font-medium text-[color:var(--fg-1)]'
+                        : 'text-[color:var(--fg-2)] hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]'
+                    )}
+                  >
+                    <span className="truncate">{tpl.name}</span>
+                    {isSelected && <Check className="size-3.5 shrink-0 text-[color:var(--fg-1)]" />}
+                  </button>
+                );
+              })}
+            </div>
+          </PopoverContent>
+        </Popover>
       ) : null}
       {/* Resume — only when the system auto-paused (sleep / meeting-app mic
           drop). There is no manual pause: stop ends the segment and the note

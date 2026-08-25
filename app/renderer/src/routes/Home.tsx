@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { cn, isMac } from '@/lib/utils';
 import { MeetingsShell } from '@/components/MeetingsShell';
-import { UpcomingCard } from '@/components/home/UpcomingCard';
+import { UpcomingCard, type BriefStreamState } from '@/components/home/UpcomingCard';
 import { Button } from '@/components/ui/button';
 import { AppIcon } from '@/components/ui/app-icon';
 import { KbdKey } from '@/components/ui/kbd';
@@ -95,6 +95,92 @@ export function Home({ mode }: HomeProps) {
     if (mode !== 'home') return;
     ipc().recording.hintWarmup();
   }, [mode]);
+  // Pre-meeting brief streaming state (one in flight at a time across Home)
+  const [activeBriefEventId, setActiveBriefEventId] = React.useState<string | null>(null);
+  const [briefState, setBriefState] = React.useState<BriefStreamState>({
+    text: '',
+    status: 'idle',
+    error: null,
+  });
+  const briefUnsubRef = React.useRef<(() => void) | null>(null);
+  const briefQueryIdRef = React.useRef<string | null>(null);
+
+  // Leaving Home or unmounting cancels any active brief stream
+  React.useEffect(() => {
+    return () => {
+      if (briefUnsubRef.current) {
+        briefUnsubRef.current();
+        briefUnsubRef.current = null;
+      }
+    };
+  }, [mode]);
+
+  const handleToggleBrief = React.useCallback(
+    (event: CalendarEvent) => {
+      if (activeBriefEventId === event.id) {
+        // Collapse
+        if (briefUnsubRef.current) {
+          briefUnsubRef.current();
+          briefUnsubRef.current = null;
+        }
+        setActiveBriefEventId(null);
+        setBriefState({ text: '', status: 'idle', error: null });
+        return;
+      }
+
+      // Cancel any prior in-flight brief stream
+      if (briefUnsubRef.current) {
+        briefUnsubRef.current();
+        briefUnsubRef.current = null;
+      }
+
+      const queryId = `brief-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      briefQueryIdRef.current = queryId;
+      setActiveBriefEventId(event.id);
+      setBriefState({ text: '', status: 'streaming', error: null });
+
+      // Pass the event's title and its attendee DISPLAY NAMES only.
+      // Filter out empty names and never pass email addresses.
+      const attendeeNames = (event.attendees || [])
+        .map((a) => a.name?.trim())
+        .filter((n): n is string => !!n && !n.includes('@'));
+
+      const off = ipc().subscribeQueryStream(queryId, {
+        onChunk: (chunk) => {
+          setBriefState((prev) => ({
+            ...prev,
+            text: prev.text + chunk,
+          }));
+        },
+        onDone: () => {
+          setBriefState((prev) => ({
+            ...prev,
+            status: 'done',
+          }));
+          briefQueryIdRef.current = null;
+        },
+        onError: (err) => {
+          setBriefState((prev) => ({
+            ...prev,
+            status: 'error',
+            error: err.message,
+          }));
+          briefQueryIdRef.current = null;
+        },
+      });
+
+      briefUnsubRef.current = off;
+      const queryBridge = ipc().query;
+      if ('briefStream' in queryBridge && typeof queryBridge.briefStream === 'function') {
+        queryBridge.briefStream(
+          queryId,
+          event.title || 'Untitled meeting',
+          attendeeNames
+        );
+      }
+    },
+    [activeBriefEventId]
+  );
 
   // Today's relevant events: anything that overlaps with today AND
   // hasn't ended yet AND that the user is likely to attend. Includes
@@ -691,7 +777,13 @@ export function Home({ mode }: HomeProps) {
                         {/* Events Column */}
                         <div className="flex-1 flex flex-col gap-1">
                           {group.map((event) => (
-                            <UpcomingCard key={event.id} event={event} />
+                            <UpcomingCard
+                              key={event.id}
+                              event={event}
+                              isBriefActive={activeBriefEventId === event.id}
+                              briefState={activeBriefEventId === event.id ? briefState : undefined}
+                              onToggleBrief={handleToggleBrief}
+                            />
                           ))}
                         </div>
                       </div>
@@ -709,12 +801,20 @@ export function Home({ mode }: HomeProps) {
                 events={allDayToday}
                 expanded={allDayExpanded}
                 onToggle={() => setAllDayExpanded((v) => !v)}
+                activeBriefEventId={activeBriefEventId}
+                briefState={briefState}
+                onToggleBrief={handleToggleBrief}
               />
               <div 
                 className="rounded-[16px] bg-[color:var(--surface-raised)] border shadow-sm p-2"
                 style={{ borderColor: 'var(--border-subtle)' }}
               >
-                <UpcomingCard event={tomorrowPreview} />
+                <UpcomingCard
+                  event={tomorrowPreview}
+                  isBriefActive={activeBriefEventId === tomorrowPreview.id}
+                  briefState={activeBriefEventId === tomorrowPreview.id ? briefState : undefined}
+                  onToggleBrief={handleToggleBrief}
+                />
               </div>
             </section>
           )}
@@ -726,6 +826,9 @@ export function Home({ mode }: HomeProps) {
                 events={allDayToday}
                 expanded={allDayExpanded}
                 onToggle={() => setAllDayExpanded((v) => !v)}
+                activeBriefEventId={activeBriefEventId}
+                briefState={briefState}
+                onToggleBrief={handleToggleBrief}
               />
             </section>
           )}
@@ -849,9 +952,19 @@ interface AllDayInlineProps {
   events: CalendarEvent[];
   expanded: boolean;
   onToggle: () => void;
+  activeBriefEventId?: string | null;
+  briefState?: BriefStreamState;
+  onToggleBrief?: (event: CalendarEvent) => void;
 }
 
-function AllDayInline({ events, expanded, onToggle }: AllDayInlineProps) {
+function AllDayInline({
+  events,
+  expanded,
+  onToggle,
+  activeBriefEventId,
+  briefState,
+  onToggleBrief,
+}: AllDayInlineProps) {
   if (events.length === 0) return null;
   return (
     <div className="mb-2 flex flex-col gap-2">
@@ -872,7 +985,13 @@ function AllDayInline({ events, expanded, onToggle }: AllDayInlineProps) {
           style={{ borderColor: 'var(--border-subtle)' }}
         >
           {events.map((e) => (
-            <UpcomingCard key={e.id} event={e} />
+            <UpcomingCard
+              key={e.id}
+              event={e}
+              isBriefActive={activeBriefEventId === e.id}
+              briefState={activeBriefEventId === e.id ? briefState : undefined}
+              onToggleBrief={onToggleBrief}
+            />
           ))}
         </div>
       )}
