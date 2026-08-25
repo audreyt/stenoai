@@ -336,5 +336,58 @@ class AppleLMCLITests(BaseAppleLMTest):
             self.assertIn("Apple System Language Model (coreAdvanced3)", llm_check["detail"])
 
 
+class AppleLMStreamDeadlineTests(BaseAppleLMTest):
+    """Pins the exception TYPE the sidecar raises when a stream stalls.
+
+    ``OllamaSummarizer.query_transcript_streaming_strict`` re-raises
+    ``TimeoutError`` instead of falling back to Ollama, because main.js kills a
+    live query at the same 300 s mark and a retry started after a full stall
+    would be SIGKILLed before emitting anything. ``subprocess.TimeoutExpired``
+    is NOT a ``TimeoutError`` subclass, so if this ever raised that instead,
+    that branch would go dead silently and a stalled sidecar would start being
+    retried again. The only test in this suite that spawns the sidecar path —
+    against a fake binary, with a 1 s deadline, no model and no network.
+    """
+
+    def _fake_sidecar(self, body: str) -> str:
+        path = Path(self._tmp_dir.name) / "steno-apple-lm"
+        path.write_text(body)
+        path.chmod(0o755)
+        return str(path)
+
+    def test_stalled_stream_raises_builtin_timeouterror(self):
+        import subprocess
+
+        # `exec` so the shell does not leave a grandchild holding the pipe
+        binary = self._fake_sidecar("#!/bin/sh\nexec sleep 30\n")
+        with mock.patch.dict(os.environ, {
+            "STENOAI_DISABLE_APPLE_LM": "0",
+            "STENOAI_APPLE_LM_BIN": binary,
+        }):
+            reset_apple_lm_cache()
+            from src.apple_lm import stream_complete
+            with self.assertRaises(TimeoutError) as ctx:
+                list(stream_complete("hello", timeout=1))
+        self.assertNotIsInstance(ctx.exception, subprocess.TimeoutExpired)
+        self.assertIn("timed out", str(ctx.exception).lower())
+
+    def test_error_record_raises_runtimeerror_so_it_can_fall_back(self):
+        """The refusal case must NOT be a TimeoutError, or the fallback that
+        makes guardrail-refused questions answerable would never run."""
+        binary = self._fake_sidecar(
+            '#!/bin/sh\ncat > /dev/null\necho \'{"error":"apple_lm_failed","reason":"unavailable"}\'\n'
+        )
+        with mock.patch.dict(os.environ, {
+            "STENOAI_DISABLE_APPLE_LM": "0",
+            "STENOAI_APPLE_LM_BIN": binary,
+        }):
+            reset_apple_lm_cache()
+            from src.apple_lm import stream_complete
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream_complete("hello", timeout=10))
+        self.assertNotIsInstance(ctx.exception, TimeoutError)
+        self.assertIn("failed", str(ctx.exception).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

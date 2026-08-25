@@ -210,6 +210,14 @@ def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+        # Deliberately NOT closing proc.stdout/stderr here. Popen closes them
+        # when it is collected, which under CPython refcounting is immediately
+        # after this frame; an explicit close instead blocks on the reader
+        # thread's lock until the pipe's write end is released, and a sidecar
+        # that spawned its own child leaves that end open after the kill —
+        # measured as a 30 s hang. A momentarily-open fd in a short-lived CLI
+        # beats a user-visible stall.
+
 
 def _run_apple_lm(
     args: list[str],
