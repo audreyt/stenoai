@@ -202,6 +202,55 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
                 mock_complete.assert_called_once()
                 self.assertEqual(mock_complete.call_args.kwargs.get("timeout"), 90)
 
+    def test_long_transcript_uses_snapshot_compact(self):
+        cfg = mock.Mock()
+        cfg.get_ai_provider.return_value = "local"
+        cfg.get_remote_ollama_url.return_value = None
+        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
+        cfg.get_language_name.return_value = "English"
+        with mock.patch("src.apple_lm.apple_lm_available", return_value=True):
+            summarizer = OllamaSummarizer(config=cfg)
+        prompts = []
+
+        def fake_complete(prompt, timeout=7200):
+            prompts.append(prompt)
+            return f"SNAPSHOT-{len(prompts)}\nDECISIONS\n- keep going"
+
+        def fake_stream(prompt, timeout=7200):
+            yield "## Summary\nSnapshot formatted."
+
+        transcript = "".join(
+            f"Speaker A: unique-line-{i} was discussed.\n" for i in range(500)
+        )
+        with mock.patch("src.apple_lm.complete", side_effect=fake_complete), \
+             mock.patch("src.apple_lm.stream_complete", side_effect=fake_stream), \
+             mock.patch.object(summarizer, "_map_reduce_streaming") as map_reduce:
+            text = "".join(summarizer.summarize_transcript_streaming(transcript))
+        map_reduce.assert_not_called()
+        self.assertIn("Snapshot formatted.", text)
+        self.assertGreaterEqual(len(prompts), 2)
+        self.assertTrue(all("CURRENT SNAPSHOT" in p for p in prompts))
+        self.assertIn("SNAPSHOT-1", prompts[1])
+        joined = "\n".join(prompts)
+        self.assertIn("unique-line-0", joined)
+        self.assertIn("unique-line-499", joined)
+
+    def test_hard_trim_snapshot_keeps_head_and_tail(self):
+        cfg = mock.Mock()
+        cfg.get_ai_provider.return_value = "local"
+        cfg.get_remote_ollama_url.return_value = None
+        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
+        with mock.patch("src.apple_lm.apple_lm_available", return_value=True):
+            summarizer = OllamaSummarizer(config=cfg)
+        from src.summarizer import _SNAPSHOT_MAX_CHARS
+        blob = "H" * 2000 + "MID" + "T" * 2000
+        trimmed = summarizer._hard_trim_snapshot(blob)
+        self.assertLessEqual(len(trimmed), _SNAPSHOT_MAX_CHARS)
+        self.assertTrue(trimmed.startswith("H"))
+        self.assertTrue(trimmed.endswith("T"))
+        self.assertIn("...", trimmed)
+
+
 class AppleLMCLITests(BaseAppleLMTest):
     def test_list_models_prepends_apple_system_when_available(self):
         with mock.patch("src.apple_lm.apple_lm_available", return_value=True), \

@@ -112,6 +112,14 @@ CHARS_PER_TOKEN = 4               # English baseline; used for the reduce-fits s
 _CHUNK_SAFETY_CHARS_PER_TOKEN = 2 # used for chunk budget: worst-case German/BPE (2.0 c/t floor)
 _OVERLAP_RATIO = 0.05             # last 5% of previous chunk prepended to next
 
+# Apple 4k path. Advanced accepted an image Attachment (2026-08-25 probe) but
+# returned 2 chars and missed the needle — do not rasterize. Carry a bounded
+# text snapshot; keep the newest slice verbatim. Map-reduce forgets reversals
+# and dies at hierarchical depth 2 on this window.
+_SNAPSHOT_MAX_CHARS = 2800
+_SNAPSHOT_PROMPT_OVERHEAD_CHARS = 900
+_SNAPSHOT_HEAD_RATIO = 0.6
+
 
 def resolve_num_ctx(model_name: str) -> int:
     """Context window (num_ctx) to request from Ollama for ``model_name``.
@@ -301,9 +309,10 @@ class OllamaSummarizer:
         content_tokens = num_ctx - MAP_PROMPT_OVERHEAD_TOKENS - MAP_OUTPUT_MAX_TOKENS
         return int(content_tokens * _CHUNK_SAFETY_CHARS_PER_TOKEN)
 
-    def _split_into_chunks(self, transcript: str) -> list[str]:
+    def _split_into_chunks(self, transcript: str, budget: Optional[int] = None) -> list[str]:
         """Split transcript into overlapping chunks that each fit within the model context."""
-        budget = self._chunk_budget_chars()
+        if budget is None:
+            budget = self._chunk_budget_chars()
         overlap_chars = int(budget * _OVERLAP_RATIO)
         content_budget = budget - overlap_chars
 
@@ -586,6 +595,76 @@ class OllamaSummarizer:
         # STREAM_ERROR instead.
         if not ''.join(streamed_chunks).strip():
             raise ValueError("Reduce step returned empty result")
+
+    def _snapshot_slice_budget_chars(self) -> int:
+        window = resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
+        output_reserve = MAP_OUTPUT_MAX_TOKENS * _CHUNK_SAFETY_CHARS_PER_TOKEN
+        budget = window - _SNAPSHOT_MAX_CHARS - _SNAPSHOT_PROMPT_OVERHEAD_CHARS - output_reserve
+        return max(800, budget)
+
+    def _hard_trim_snapshot(self, snapshot: str) -> str:
+        if len(snapshot) <= _SNAPSHOT_MAX_CHARS:
+            return snapshot
+        head = int(_SNAPSHOT_MAX_CHARS * _SNAPSHOT_HEAD_RATIO)
+        tail = _SNAPSHOT_MAX_CHARS - head - 5
+        return snapshot[:head] + "\n...\n" + snapshot[-tail:]
+
+    def _create_snapshot_update_prompt(
+        self, snapshot: str, slice_text: str, chunk_num: int, total_chunks: int
+    ) -> str:
+        current = snapshot.strip() or "(empty)"
+        return (
+            "Maintain a running meeting snapshot. Extract only what is explicitly stated.\n"
+            f"Hard cap: {_SNAPSHOT_MAX_CHARS} characters. Prefer dropping chatter over "
+            "decisions, actions, or reversals. If this slice contradicts the snapshot, "
+            "the slice wins and note the reversal.\n\n"
+            "Emit ONLY the updated snapshot with these headers:\n"
+            "ATTENDEES\nDECISIONS\nACTIONS\nOPEN\nTIMELINE\n\n"
+            f"CURRENT SNAPSHOT:\n{current}\n\n"
+            f"NEW TRANSCRIPT (part {chunk_num} of {total_chunks}):\n{slice_text}"
+        )
+
+    def _complete_snapshot(self, prompt: str) -> str:
+        from src.apple_lm import complete
+
+        text = (complete(prompt) or "").strip()
+        if not text:
+            raise ValueError("Snapshot update returned an empty result")
+        return self._hard_trim_snapshot(text)
+
+    def _snapshot_compact_streaming(
+        self,
+        transcript: str,
+        language: str = "en",
+        notes: str = None,
+        progress_callback=None,
+        template_prompt: Optional[str] = None,
+    ):
+        """Sequential snapshot updates, then one format pass. Apple 4k path."""
+        slices = self._split_into_chunks(transcript, budget=self._snapshot_slice_budget_chars())
+        n = len(slices)
+        snapshot = (notes or "").strip()
+        for i, slice_text in enumerate(slices):
+            if progress_callback:
+                progress_callback(i + 1, n)
+            snapshot = self._complete_snapshot(
+                self._create_snapshot_update_prompt(snapshot, slice_text, i + 1, n)
+            )
+        if progress_callback:
+            progress_callback(n + 1, n)
+        if template_prompt:
+            prompt = self._create_template_report_prompt(
+                snapshot, template_prompt, language, notes=None
+            )
+        else:
+            prompt = self._create_markdown_prompt(snapshot, language, notes=None)
+        yielded = []
+        for chunk in self._stream_direct(prompt):
+            if chunk:
+                yielded.append(chunk)
+                yield chunk
+        if not "".join(yielded).strip():
+            raise ValueError("Snapshot format step returned empty result")
 
     def _repair_json(self, json_text: str) -> Optional[str]:
         """
@@ -1575,7 +1654,15 @@ TRANSCRIPT:
             str: Text chunks as they arrive from the LLM
         """
         transcript = _strip_leading_timestamps(transcript)
-        if template_prompt:
+        if self._using_apple_lm() and self._needs_chunking(transcript, notes):
+            inner = self._snapshot_compact_streaming(
+                transcript, language, notes, progress_callback, template_prompt
+            )
+            empty_message = (
+                "Model returned an empty report" if template_prompt
+                else "Model returned an empty summary"
+            )
+        elif template_prompt:
             # Free-form template report: no chunking/map-reduce (those prompts are
             # summary-schema specific and don't apply here). Stream through the
             # ACTIVE provider — not straight to Ollama, which has no client and
