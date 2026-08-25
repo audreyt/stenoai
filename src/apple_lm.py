@@ -23,7 +23,18 @@ from typing import Any, Dict, Iterator, Optional
 logger = logging.getLogger(__name__)
 
 APPLE_SYSTEM_MODEL = "apple:system"
-APPLE_LM_NUM_CTX = 4096
+# Apple's on-device session window, in tokens. This is not a knob we send to
+# the model — the OS owns the session — it only sizes OUR prompt budgets
+# (resolve_num_ctx -> corpus/chunk/snapshot budgets in src.summarizer).
+#
+# Measured on this class of machine (AFM 3 Core Advanced, macOS 27) by feeding
+# needle-in-filler prompts of increasing size straight at the sidecar: clean
+# answers through ~37.9k chars, hard refusal from ~40.0k. At the repo's 3.5
+# chars/token English assumption that cliff is ~11k tokens, so an 8k window is
+# the honest figure and leaves the derived budgets (largest: ~15.8k chars for
+# the chat corpus) well under half the measured ceiling. It was 4096, which
+# silently halved every Apple budget.
+APPLE_LM_NUM_CTX = 8192
 
 _DISABLE_ENV = "STENOAI_DISABLE_APPLE_LM"
 _BIN_ENV = "STENOAI_APPLE_LM_BIN"

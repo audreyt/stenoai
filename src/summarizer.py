@@ -112,7 +112,8 @@ CHARS_PER_TOKEN = 4               # English baseline; used for the reduce-fits s
 _CHUNK_SAFETY_CHARS_PER_TOKEN = 2 # used for chunk budget: worst-case German/BPE (2.0 c/t floor)
 _OVERLAP_RATIO = 0.05             # last 5% of previous chunk prepended to next
 
-# Apple 4k path. Advanced accepted an image Attachment (2026-08-25 probe) but
+# Apple on-device path (8k window — see APPLE_LM_NUM_CTX, measured, not
+# assumed). Advanced accepted an image Attachment (2026-08-25 probe) but
 # returned 2 chars and missed the needle — do not rasterize. Carry a bounded
 # text snapshot; keep the newest slice verbatim. Map-reduce forgets reversals
 # and dies at hierarchical depth 2 on this window.
@@ -640,7 +641,7 @@ class OllamaSummarizer:
         progress_callback=None,
         template_prompt: Optional[str] = None,
     ):
-        """Sequential snapshot updates, then one format pass. Apple 4k path."""
+        """Sequential snapshot updates, then one format pass. Apple on-device path."""
         slices = self._split_into_chunks(transcript, budget=self._snapshot_slice_budget_chars())
         n = len(slices)
         snapshot = (notes or "").strip()
