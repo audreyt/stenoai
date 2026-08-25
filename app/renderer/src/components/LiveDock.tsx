@@ -6,7 +6,8 @@ import { useRecording } from '@/hooks/useRecording';
 import { useLiveTranscriptStatus } from '@/hooks/useLiveTranscript';
 import { useLiveTranscriptOpen } from '@/hooks/liveTranscriptOpenStore';
 import { useLiveTranscriptAvailable } from '@/hooks/useModels';
-
+import { useTemplates } from '@/hooks/useTemplates';
+import { useRecordTemplateStore } from '@/hooks/useSystemAudioCapture';
 /**
  * Compact (Granola-style) transcription pill shown whenever a recording is
  * active — recording coexists with whatever the user is viewing; PrimaryDock
@@ -28,6 +29,14 @@ export function LiveDock() {
   const paused = recording.status === 'paused';
   const isRecording = recording.status === 'recording';
   // Belt-and-braces: PrimaryDock unmounts the pill before status leaves
+  const { templates, defaultId } = useTemplates();
+  const activeTemplateId = useRecordTemplateStore((s) => s.activeTemplateId);
+  const activeTemplateName = React.useMemo(() => {
+    const targetId = activeTemplateId || defaultId;
+    const found = templates.find((t) => t.id === targetId);
+    return found?.name ?? 'Standard Summary';
+  }, [templates, defaultId, activeTemplateId]);
+
   // recording/paused, so this branch is normally unreachable — it only
   // covers a same-render race between the queue poll and the unmount.
   const stopped = !paused && !isRecording;
@@ -95,14 +104,22 @@ export function LiveDock() {
       </span>
       {/* No elapsed timer here — the toolbar's recording chip already shows it.
           Keep only the transient warm-up hint while the live model loads. */}
-      {prepareLabel && (
+      {prepareLabel ? (
         <span
           className="px-1.5"
           style={{ fontFamily: 'var(--font-sans)', fontSize: 12.5, color: 'var(--fg-2)' }}
         >
           {prepareLabel}
         </span>
-      )}
+      ) : activeTemplateName ? (
+        <span
+          data-testid="live-dock-template-label"
+          className="max-w-[120px] truncate px-1.5 text-xs text-[color:var(--fg-muted)]"
+          title={`Template: ${activeTemplateName}`}
+        >
+          {activeTemplateName}
+        </span>
+      ) : null}
       {/* Resume — only when the system auto-paused (sleep / meeting-app mic
           drop). There is no manual pause: stop ends the segment and the note
           can be continued later. */}

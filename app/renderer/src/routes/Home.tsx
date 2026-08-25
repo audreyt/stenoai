@@ -1,9 +1,20 @@
 import * as React from 'react';
-import { Calendar, ChevronLeft, ChevronRight, Plus, RefreshCw, Search, Square, X } from 'lucide-react';
+import {
+  AudioLines,
+  Calendar,
+  ChevronLeft,
+  ChevronRight,
+  Folder as FolderIcon,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Search,
+  Square,
+  X,
+} from 'lucide-react';
 import { cn, isMac } from '@/lib/utils';
 import { MeetingsShell } from '@/components/MeetingsShell';
 import { UpcomingCard } from '@/components/home/UpcomingCard';
-import { PreviousRow } from '@/components/home/PreviousRow';
 import { Button } from '@/components/ui/button';
 import { AppIcon } from '@/components/ui/app-icon';
 import { KbdKey } from '@/components/ui/kbd';
@@ -19,7 +30,9 @@ import { useRecordHotkeySetting } from '@/hooks/useSettings';
 import { ipc, type CalendarEvent, type Meeting } from '@/lib/ipc';
 import { pickInProgressEvent } from '@/lib/calendar';
 import { heroHeadline, heroSubtitle } from '@/lib/hero';
-import { searchNotes } from '@/lib/noteSearch';
+import { searchNotesDetailed, type NoteSearchMatch } from '@/lib/noteSearch';
+import { useMeetingsList } from '@/lib/meetingsListContext';
+import { stripReasoning } from '@/lib/markdown';
 import { navigate } from '@/lib/router';
 
 interface HomeProps {
@@ -213,11 +226,25 @@ export function Home({ mode }: HomeProps) {
   // unfiltered Previous list since it's already chronologically grouped.
   const [search, setSearch] = React.useState('');
   const searchInputRef = React.useRef<HTMLInputElement>(null);
+  const searchResults = React.useMemo(() => {
+    if (mode !== 'meetings' || !search.trim()) return null;
+    return searchNotesDetailed(previous, search);
+  }, [mode, previous, search]);
+
+  const searchMatchMap = React.useMemo(() => {
+    if (!searchResults) return new Map<string, NoteSearchMatch>();
+    const map = new Map<string, NoteSearchMatch>();
+    for (const r of searchResults) {
+      map.set(r.meeting.session_info.summary_file, r.match);
+    }
+    return map;
+  }, [searchResults]);
+
   const filtered = React.useMemo(() => {
     if (mode !== 'meetings') return previous;
     if (!search.trim()) return previous;
-    return searchNotes(previous, search);
-  }, [mode, previous, search]);
+    return searchResults ? searchResults.map((r) => r.meeting) : previous;
+  }, [mode, previous, search, searchResults]);
   const groups = React.useMemo(() => groupPrevious(filtered), [filtered]);
 
   // Calendar-connect nudge: most new users don't realise Steno can
@@ -764,10 +791,12 @@ export function Home({ mode }: HomeProps) {
                   </div>
                   <div>
                     {g.items.map((m) => (
-                      <PreviousRow
+                      <HomeMeetingRow
                         key={m.session_info.summary_file}
                         meeting={m}
                         folderName={firstFolderName(m, folderName)}
+                        searchMatch={searchMatchMap.get(m.session_info.summary_file)}
+                        searchQuery={search}
                       />
                     ))}
                   </div>
@@ -900,4 +929,219 @@ function groupLabel(d: Date, now: Date): string {
     return d.toLocaleDateString(undefined, { weekday: 'long' });
   }
   return d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+interface HomeMeetingRowProps {
+  meeting: Meeting;
+  folderName?: string;
+  searchMatch?: NoteSearchMatch;
+  searchQuery?: string;
+}
+
+function HomeMeetingRow({
+  meeting,
+  folderName,
+  searchMatch,
+  searchQuery,
+}: HomeMeetingRowProps) {
+  const info = meeting.session_info;
+  const when = formatTime(info.processed_at ?? info.updated_at);
+  const duration = formatDuration(info.duration_seconds);
+  const isLive = meeting.is_recording;
+  const isProcessing = meeting.is_processing;
+  const isSynthetic = isLive || isProcessing;
+  const participants = Array.isArray(meeting.participants)
+    ? meeting.participants.length
+    : 0;
+  const list = useMeetingsList();
+
+  const targetPath = isLive
+    ? '/recording'
+    : isProcessing
+      ? '/meetings/processing'
+      : `/meetings/${encodeURIComponent(info.summary_file)}`;
+
+  const title = info.name || 'Untitled note';
+
+  const showFieldLabel = Boolean(
+    searchQuery?.trim() &&
+      searchMatch &&
+      searchMatch.field !== 'title' &&
+      searchMatch.label
+  );
+  const preview = previewText(meeting);
+  const sub = searchMatch?.snippet || preview;
+  const showPreview = sub && !isSynthetic;
+
+  return (
+    <div
+      className="group relative flex cursor-pointer items-center justify-between py-[10px] -mx-3 px-3 rounded-lg transition-colors hover:bg-[color:var(--surface-hover)]"
+      data-testid="previous-row"
+      data-recording={isLive ? 'true' : undefined}
+      data-processing={isProcessing ? 'true' : undefined}
+      role="button"
+      tabIndex={0}
+      draggable={!isSynthetic && !!list}
+      onDragStart={(e) =>
+        !isSynthetic && list?.startMeetingDrag(info.summary_file, e)
+      }
+      onContextMenu={(e) =>
+        !isSynthetic && list?.openMeetingContextMenu(info.summary_file, e)
+      }
+      onClick={() => navigate(targetPath)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          navigate(targetPath);
+        }
+      }}
+    >
+      <div className="flex min-w-0 flex-1 items-center gap-3.5">
+        <div
+          aria-hidden="true"
+          className="flex size-9 flex-shrink-0 items-center justify-center rounded-lg text-[15px] font-medium"
+          style={{ background: 'var(--surface-sunken)', color: 'var(--fg-2)' }}
+        >
+          {title.charAt(0).toUpperCase()}
+        </div>
+
+        <div className="flex min-w-0 flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <div
+              className="truncate text-[13.5px] font-medium tracking-[-0.005em]"
+              style={{ color: 'var(--fg-1)' }}
+            >
+              {title}
+            </div>
+            {isLive && <LiveBadge />}
+            {isProcessing && <ProcessingBadge />}
+          </div>
+
+          {(folderName || participants > 0 || showFieldLabel || showPreview) && (
+            <div
+              className="flex items-center gap-1.5 truncate text-[12px] font-medium"
+              style={{ color: 'var(--fg-muted)' }}
+            >
+              {folderName && (
+                <>
+                  <span className="flex items-center gap-1">
+                    <FolderIcon className="size-3" />
+                    {folderName}
+                  </span>
+                  {(participants > 0 || showFieldLabel || showPreview) && (
+                    <span className="opacity-40">·</span>
+                  )}
+                </>
+              )}
+              {participants > 0 && (
+                <>
+                  <span>
+                    {participants} {participants === 1 ? 'person' : 'people'}
+                  </span>
+                  {(showFieldLabel || showPreview) && (
+                    <span className="opacity-40">·</span>
+                  )}
+                </>
+              )}
+              {showFieldLabel && (
+                <span
+                  className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium tracking-[0.01em] shrink-0"
+                  style={{
+                    background: 'var(--surface-sunken)',
+                    color: 'var(--fg-2)',
+                    border: '1px solid var(--border-subtle)',
+                  }}
+                >
+                  {searchMatch?.label}
+                </span>
+              )}
+              {showPreview && <span className="truncate">{sub}</span>}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div
+        className="flex flex-col items-end gap-1.5 pl-4 text-[12.5px] tabular-nums"
+        style={{ color: 'var(--fg-2)' }}
+      >
+        <span>{isSynthetic ? 'Now' : (when ?? '')}</span>
+        {(duration || (!isSynthetic && meeting.has_audio)) && (
+          <span className="flex items-center gap-1 text-[11.5px] opacity-70">
+            {!isSynthetic && meeting.has_audio && (
+              <AudioLines
+                className="size-3"
+                aria-label="Original audio still available"
+                data-testid="previous-row-has-audio"
+              >
+                <title>Original audio still available</title>
+              </AudioLines>
+            )}
+            {duration}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LiveBadge() {
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium"
+      style={{
+        background: 'var(--recording)',
+        color: '#FFFFFF',
+      }}
+    >
+      <span
+        aria-hidden
+        className="inline-block size-1.5 rounded-full bg-white"
+        style={{ animation: 'pulse 1.4s ease-in-out infinite' }}
+      />
+      Recording
+    </span>
+  );
+}
+
+function ProcessingBadge() {
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium"
+      style={{
+        background: 'var(--surface-sunken)',
+        color: 'var(--fg-2)',
+        borderRadius: 'var(--radius-sm)',
+      }}
+    >
+      <Loader2 className="size-[10px] animate-spin" aria-hidden />
+      Processing
+    </span>
+  );
+}
+
+function formatTime(iso?: string): string | undefined {
+  if (!iso) return undefined;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return undefined;
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatDuration(seconds?: number): string | undefined {
+  if (!seconds || seconds <= 0) return undefined;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
+function previewText(meeting: Meeting): string | undefined {
+  const summary = meeting.summary ? stripReasoning(meeting.summary).trim() : undefined;
+  if (summary) return summary;
+  const kp = meeting.key_points?.[0];
+  if (typeof kp === 'string' && kp.trim()) return kp.trim();
+  return undefined;
 }

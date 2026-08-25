@@ -273,6 +273,107 @@ const AUDIO_SEED_MEETINGS = [
   },
 ];
 
+// Seed meetings with varied attendee counts and transcript-only keywords
+// for Granola-parity metadata and search tests (STENOAI_E2E_SEED_ATTENDEES=1).
+const ATTENDEES_SEED_MEETINGS = [
+  {
+    session_info: {
+      name: '1-on-1 Catchup',
+      summary_file: 'single_attendee.json',
+      processed_at: '2026-08-20T10:00:00Z',
+      duration_seconds: 1800,
+      transcription_failed: false,
+    },
+    summary: 'Discussed civic AI roadmap.',
+    transcript: 'Audrey: We should align on civic AI.',
+    attendees: ['Dr. Audrey Tang'],
+    participants: ['Audrey'],
+    key_points: [],
+    action_items: [],
+    discussion_areas: [],
+  },
+  {
+    session_info: {
+      name: 'Weekly Engineering Sync',
+      summary_file: 'team_sync.json',
+      processed_at: '2026-08-20T11:00:00Z',
+      duration_seconds: 1800,
+      transcription_failed: false,
+    },
+    summary: 'Team status review.',
+    transcript: 'Speaker 1: Reviewing sprint progress.',
+    attendees: ['Alice Smith', 'Bob Jones', 'Charlie Brown'],
+    participants: ['Speaker 1'],
+    key_points: [],
+    action_items: [],
+    discussion_areas: [],
+  },
+  {
+    session_info: {
+      name: 'Company All Hands',
+      summary_file: 'all_hands.json',
+      processed_at: '2026-08-20T12:00:00Z',
+      duration_seconds: 3600,
+      transcription_failed: false,
+    },
+    summary: 'Quarterly company review and updates.',
+    transcript: 'Quarterly company review.',
+    attendees: Array.from({ length: 30 }, (_, i) => `Colleague ${i + 1}`),
+    participants: [],
+    key_points: [],
+    action_items: [],
+    discussion_areas: [],
+  },
+  {
+    session_info: {
+      name: 'Solo Brainstorming',
+      summary_file: 'solo_note.json',
+      processed_at: '2026-08-20T13:00:00Z',
+      duration_seconds: 900,
+      transcription_failed: false,
+    },
+    summary: 'Personal ideas and reflections.',
+    transcript: 'Personal reflections.',
+    attendees: [],
+    participants: ['Self'],
+    key_points: [],
+    action_items: [],
+    discussion_areas: [],
+  },
+  {
+    session_info: {
+      name: 'Sprint Planning',
+      summary_file: 'sprint_planning.json',
+      processed_at: '2026-08-20T14:00:00Z',
+      duration_seconds: 1800,
+      transcription_failed: false,
+    },
+    summary: 'Regular team planning for sprint 42.',
+    transcript: 'Alice: We have resolved the secret_zeta_keyword blocker.\nBob: Great news.',
+    attendees: [],
+    participants: ['Alice', 'Bob'],
+    key_points: [],
+    action_items: [],
+    discussion_areas: [],
+  },
+  {
+    session_info: {
+      name: 'Design Review',
+      summary_file: 'design_review.json',
+      processed_at: '2026-08-20T15:00:00Z',
+      duration_seconds: 1800,
+      transcription_failed: false,
+    },
+    summary: 'Reviewing component library and tokens.',
+    transcript: 'Charlie: The buttons look good in dark mode.',
+    attendees: [],
+    participants: ['Charlie'],
+    key_points: [],
+    action_items: [],
+    discussion_areas: [],
+  },
+];
+
 function install({ ipcMain }) {
   // In-memory stand-in for the org session + provider config that the real
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
@@ -464,7 +565,18 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
-    'start-recording-ui': async (_event, name, _trigger, appendTo) => {
+    'start-recording-ui': async (_event, ...args) => {
+      const [name, trigger, appendTo, templateId] = args;
+      if (!global.__stenoai_e2e_recording_start_calls) {
+        global.__stenoai_e2e_recording_start_calls = [];
+      }
+      global.__stenoai_e2e_recording_start_calls.push({
+        name: name !== undefined ? name : undefined,
+        trigger: trigger !== undefined ? trigger : undefined,
+        appendTo: appendTo !== undefined ? appendTo : undefined,
+        templateId: templateId !== undefined ? templateId : undefined,
+        argsLength: templateId !== undefined ? 4 : 3,
+      });
       rec.active = true;
       rec.paused = false;
       rec.processing = false;
@@ -623,6 +735,9 @@ function install({ ipcMain }) {
     // lives in MOCKS, which shadows DEFAULTS, so it is the single source for the
     // channel.
     'list-meetings': async () => {
+      if (process.env.STENOAI_E2E_SEED_ATTENDEES === '1') {
+        return { success: true, meetings: ATTENDEES_SEED_MEETINGS };
+      }
       if (process.env.STENOAI_E2E_SEED_AUDIO_MEETINGS === '1') {
         return { success: true, meetings: AUDIO_SEED_MEETINGS };
       }
@@ -665,6 +780,14 @@ function install({ ipcMain }) {
     // by filtering list-meetings — answer it with the same seeded meeting so the
     // transcript-export detail route resolves and renders the transcript actions.
     'get-meeting': async (_event, summaryFile) => {
+      if (process.env.STENOAI_E2E_SEED_ATTENDEES === '1') {
+        const m = ATTENDEES_SEED_MEETINGS.find(
+          (x) => x.session_info && x.session_info.summary_file === summaryFile,
+        );
+        return m
+          ? { success: true, meeting: applyOverlay(m) }
+          : { success: false, error: 'meeting not found' };
+      }
       if (process.env.STENOAI_E2E_SEED_PENDING_NOTE === '1') {
         return { success: true, meeting: applyOverlay(PENDING_MEETING) };
       }
@@ -1501,6 +1624,12 @@ function install({ ipcMain }) {
   if (!global.__stenoai_e2e_live_queries) {
     global.__stenoai_e2e_live_queries = [];
   }
+  if (!global.__stenoai_e2e_global_chat_queries) {
+    global.__stenoai_e2e_global_chat_queries = [];
+  }
+  if (!global.__stenoai_e2e_recording_start_calls) {
+    global.__stenoai_e2e_recording_start_calls = [];
+  }
   ipcMain.on = (channel, listener) => {
     if (channel === 'query-live-transcript-stream') {
       return originalOn(channel, (event, queryId, sessionName, question, history) => {
@@ -1550,6 +1679,53 @@ function install({ ipcMain }) {
       });
     }
 
+    if (channel === 'chat-global-stream') {
+      return originalOn(channel, (event, queryId, question, folderId, meetingFiles) => {
+        if (process.env.STENOAI_E2E_MOCK_GLOBAL_CHAT === '1') {
+          global.__stenoai_e2e_global_chat_queries.push({
+            queryId,
+            question,
+            folderId: folderId ?? null,
+            meetingFiles: Array.isArray(meetingFiles) ? meetingFiles : null,
+          });
+          const sender = event.sender;
+          if (!queryId || typeof queryId !== 'string') return;
+          if (sender.isDestroyed()) return;
+
+          if (activeLiveStreams.has(queryId)) {
+            for (const t of activeLiveStreams.get(queryId)) clearTimeout(t);
+            activeLiveStreams.delete(queryId);
+          }
+
+          const timers = [];
+          timers.push(
+            setTimeout(() => {
+              if (!sender.isDestroyed()) {
+                sender.send('query-chunk', { queryId, chunk: 'Based on the selected notes, ' });
+              }
+            }, 50),
+          );
+          timers.push(
+            setTimeout(() => {
+              if (!sender.isDestroyed()) {
+                sender.send('query-chunk', { queryId, chunk: 'everything is on track.' });
+              }
+            }, 150),
+          );
+          timers.push(
+            setTimeout(() => {
+              if (!sender.isDestroyed()) {
+                sender.send('query-done', { queryId, success: true });
+              }
+              activeLiveStreams.delete(queryId);
+            }, 250),
+          );
+          activeLiveStreams.set(queryId, timers);
+          return;
+        }
+        return listener(event, queryId, question, folderId, meetingFiles);
+      });
+    }
     if (channel === 'query-cancel') {
       return originalOn(channel, (event, queryId) => {
         if (activeLiveStreams.has(queryId)) {

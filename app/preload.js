@@ -187,7 +187,10 @@ const stenoai = {
       history === undefined || history === null
         ? send('query-live-transcript-stream', id, sessionName, q)
         : send('query-live-transcript-stream', id, sessionName, q, history),
-    chatGlobalStream: (id, q, folderId) => send('chat-global-stream', id, q, folderId ?? null),
+    chatGlobalStream: (id, q, folderId, meetingFiles) =>
+      meetingFiles === undefined || meetingFiles === null
+        ? send('chat-global-stream', id, q, folderId ?? null)
+        : send('chat-global-stream', id, q, folderId ?? null, meetingFiles),
     cancel: (id) => send('query-cancel', id),
   },
 

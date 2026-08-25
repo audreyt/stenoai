@@ -125,6 +125,7 @@ export function Chat() {
   // server-side. Default null so first-time users get the broadest
   // possible answer.
   const [scopeFolderId, setScopeFolderId] = React.useState<string | null>(null);
+  const [selectedMeetingFiles, setSelectedMeetingFiles] = React.useState<string[]>([]);
   const submittingRef = React.useRef(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -196,12 +197,24 @@ export function Chat() {
       setInput('');
 
       // Streaming for both local AND org scope — startGlobalStream picks
-      // the right backend internally based on folderId.
-      const streamId = streaming.startGlobalStream(q, scopeFolderId);
+      // the right backend internally based on folderId / meetingFiles.
+      const hasMeetings = selectedMeetingFiles.length > 0;
+      const streamId = streaming.startGlobalStream(
+        q,
+        hasMeetings ? null : scopeFolderId,
+        undefined,
+        undefined,
+        hasMeetings ? selectedMeetingFiles : null,
+      );
       // Record the handoff under THIS sessionId so a fast double-submit
       // can't clobber an earlier in-flight stream before the conversation
       // page mounts and claims it.
-      recordPendingNewChat({ sessionId: createdSessionId, streamId, folderId: scopeFolderId });
+      recordPendingNewChat({
+        sessionId: createdSessionId,
+        streamId,
+        folderId: hasMeetings ? null : scopeFolderId,
+        selectedMeetingFiles: hasMeetings ? selectedMeetingFiles : undefined,
+      });
       navigate(`/chat/${encodeURIComponent(createdSessionId)}`);
     } catch (err) {
       // appendMessage / startGlobalStream / createSession can all fail
@@ -338,7 +351,18 @@ export function Chat() {
               </div>
           <div className="flex items-center justify-between gap-2 px-2 pb-1">
             <div className="flex items-center gap-1">
-              <FolderScopePicker value={scopeFolderId} onChange={setScopeFolderId} />
+              <FolderScopePicker
+                value={scopeFolderId}
+                onChange={(fid) => {
+                  setScopeFolderId(fid);
+                  if (fid !== null) setSelectedMeetingFiles([]);
+                }}
+                selectedMeetings={selectedMeetingFiles}
+                onSelectedMeetingsChange={(files) => {
+                  setSelectedMeetingFiles(files);
+                  if (files.length > 0) setScopeFolderId(null);
+                }}
+              />
               <span
                 data-testid="chat-model-indicator"
                 className="text-[12px]"
@@ -493,6 +517,7 @@ export interface PendingNewChat {
   sessionId: string;
   streamId: string;
   folderId: string | null;
+  selectedMeetingFiles?: string[];
 }
 const pendingNewChats = new Map<string, PendingNewChat>();
 

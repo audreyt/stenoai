@@ -3971,14 +3971,9 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
 // provider — the Python CLI sizes the assembled corpus to the active model's
 // context window (smaller for local/remote), so a local model answers over
 // fewer recent notes instead of overflowing. No retrieval (RAG) yet.
-ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
-  sendDebugLog(`💬 Global chat query (${String(question || '').length} chars, folder: ${folderId || 'all'})`);
+ipcMain.on('chat-global-stream', async (event, queryId, question, folderId, meetingFiles) => {
+  sendDebugLog(`💬 Global chat query (${String(question || '').length} chars, folder: ${folderId || 'all'}, meetings: ${Array.isArray(meetingFiles) ? meetingFiles.length : 0})`);
   const env = { ...process.env, ...getAiEnv() };
-
-  const args = ['chat-global-streaming', '-q', question];
-  if (folderId && typeof folderId === 'string' && folderId !== 'all') {
-    args.push('-f', folderId);
-  }
 
   // See query-transcript-stream's trackChatOnce comment -- same multi-exit-
   // path guard, scope: 'global' distinguishes cross-note chat from a
@@ -3996,6 +3991,78 @@ ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
     });
   };
 
+  const sendDone = (payload) => {
+    try {
+      if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, ...payload });
+    } catch (_) { /* renderer gone — nothing to notify */ }
+  };
+
+  // Pre-spawn cancellation guard: if query-cancel arrives while validating paths
+  let cancelled = false;
+  pendingQueryCancels.set(queryId, () => { cancelled = true; });
+  const aborted = () => cancelled || event.sender.isDestroyed();
+
+  // Validate meeting selection if provided
+  let validatedMeetingPaths = [];
+  const hasMeetingSelection = Array.isArray(meetingFiles) && meetingFiles.length > 0;
+  if (hasMeetingSelection) {
+    // Cap selection at 50 notes. Cross-note CLI builds an assembled corpus of summaries,
+    // key points, and transcript excerpts across all selected notes; capping limits OS argv
+    // buffer pressure and stays safely within LLM context-window prompt sizing.
+    const MAX_SELECTED_MEETINGS = 50;
+    const boundedFiles = meetingFiles.slice(0, MAX_SELECTED_MEETINGS);
+
+    try {
+      const results = await Promise.all(
+        boundedFiles.map(async (file) => {
+          try {
+            return await validateMeetingFilePath(file);
+          } catch {
+            return { error: 'Invalid file path' };
+          }
+        })
+      );
+      for (const res of results) {
+        if (res && !res.error && res.realPath) {
+          validatedMeetingPaths.push(res.realPath);
+        }
+      }
+    } catch {
+      // Defense-in-depth
+    }
+
+    pendingQueryCancels.delete(queryId);
+
+    if (aborted()) {
+      trackChatOnce(false);
+      return;
+    }
+
+    // Security & fail-closed: if the user explicitly provided a selection of meetings
+    // but none of them passed validation, fail with a fixed error rather than silently
+    // falling back to a full-corpus or folder query.
+    if (validatedMeetingPaths.length === 0) {
+      sendDone({ success: false, error: 'Invalid file path' });
+      trackChatOnce(false);
+      return;
+    }
+  } else {
+    pendingQueryCancels.delete(queryId);
+    if (aborted()) {
+      trackChatOnce(false);
+      return;
+    }
+  }
+
+  const args = ['chat-global-streaming', '-q', question];
+  if (validatedMeetingPaths.length > 0) {
+    for (const mPath of validatedMeetingPaths) {
+      args.push('--meeting', mPath);
+    }
+  } else if (folderId && typeof folderId === 'string' && folderId !== 'all') {
+    args.push('-f', folderId);
+  }
+
   let proc;
   try {
     proc = require('child_process').spawn(
@@ -4004,8 +4071,12 @@ ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
       { env, cwd: getBackendCwd(), windowsHide: true },
     );
   } catch (err) {
-    event.sender.send('query-done', { queryId, success: false, error: err.message });
+    sendDone({ success: false, error: err.message });
     trackChatOnce(false);
+    return;
+  }
+  if (aborted()) {
+    try { proc.kill(); } catch (_) {}
     return;
   }
 

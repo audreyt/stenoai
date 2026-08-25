@@ -54,10 +54,11 @@ export function ChatConversation({ sessionId }: ChatConversationProps) {
   const [activeStreamId, setActiveStreamId] = React.useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   const [presetsOpen, setPresetsOpen] = React.useState(false);
-  // Folder scope persists for the lifetime of the conversation page mount.
+  // Folder / meetings scope persists for the lifetime of the conversation page mount.
   // The entry page's scope is handed off via consumePendingNewChat; later
   // turns in the same conversation can be re-scoped from this composer.
   const [scopeFolderId, setScopeFolderId] = React.useState<string | null>(null);
+  const [selectedMeetingFiles, setSelectedMeetingFiles] = React.useState<string[]>([]);
   const pendingPersistRef = React.useRef<string | null>(null);
   const submittingRef = React.useRef(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -90,6 +91,9 @@ export function ChatConversation({ sessionId }: ChatConversationProps) {
       pendingPersistRef.current = pending.sessionId;
       setActiveStreamId(pending.streamId);
       setScopeFolderId(pending.folderId);
+      if (pending.selectedMeetingFiles && pending.selectedMeetingFiles.length > 0) {
+        setSelectedMeetingFiles(pending.selectedMeetingFiles);
+      }
     }
   }, [sessionId]);
 
@@ -205,6 +209,7 @@ export function ChatConversation({ sessionId }: ChatConversationProps) {
       appended = true;
       setInput('');
 
+      const hasMeetings = selectedMeetingFiles.length > 0;
       // Hand the running history to the org backend so follow-ups have
       // context. For local scope this third arg is ignored.
       const history = isOrgScope(scopeFolderId)
@@ -213,7 +218,13 @@ export function ChatConversation({ sessionId }: ChatConversationProps) {
             content: m.content,
           }))
         : undefined;
-      const streamId = streaming.startGlobalStream(q, scopeFolderId, history);
+      const streamId = streaming.startGlobalStream(
+        q,
+        hasMeetings ? null : scopeFolderId,
+        history,
+        undefined,
+        hasMeetings ? selectedMeetingFiles : null,
+      );
       pendingPersistRef.current = session.id;
       setActiveStreamId(streamId);
     } catch (err) {
@@ -472,7 +483,18 @@ export function ChatConversation({ sessionId }: ChatConversationProps) {
           />
           <div className="flex items-center justify-between gap-2 px-1">
             <div className="flex items-center gap-1">
-              <FolderScopePicker value={scopeFolderId} onChange={setScopeFolderId} />
+              <FolderScopePicker
+                value={scopeFolderId}
+                onChange={(fid) => {
+                  setScopeFolderId(fid);
+                  if (fid !== null) setSelectedMeetingFiles([]);
+                }}
+                selectedMeetings={selectedMeetingFiles}
+                onSelectedMeetingsChange={(files) => {
+                  setSelectedMeetingFiles(files);
+                  if (files.length > 0) setScopeFolderId(null);
+                }}
+              />
               <span
                 data-testid="chat-model-indicator"
                 className="text-[12px]"

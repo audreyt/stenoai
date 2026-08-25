@@ -153,7 +153,8 @@ export function useStreamingQuery() {
       question: string,
       folderId?: string | null,
       orgHistory?: Array<{ role: 'user' | 'assistant'; content: string }>,
-      options?: StreamOptions
+      options?: StreamOptions,
+      meetingFiles?: string[] | null
     ): string => {
       const id = newId();
       setStreams((prev) => ({
@@ -223,7 +224,7 @@ export function useStreamingQuery() {
           }
         })();
       } else {
-        ipc().query.chatGlobalStream(id, question, folderId ?? null);
+        ipc().query.chatGlobalStream(id, question, folderId ?? null, meetingFiles ?? null);
       }
       return id;
     },

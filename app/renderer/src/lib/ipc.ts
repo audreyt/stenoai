@@ -141,6 +141,8 @@ export interface ChatSessionsBlob {
     id: string;
     name: string;
     summaryFile?: string;
+    folderId?: string | null;
+    selectedMeetingFiles?: string[];
     messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number }>;
     createdAt: number;
     updatedAt: number;
@@ -1142,7 +1144,7 @@ export interface StenoaiBridge {
     ask: RequestFn<[file: string, q: string], QueryResponse>;
     askStream: SendFn<[id: string, file: string, q: string]>;
     askLiveStream: SendFn<[id: string, sessionName: string, q: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>]>;
-    chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null]>;
+    chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null, meetingFiles?: string[] | null]>;
     cancel: SendFn<[id: string]>;
   };
 

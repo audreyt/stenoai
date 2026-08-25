@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  UserRoundCheck,
   Users,
 } from 'lucide-react';
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -648,6 +649,7 @@ function DetailContent({
 
   const summary = meeting.summary?.trim();
   const participants = asStringArray(meeting.participants);
+  const attendees = asStringArray(meeting.attendees);
   const keyPoints = meeting.key_points ?? [];
   const actionItems = asStringArray(meeting.action_items);
   const discussionAreas = asDiscussionAreas(meeting.discussion_areas);
@@ -1128,9 +1130,14 @@ function DetailContent({
             summaryFile={summaryFile}
             assignedFolderIds={meeting.folders ?? meeting.session_info.folders ?? []}
           />
+          {attendees.length > 0 && <AttendeesChip attendees={attendees} />}
           {participants.length > 0 && (
+            // "speaker", not "person": this count comes from the audio, and on a
+            // note that also has calendar attendees the two chips otherwise read
+            // as one fact with two different numbers. The Participants section
+            // below names these same rows Speaker 1..N.
             <ChipV2 icon={<Users className="size-[11px]" />}>
-              {participants.length} {participants.length === 1 ? 'person' : 'people'}
+              {participants.length} {participants.length === 1 ? 'speaker' : 'speakers'}
             </ChipV2>
           )}
           {/* Quiet, non-alarming backup status for org users — a calm
@@ -1790,6 +1797,63 @@ function ChipV2({ icon, children, onClick, title }: ChipV2Props) {
       {icon}
       <span>{children}</span>
     </button>
+  );
+}
+
+interface AttendeesChipProps {
+  attendees: string[];
+}
+
+function AttendeesChip({ attendees }: AttendeesChipProps) {
+  if (!attendees || attendees.length === 0) return null;
+
+  const count = attendees.length;
+  // "invited", not a bare count: the speaker-count chip sitting beside this one
+  // also counts people, and two adjacent people-shaped counts with different
+  // numbers (3 invited from the calendar, 1 speaker detected in the audio) read
+  // as a contradiction rather than as two different facts.
+  const label =
+    count === 1
+      ? attendees[0]
+      : count === 2 && `${attendees[0]}, ${attendees[1]}`.length <= 32
+        ? `${attendees[0]}, ${attendees[1]}`
+        : `${count} invited`;
+
+  const allNames = attendees.join(', ');
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="mv-chip"
+          data-testid="attendees-chip"
+          title={allNames}
+          aria-label={`Attendees: ${allNames}`}
+        >
+          <UserRoundCheck className="size-[11px]" />
+          <span className="max-w-[200px] truncate">{label}</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-64 p-2.5" data-testid="attendees-popover">
+        <div
+          className="pb-1.5 mb-1.5 text-[11.5px] font-medium tracking-[0.02em]"
+          style={{
+            color: 'var(--fg-muted)',
+            borderBottom: '1px solid var(--border-subtle)',
+          }}
+        >
+          Attendees ({count})
+        </div>
+        <ul className="max-h-56 overflow-y-auto space-y-1 text-[13px]" style={{ color: 'var(--fg-1)' }}>
+          {attendees.map((name, i) => (
+            <li key={i} className="truncate py-0.5" data-testid="attendee-item">
+              {name}
+            </li>
+          ))}
+        </ul>
+      </PopoverContent>
+    </Popover>
   );
 }
 
