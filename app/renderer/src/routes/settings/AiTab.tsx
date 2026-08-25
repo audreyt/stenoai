@@ -62,9 +62,10 @@ import { COMPACT_BTN, COMPACT_INPUT, COMPACT_TRIGGER, SectionHeading, SettingRow
 import { ModelCard, formatModelSize, isDefaultModel, parsePullPercent } from './model-card';
 import { modelMayExceedMemory } from './model-memory';
 import { LANGUAGES_PARAKEET, LANGUAGES_WHISPER } from './languages';
-import { t } from '@/i18n';
+import { useTranslation, t } from '@/i18n';
 
 export function AiTab() {
+  const { t } = useTranslation();
   return (
     <section data-settings-tab="ai">
       <SectionHeading>{t('settings.ai.sectionTranscription')}</SectionHeading>
@@ -85,6 +86,7 @@ export function AiTab() {
 }
 
 function TranscriptionSection() {
+  const { t } = useTranslation();
   const language = useLanguageSetting();
   const setLanguage = useSetLanguage();
   const keepRecordings = useKeepRecordingsSetting();
@@ -149,6 +151,7 @@ function TranscriptionSection() {
 }
 
 export function SpeakerIdentificationSetting() {
+  useTranslation();
   const enabled = useIdentityMatchingEnabledSetting();
   const setEnabled = useSetIdentityMatchingEnabled();
   return (

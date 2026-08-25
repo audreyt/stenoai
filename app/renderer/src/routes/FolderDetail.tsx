@@ -5,12 +5,13 @@ import { useMeetings } from '@/hooks/useMeetings';
 import { useFolders, useUpdateFolderIcon } from '@/hooks/useFolders';
 import { LucideIcon, IconPicker } from '@/components/IconPicker';
 import { navigate } from '@/lib/router';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 interface FolderDetailProps {
   folderId: string;
 }
 
 export function FolderDetail({ folderId }: FolderDetailProps) {
+  const { t } = useTranslation();
   const meetings = useMeetings();
   const folders = useFolders();
   const updateIcon = useUpdateFolderIcon();

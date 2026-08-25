@@ -62,6 +62,14 @@ describe('i18n key parity', () => {
     }
   });
 
+  it('every zh-TW value is a non-empty string', () => {
+    for (const key of allKeys(zhTW as unknown as Json)) {
+      const value = getByPath(zhTW as unknown as Json, key);
+      expect(typeof value).toBe('string');
+      expect((value as string).length).toBeGreaterThan(0);
+    }
+  });
+
   it('Translations is fully populated (compile-time)', () => {
     const dict: Translations = en;
     expect(dict.common.save).toBe('Save');

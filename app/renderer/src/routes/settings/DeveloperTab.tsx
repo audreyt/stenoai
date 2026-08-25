@@ -16,7 +16,7 @@ import {
 } from '@/hooks/useSettings';
 import { useAiProvider } from '@/hooks/useAi';
 import { useTranscriptionEngine } from '@/hooks/useModels';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 // Cross-process sentinel: the save-diagnostics handler (and its e2e mock) return
 // this exact error string when the user dismisses the save dialog. Kept in sync
 // with app/ipc-sentinels.js (EXPORT_CANCELED); the renderer can't require that
@@ -24,6 +24,7 @@ import { t } from '@/i18n';
 const DIAGNOSTICS_CANCELED = 'canceled';
 
 export function DeveloperTab() {
+  const { t } = useTranslation();
   // Read from the global store so we get the full session backlog, not just
   // lines emitted after this tab mounted.
   const logs = React.useSyncExternalStore(

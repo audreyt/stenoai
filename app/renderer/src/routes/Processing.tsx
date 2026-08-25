@@ -15,7 +15,7 @@ import { useUpdateMeeting } from '@/hooks/useMeetings';
 import { getLiveDraft, useLiveDraftStore } from '@/hooks/liveDraftStore';
 import { ipc } from '@/lib/ipc';
 import { stripReasoning } from '@/lib/markdown';
-import { t } from '@/i18n';
+import { useTranslation, t } from '@/i18n';
 type ProcessingStage = 'transcribing' | 'diarizing' | 'summarizing' | 'finalizing' | 'error';
 
 // Shared flag so the sibling ProcessingDock (the bottom "Processing" chip,
@@ -80,6 +80,7 @@ const WATCHDOG_TICK_MS = 1500;
 const WATCHDOG_IDLE_TICKS = 8;
 
 export function Processing() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const recording = useRecording();
   const updateMeeting = useUpdateMeeting();
@@ -623,6 +624,8 @@ function StageCard({
 }
 
 function ErrorPanel({
+  // error panel
+
   onRetry,
   canRetry,
   retrying,
@@ -635,6 +638,7 @@ function ErrorPanel({
   error: string | null;
   nothingRecorded: boolean;
 }) {
+  const { t } = useTranslation();
   // The watchdog case is not a failure — nothing was lost because nothing was
   // captured — so it gets a calmer heading and copy than the hard-crash path.
   const heading = nothingRecorded ? t('processing.nothingToProcess') : getStageLabel('error');
@@ -728,6 +732,7 @@ function Chip({
 // ---------------------------------------------------------------------------
 
 export function ProcessingDock() {
+  const { t } = useTranslation();
   const recording = useRecording();
   const sessionName = recording.sessionName;
   const draft = useLiveDraftStore((s) =>

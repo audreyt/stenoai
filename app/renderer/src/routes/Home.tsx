@@ -21,12 +21,13 @@ import { pickInProgressEvent } from '@/lib/calendar';
 import { heroHeadline, heroSubtitle } from '@/lib/hero';
 import { searchNotes } from '@/lib/noteSearch';
 import { navigate } from '@/lib/router';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 interface HomeProps {
   mode: 'home' | 'meetings';
 }
 
 export function Home({ mode }: HomeProps) {
+  const { t } = useTranslation();
   const meetings = useMeetings();
   const folders = useFolders();
   const calendar = useCalendarEvents();

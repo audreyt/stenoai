@@ -6,7 +6,7 @@ import { useRecording } from '@/hooks/useRecording';
 import { useLiveTranscriptStatus } from '@/hooks/useLiveTranscript';
 import { useLiveTranscriptOpen } from '@/hooks/liveTranscriptOpenStore';
 import { useLiveTranscriptAvailable } from '@/hooks/useModels';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 /**
  * Compact (Granola-style) transcription pill shown whenever a recording is
  * active — recording coexists with whatever the user is viewing; PrimaryDock
@@ -21,6 +21,7 @@ import { t } from '@/i18n';
  * drop) — without it an auto-paused recording would be stranded.
  */
 export function LiveDock() {
+  const { t } = useTranslation();
   const recording = useRecording();
   const liveAvailable = useLiveTranscriptAvailable();
   const transcriptOpen = useLiveTranscriptOpen((s) => s.open);

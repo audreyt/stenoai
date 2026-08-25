@@ -23,6 +23,10 @@ export interface Translations {
     continue: string;
     start: string;
     stop: string;
+    send: string;
+    showLess: string;
+    seeAll: string;
+    play: string;
     resume: string;
     pause: string;
     paused: string;

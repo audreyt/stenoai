@@ -10,13 +10,14 @@ import {
   useSetObsidianVaultPath,
 } from '@/hooks/useSettings';
 import { COMPACT_BTN } from './primitives';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 /**
  * Integrations settings (#413). Currently: Obsidian vault sync — a one-way
  * mirror of notes into a chosen vault folder. More integrations (e.g. Zapier,
  * #414) will join this tab.
  */
 export function IntegrationsTab() {
+  const { t } = useTranslation();
   const enabled = useObsidianSyncSetting();
   const setEnabled = useSetObsidianSync();
   const vaultPath = useObsidianVaultPath();

@@ -4,10 +4,10 @@
 // zh-TW localization: when the system language is Chinese, the tray menu renders
 // 繁體中文, otherwise English.
 //
-// The renderer stores the user's explicit UI-locale preference in
-// localStorage and the native menu has no renderer to read, so the tray menu
-// follows the *system* locale instead — the same source Electron's built-in
-// menus use, which is why the two never disagree for a default install.
+// The renderer defaults to English and stores the user's explicit UI-locale
+// preference in localStorage, while the native menu has no renderer to read,
+// so the tray menu follows the *system* locale instead — matching Electron's
+// built-in menu behavior.
 
 // Map the OS language (app.getLocale() returns e.g. 'zh-TW', 'en-US', 'zh-HK')
 // to the app's two supported UI locales. Anything not recognizably Chinese is

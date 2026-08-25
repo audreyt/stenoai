@@ -10,8 +10,9 @@ import { MeetingsShell } from '@/components/MeetingsShell';
 import { useNavigate } from '@/lib/router';
 import { useRecording } from '@/hooks/useRecording';
 import { useLiveMeeting } from '@/hooks/useLiveMeeting';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 export function Recording() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const recording = useRecording();
   const live = useLiveMeeting();

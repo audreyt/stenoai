@@ -12,7 +12,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { t } from '@/i18n';
+import { useTranslation, t } from '@/i18n';
 // The full set of nav rail destinations. Distinct from Settings.tsx's
 // deep-linkable TabId, which additionally accepts the legacy 'transcription'
 // id as an alias that resolves onto 'ai' — the nav rail itself only ever
@@ -95,6 +95,7 @@ interface SettingsNavProps {
 }
 
 export function SettingsNav({ activeTab, onSelect, onBack, version }: SettingsNavProps) {
+  const { t } = useTranslation();
   const navGroups = getNavGroups();
   return (
     <nav

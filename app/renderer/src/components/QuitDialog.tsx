@@ -2,13 +2,14 @@ import * as React from 'react';
 import { createPortal } from 'react-dom';
 import { CircleAlert } from 'lucide-react';
 import { ipc } from '@/lib/ipc';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 interface DialogState {
   type: 'recording' | 'processing';
   jobCount?: number;
 }
 
 export function QuitDialog() {
+  const { t } = useTranslation();
   const [mounted, setMounted] = React.useState(false);
   const [visible, setVisible] = React.useState(false);
   const [state, setState] = React.useState<DialogState>({ type: 'recording' });
@@ -114,6 +115,7 @@ export function QuitDialog() {
 }
 
 function CancelButton({ onClick }: { onClick: () => void }) {
+  const { t } = useTranslation();
   const [hovered, setHovered] = React.useState(false);
   return (
     <button

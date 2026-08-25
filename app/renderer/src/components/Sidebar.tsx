@@ -20,7 +20,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useUpdateFolderIcon } from '@/hooks/useFolders';
 import { useOrgLogout, useOrgSession, useSharedNotesGate } from '@/hooks/useOrg';
 import { useCommandPalette } from '@/components/CommandPalette';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 export interface SidebarMeeting {
   summaryFile: string;
   title: string;
@@ -161,6 +161,7 @@ export function Sidebar({
   onContextAction,
   currentRoute,
 }: SidebarProps) {
+  const { t } = useTranslation();
   const palette = useCommandPalette();
   const [foldersOpen, setFoldersOpen] = React.useState(true);
   const [dragOverFolder, setDragOverFolder] = React.useState<string | null>(null);
@@ -601,6 +602,7 @@ interface ProfileChipProps {
 }
 
 function ProfileChip({ email, name, orgId, onSignOut }: ProfileChipProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
 

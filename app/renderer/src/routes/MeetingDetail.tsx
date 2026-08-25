@@ -81,7 +81,7 @@ import { cn } from '@/lib/utils';
 import { navigate } from '@/lib/router';
 import { stripReasoning } from '@/lib/markdown';
 import { pendingTitleRegens, streamCache, type StreamPhase } from '@/lib/meetingDetailState';
-import { t } from '@/i18n';
+import { useTranslation, t } from '@/i18n';
 import { useReprocessBridge } from '@/hooks/reprocessBridgeStore';
 import { useRecording } from '@/hooks/useRecording';
 import { useAutoSummarizeSetting } from '@/hooks/useSettings';
@@ -101,6 +101,7 @@ interface MeetingDetailProps {
 }
 
 export function MeetingDetail({ summaryFile }: MeetingDetailProps) {
+  const { t } = useTranslation();
   const meeting = useMeeting(summaryFile);
   useActiveMeeting(summaryFile, meeting.data?.session_info.name ?? null);
 
@@ -1603,6 +1604,7 @@ function MyNotesEditor({
   summaryFile: string;
   initialNotes: string;
 }) {
+  const { t } = useTranslation();
   const [value, setValue] = React.useState(initialNotes);
   const save = useUpdateUserNotes();
   const timerRef = React.useRef<number | null>(null);

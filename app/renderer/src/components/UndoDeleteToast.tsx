@@ -8,7 +8,7 @@ import {
   useSpeakerNamingStatus,
   meetingStemFromSummaryFile,
 } from '@/hooks/useSpeakerSuggestions';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 /**
  * Bottom-right "Note deleted — Undo?" toast stack (#234). Deletion is a
  * soft-delete: main hides only the note's summary (an atomic rename) and pushes
@@ -42,6 +42,7 @@ function UndoDeleteToastItem({
   onUndo: () => void;
   onExpire: () => void;
 }) {
+  const { t } = useTranslation();
   // Keep the expire callback in a ref so the auto-dismiss timer runs exactly once
   // and isn't reset by re-renders (it must expire relative to main's deadline,
   // not the last render).

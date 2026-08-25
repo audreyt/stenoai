@@ -24,12 +24,13 @@ import {
 import { useMeeting } from '@/hooks/useMeetings';
 import { useRecording } from '@/hooks/useRecording';
 import { buildTranscriptBundle } from '@/lib/transcriptBundle';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 // ---------------------------------------------------------------------------
 // Transcript bar — rendered separately above the chat bar
 // ---------------------------------------------------------------------------
 
 export function TranscriptBar() {
+  const { t } = useTranslation();
   const { activeSummaryFile, activeMeetingName, activeOrgMeeting, transcriptOpen, setTranscriptOpen } =
     useAskBar();
   const meeting = useMeeting(activeSummaryFile ?? undefined);
@@ -151,6 +152,7 @@ export function TranscriptBar() {
  * Shown only for a meeting that actually has a transcript.
  */
 export function TranscriptToggle() {
+  const { t } = useTranslation();
   const { activeSummaryFile, activeOrgMeeting, transcriptOpen, setTranscriptOpen } = useAskBar();
   const [hover, setHover] = React.useState(false);
   const hasTranscript =
@@ -210,6 +212,7 @@ export function TranscriptToggle() {
  * pill always has the bar beside it.
  */
 export function AskBar({ disabled = false }: { disabled?: boolean }) {
+  const { t } = useTranslation();
   const {
     activeSummaryFile,
     activeMeetingName,
@@ -493,10 +496,10 @@ export function AskBar({ disabled = false }: { disabled?: boolean }) {
         {/* Send / stop */}
         {isStreaming ? (
           <button
-            type="submit"
-            className={cn('mv-chat-send', canSend && 'active')}
-            disabled={!canSend}
-            aria-label={t('common.continue')}
+            type="button"
+            className="mv-chat-send active"
+            onClick={stop}
+            aria-label={t('common.stop')}
           >
             <Square size={12} />
           </button>
@@ -505,7 +508,7 @@ export function AskBar({ disabled = false }: { disabled?: boolean }) {
             type="submit"
             className={cn('mv-chat-send', canSend && 'active')}
             disabled={!canSend}
-            aria-label={t('common.continue')}
+            aria-label={t('common.send')}
           >
             <ArrowUp size={14} />
           </button>

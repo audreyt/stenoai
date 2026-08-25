@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button';
 import { ipc } from '@/lib/ipc';
 import { useAppVersion } from '@/hooks/useSettings';
 import { COMPACT_BTN, SettingRow } from './primitives';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 /** Plain external-link text (matches TemplatesTab's "learn more" link) for
  *  rows that just navigate out, rather than a bordered Button — keeps the
  *  bordered-button treatment reserved for in-page actions (Check for
@@ -45,6 +45,7 @@ type CheckState =
   | { kind: 'update-blocked-os'; version: string };
 
 export function AboutTab() {
+  const { t } = useTranslation();
   const version = useAppVersion();
   const [checkState, setCheckState] = React.useState<CheckState>({ kind: 'idle' });
   const [downloadPercent, setDownloadPercent] = React.useState<number | null>(null);

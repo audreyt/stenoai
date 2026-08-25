@@ -10,7 +10,7 @@ import {
 import type { PersonProfile } from '@/lib/ipc';
 import { useBlobAudioPlayback } from '@/hooks/useBlobAudioPlayback';
 import { SettingRow, COMPACT_BTN } from './primitives';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 // ---------------------------------------------------------------------------
 // People - the one place a voice profile can be deleted.
 //
@@ -37,7 +37,7 @@ function sampleCount(profile: PersonProfile): number {
   );
 }
 
-function describeSamples(profile: PersonProfile): string {
+function describeSamples(profile: PersonProfile, t: (key: string, params?: Record<string, string | number>) => string): string {
   const n = sampleCount(profile);
   // A profile with no samples is a real state, not an error: "New person"
   // creates the profile before any voice has been attached to it, and every
@@ -48,6 +48,7 @@ function describeSamples(profile: PersonProfile): string {
 }
 
 export function PeopleTab() {
+  const { t } = useTranslation();
   const profilesQuery = usePersonProfiles();
   const deleteProfile = useDeletePersonProfile();
   const getPersonSample = useGetPersonSampleAudio();
@@ -96,7 +97,7 @@ export function PeopleTab() {
             label={profile.display_name}
             description={(
               <>
-                <span>{describeSamples(profile)}</span>
+                <span>{describeSamples(profile, t)}</span>
                 {playback.errorKey === profile.person_id && (
                   <span
                     role="alert"
@@ -131,7 +132,7 @@ export function PeopleTab() {
                   ) : (
                     <Play className="size-[13px]" />
                   )}
-                  {playback.playingKey === profile.person_id ? t('common.stop') : t('common.start')}
+                  {playback.playingKey === profile.person_id ? t('common.stop') : t('common.play')}
                 </Button>
               )}
               <Button

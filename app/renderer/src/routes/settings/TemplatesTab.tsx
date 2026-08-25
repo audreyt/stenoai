@@ -21,7 +21,7 @@ import {
 } from '@/hooks/useTemplates';
 import { COMPACT_BTN } from './primitives';
 import { LANGUAGES_WHISPER, type LangOption } from './languages';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 
 // ---------------------------------------------------------------------------
 // Templates tab — manage summary report templates (CRUD + default pick) as a
@@ -42,12 +42,15 @@ const TEMPLATE_LANGUAGES: LangOption[] = LANGUAGES_WHISPER;
 export function TemplatesTab({
   onEditingChange,
 }: {
+  // t
+
   // Lets Settings.tsx hide its own page header (title/description/divider)
   // while the editor is open — the editor is a full-page takeover with its
   // own header, so the outer "Templates" header would just carry over as a
   // redundant leftover from the list view above it.
   onEditingChange?: (editing: boolean) => void;
 } = {}) {
+  const { t } = useTranslation();
   const { templates, defaultId } = useTemplates();
   const setDefault = useSetDefaultTemplate();
   const del = useDeleteTemplate();
@@ -296,6 +299,7 @@ function TemplateEditor({
   editing: Partial<Template> | null;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const save = useSaveTemplate();
   const reset = useResetTemplate();
   const { defaultId } = useTemplates();

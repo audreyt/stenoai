@@ -13,7 +13,7 @@ import {
   useTelemetrySetting,
 } from '@/hooks/useSettings';
 import { COMPACT_BTN, SettingRow } from './primitives';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 /** A read-only value with a click-to-copy button. Used for paths and IDs that
  *  users frequently need to paste into bug reports or terminal sessions. */
 function CopyableValue({ value, mono = false }: { value: string; mono?: boolean }) {
@@ -57,6 +57,7 @@ function CopyableValue({ value, mono = false }: { value: string; mono?: boolean 
 }
 
 export function AdvancedTab() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const storage = useStoragePath();
   const setStorage = useSetStoragePath();
@@ -161,6 +162,7 @@ export function AdvancedTab() {
       <SettingRow
         label={t('settings.advanced.analyticsTitle')}
         description={t('settings.advanced.analyticsDesc')}
+        noBorder={!telemetry.data?.anonymous_id}
       >
         <Switch
           checked={telemetry.data?.telemetry_enabled ?? false}

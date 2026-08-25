@@ -19,7 +19,7 @@ import type { RecordingStatus } from '@/hooks/useRecording';
 import { useImportAudio } from '@/hooks/useImportAudio';
 import { useRoute, navigate } from '@/lib/router';
 import { cn, isMac } from '@/lib/utils';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 interface MainToolbarProps {
   recordingStatus: RecordingStatus;
   elapsedSeconds?: number;
@@ -42,6 +42,7 @@ export function MainToolbar({
   onToggleSidebar,
   settingsMode = false,
 }: MainToolbarProps) {
+  const { t } = useTranslation();
   const isRecording =
     recordingStatus === 'recording' || recordingStatus === 'paused';
   const isPaused = recordingStatus === 'paused';
@@ -179,6 +180,7 @@ function RecordingOptionsPopover({
   importAudio: UseMutationResult<boolean, Error, void>;
   disabled: boolean;
 }) {
+  const { t } = useTranslation();
   const systemAudio = useSystemAudioSetting();
   const setSystemAudio = useSetSystemAudio();
   const systemAudioSupport = useSystemAudioSupport();

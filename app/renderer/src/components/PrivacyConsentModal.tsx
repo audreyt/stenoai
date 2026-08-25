@@ -18,7 +18,7 @@ import {
   useSetTelemetry,
   useTelemetrySetting,
 } from '@/hooks/useSettings';
-import { t } from '@/i18n';
+import { useTranslation } from '@/i18n';
 /**
  * One-time, soft privacy disclosure for existing installs upgrading into the
  * version that added telemetry + launch-on-login (both default ON). Nothing is
@@ -32,6 +32,7 @@ import { t } from '@/i18n';
  * onboarding isn't disclosed to twice).
  */
 export function PrivacyConsentModal({ open }: { open: boolean }) {
+  const { t } = useTranslation();
   const { mutateAsync: markNoticeSeen } = useMarkPrivacyNoticeSeen();
 
   const telemetry = useTelemetrySetting();
@@ -98,6 +99,7 @@ export function PrivacyConsentModal({ open }: { open: boolean }) {
               onCheckedChange={(v) => setLaunchOnLogin.mutate(v)}
               disabled={launchOnLogin.data === undefined}
               aria-label={t('settings.general.launchOnLogin')}
+              data-privacy-launch
             />
           </SettingRow>
         </div>
