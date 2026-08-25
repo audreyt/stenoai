@@ -105,34 +105,37 @@ export function Home({ mode }: HomeProps) {
   const briefUnsubRef = React.useRef<(() => void) | null>(null);
   const briefQueryIdRef = React.useRef<string | null>(null);
 
+  // Helper to cancel active brief stream and backend process
+  const cancelActiveBrief = React.useCallback(() => {
+    if (briefQueryIdRef.current) {
+      ipc().query.cancel(briefQueryIdRef.current);
+      briefQueryIdRef.current = null;
+    }
+    if (briefUnsubRef.current) {
+      briefUnsubRef.current();
+      briefUnsubRef.current = null;
+    }
+  }, []);
+
   // Leaving Home or unmounting cancels any active brief stream
   React.useEffect(() => {
     return () => {
-      if (briefUnsubRef.current) {
-        briefUnsubRef.current();
-        briefUnsubRef.current = null;
-      }
+      cancelActiveBrief();
     };
-  }, [mode]);
+  }, [mode, cancelActiveBrief]);
 
   const handleToggleBrief = React.useCallback(
     (event: CalendarEvent) => {
       if (activeBriefEventId === event.id) {
         // Collapse
-        if (briefUnsubRef.current) {
-          briefUnsubRef.current();
-          briefUnsubRef.current = null;
-        }
+        cancelActiveBrief();
         setActiveBriefEventId(null);
         setBriefState({ text: '', status: 'idle', error: null });
         return;
       }
 
       // Cancel any prior in-flight brief stream
-      if (briefUnsubRef.current) {
-        briefUnsubRef.current();
-        briefUnsubRef.current = null;
-      }
+      cancelActiveBrief();
 
       const queryId = `brief-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       briefQueryIdRef.current = queryId;
@@ -140,9 +143,10 @@ export function Home({ mode }: HomeProps) {
       setBriefState({ text: '', status: 'streaming', error: null });
 
       // Pass the event's title and its attendee DISPLAY NAMES only.
-      // Filter out empty names and never pass email addresses.
+      // Two-step rule: strip an angle-bracketed email tail (e.g. "John Doe <john@example.com>" -> "John Doe"),
+      // then drop if the remainder is empty or still contains an '@' (bare addresses like "john@example.com" are never passed).
       const attendeeNames = (event.attendees || [])
-        .map((a) => a.name?.trim())
+        .map((a) => (a.name ? a.name.replace(/<[^>]*>/g, '').trim() : ''))
         .filter((n): n is string => !!n && !n.includes('@'));
 
       const off = ipc().subscribeQueryStream(queryId, {
@@ -168,8 +172,8 @@ export function Home({ mode }: HomeProps) {
           briefQueryIdRef.current = null;
         },
       });
-
       briefUnsubRef.current = off;
+
       const queryBridge = ipc().query;
       if ('briefStream' in queryBridge && typeof queryBridge.briefStream === 'function') {
         queryBridge.briefStream(
@@ -179,7 +183,7 @@ export function Home({ mode }: HomeProps) {
         );
       }
     },
-    [activeBriefEventId]
+    [activeBriefEventId, cancelActiveBrief]
   );
 
   // Today's relevant events: anything that overlaps with today AND

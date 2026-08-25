@@ -1777,6 +1777,9 @@ function install({ ipcMain }) {
   if (!global.__stenoai_e2e_brief_queries) {
     global.__stenoai_e2e_brief_queries = [];
   }
+  if (!global.__stenoai_e2e_cancelled_queries) {
+    global.__stenoai_e2e_cancelled_queries = [];
+  }
   ipcMain.on = (channel, listener) => {
     if (channel === 'query-live-transcript-stream') {
       return originalOn(channel, (event, queryId, sessionName, question, history) => {
@@ -1934,6 +1937,10 @@ function install({ ipcMain }) {
     }
     if (channel === 'query-cancel') {
       return originalOn(channel, (event, queryId) => {
+        if (!global.__stenoai_e2e_cancelled_queries) {
+          global.__stenoai_e2e_cancelled_queries = [];
+        }
+        global.__stenoai_e2e_cancelled_queries.push(queryId);
         if (activeLiveStreams.has(queryId)) {
           for (const t of activeLiveStreams.get(queryId)) clearTimeout(t);
           activeLiveStreams.delete(queryId);

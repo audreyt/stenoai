@@ -61,6 +61,17 @@ function getSetTemplateCalls(app: ElectronApplication): Promise<string[]> {
   });
 }
 
+function getCancelledQueries(app: ElectronApplication): Promise<string[]> {
+  return app.evaluate(() => {
+    return (
+      (
+        globalThis as unknown as {
+          __stenoai_e2e_cancelled_queries: string[];
+        }
+      ).__stenoai_e2e_cancelled_queries ?? []
+    );
+  });
+}
 // The seeded event comes from app/e2e-mock-ipc.js behind
 // STENOAI_E2E_SEED_CALENDAR=1: 'Weekly Engineering Sync', with attendees
 // Alice Smith + Bob Jones and one entry that has an email but NO name.
@@ -145,6 +156,48 @@ test('pre-meeting brief renders calm empty state when no prior history exists', 
   const emptyState = page.getByTestId('upcoming-card-brief-empty');
   await expect(emptyState).toBeVisible();
   await expect(emptyState).toContainText('No related notes yet');
+});
+
+test('collapsing a streaming brief cancels its backend query process', async ({
+  launchApp,
+}) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: {
+      ...PILL_ENV,
+      STENOAI_E2E_MOCK_BRIEF: '1',
+      STENOAI_E2E_SEED_CALENDAR: '1',
+      STENOAI_E2E_SEED_ATTENDEES: '1',
+    },
+  });
+
+  await page.evaluate(() => {
+    window.location.hash = '#/';
+  });
+
+  const card = page.getByRole('button', { name: /Weekly Engineering Sync/ }).first();
+  await card.hover();
+  const briefBtn = page.getByTestId('upcoming-card-brief-btn');
+  await expect(briefBtn).toBeVisible();
+
+  // Start streaming brief
+  await briefBtn.click();
+  const briefContent = page.getByTestId('upcoming-card-brief-content');
+  await expect(briefContent).toBeVisible();
+
+  const queries = await getBriefQueries(app);
+  expect(queries.length).toBeGreaterThan(0);
+  const startedQueryId = queries[queries.length - 1].queryId;
+
+  // Collapse brief while streaming
+  await briefBtn.click();
+
+  // (a) Brief container is gone
+  await expect(briefContent).not.toBeVisible();
+
+  // (b) Cancelled queries array contains the started queryId
+  const cancelled = await getCancelledQueries(app);
+  expect(cancelled).toContain(startedQueryId);
 });
 
 test('bulk export in settings advanced offers markdown and csv and reports count', async ({
