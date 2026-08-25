@@ -1988,8 +1988,38 @@ ANSWER:"""
             return
 
         if self._using_apple_lm():
-            from src.apple_lm import stream_complete
-            yield from stream_complete(prompt, timeout=300)
+            from src.apple_lm import is_apple_system_model, stream_complete
+            emitted = False
+            try:
+                for chunk in stream_complete(prompt, timeout=300):
+                    emitted = True
+                    yield chunk
+                return
+            except Exception:
+                # Apple Intelligence reports itself available and then refuses
+                # individual requests: its guardrails reject some entirely
+                # ordinary meeting content (measured — a transcript line naming
+                # a person and an action is enough), deterministically, for the
+                # same prompt shape that answers fine one sentence later. A
+                # question about the user's own meeting must not die on that,
+                # so serve it with the model __init__ already downgrades to
+                # when the sidecar is missing. Two cases re-raise instead:
+                # mid-answer (falling back would duplicate text already
+                # yielded), and a downgrade target that is itself the Apple
+                # sentinel (falling back would re-enter this arm forever).
+                if emitted or is_apple_system_model(Config.DEFAULT_MODEL):
+                    raise
+                logger.warning(
+                    "Apple Intelligence refused an interactive query; "
+                    "falling back to %s", Config.DEFAULT_MODEL
+                )
+            fallback = OllamaSummarizer(
+                model_name=Config.DEFAULT_MODEL,
+                ai_provider=self.ai_provider,
+            )
+            yield from fallback.query_transcript_streaming_strict(
+                transcript, question, language=language, history=history
+            )
             return
 
         if self.ai_provider == "remote":
