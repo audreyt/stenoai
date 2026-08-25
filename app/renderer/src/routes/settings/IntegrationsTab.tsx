@@ -361,11 +361,21 @@ export function IntegrationsTab() {
           </code>
         </div>
         <div className="flex shrink-0 gap-2 pt-1">
+          {/* Copy is offered only while the server is actually running. The URL
+              stays visible when stopped (it tells you which port will be used),
+              but handing someone a one-click copy of an endpoint nothing is
+              listening on just sends them to configure a client that fails. */}
           <Button
             variant="outline"
             size="sm"
             className={COMPACT_BTN}
             onClick={handleCopyEndpoint}
+            disabled={!mcpStatus.data?.running}
+            title={
+              mcpStatus.data?.running
+                ? 'Copy the endpoint URL'
+                : 'Turn the server on to copy its endpoint'
+            }
             data-testid="mcp-copy-endpoint-btn"
           >
             {copiedEndpoint ? 'Copied' : 'Copy URL'}

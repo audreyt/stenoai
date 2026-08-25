@@ -11,15 +11,12 @@ import { test, expect } from '../fixtures/electron';
  * 6. Client configuration snippet renders with endpoint and Authorization header.
  * 7. Custom key paste input mode toggles and allows cancel.
  *
- * NOTE ON MOCK IPC STUB LIMITATIONS:
- * The mcp channels (`mcp-get-status`, `mcp-get-key`, `mcp-set-key`, `mcp-regenerate-key`,
- * `mcp-set-enabled`, `mcp-set-port`) are intentionally NOT stubbed in app/e2e-mock-ipc.js.
- * Under permissive `{ success: true }` mock resolution, the following backend behaviors
- * cannot be asserted in this T1 suite and require backend/T2 integration tests or explicit stubs:
- * - Round-trip persistence of enabled state and port changes across reloads.
- * - Exact key string verification returned from `mcp-get-key` (returns mock `{ success: true }`).
- * - Active localhost socket binding and port conflict refusal.
- * - Live HTTP Streamable protocol authorization header verification.
+ * The mcp channels are stubbed statefully in app/e2e-mock-ipc.js (enabling with
+ * no key mints one, like the real handler), so this suite also asserts the
+ * EFFECT of the toggle. What still belongs to T2 and cannot be proven here:
+ * a real localhost socket, a port collision refusal, safeStorage encryption of
+ * the key, and the HTTP auth/Origin gates — all covered by
+ * e2e/specs/mcp-server.t2.spec.ts against the real endpoint.
  */
 
 test('Local MCP settings render OFF by default with disclosure copy and masked key', async ({
@@ -170,4 +167,51 @@ test('Paste custom key toggles input mode and allows cancel', async ({ launchApp
   await cancelBtn.click();
   await expect(section.getByTestId('mcp-custom-key-input')).toHaveCount(0);
   await expect(section.getByTestId('mcp-key-masked')).toBeVisible();
+});
+
+test('enabling the server reports it running, unlocks copy, and stops on disable', async ({
+  launchApp,
+}) => {
+  const { page } = await launchApp({ mockIpc: true });
+
+  await page.evaluate(() => {
+    window.location.hash = '#/settings?tab=integrations';
+  });
+
+  const section = page.locator('[data-settings-tab="integrations"]');
+  await expect(section).toBeVisible();
+
+  // Stopped: the URL is shown (it says which port will be used) but copying it
+  // is refused - a one-click copy of a dead endpoint just sends the user off to
+  // configure a client that cannot connect.
+  const endpoint = section.getByTestId('mcp-endpoint-url');
+  await expect(endpoint).toBeVisible();
+  await expect(endpoint).toContainText('http://127.0.0.1:');
+  await expect(endpoint).toContainText('/mcp');
+  const copyBtn = section.getByTestId('mcp-copy-endpoint-btn');
+  await expect(copyBtn).toBeDisabled();
+  await expect(section.getByText(/Server is stopped/)).toBeVisible();
+
+  const toggle = section.getByTestId('mcp-toggle');
+  await expect(toggle).not.toBeChecked();
+  await toggle.click();
+
+  // Enabling with no key mints one and brings the server up: the status line
+  // flips and copy becomes available.
+  await expect(toggle).toBeChecked();
+  await expect(section.getByText(/The server is running locally/)).toBeVisible();
+  await expect(copyBtn).toBeEnabled();
+
+  // The key now exists, and revealing shows a real value rather than the mask.
+  await section.getByTestId('mcp-reveal-key-btn').click();
+  const revealed = section.getByTestId('mcp-key-revealed');
+  await expect(revealed).toBeVisible();
+  await expect(revealed).not.toHaveText('');
+  await expect(revealed).not.toContainText('\u2022\u2022\u2022\u2022');
+
+  // Turning it back off withdraws the copy affordance again.
+  await toggle.click();
+  await expect(toggle).not.toBeChecked();
+  await expect(section.getByText(/Server is stopped/)).toBeVisible();
+  await expect(copyBtn).toBeDisabled();
 });

@@ -567,6 +567,21 @@ function install({ ipcMain }) {
     { id: 'weekly-status', label: 'Weekly status', prompt: 'Summarise this week across my meetings.' },
   ];
 
+  // Local MCP server, per launch. Stateful so a spec can drive the settings UI
+  // and observe the EFFECT of enabling (running + endpoint) rather than only
+  // that the section rendered. Mirrors the real handlers' result shapes; there
+  // is no socket here, so `running` is simply "enabled with a key".
+  const mockMcp = { enabled: false, port: 27127, key: null };
+  const mockMcpEndpoint = () => `http://127.0.0.1:${mockMcp.port}/mcp`;
+  const mockMcpStatus = () => ({
+    success: true,
+    enabled: mockMcp.enabled,
+    port: mockMcp.port,
+    running: mockMcp.enabled && !!mockMcp.key,
+    keySet: !!mockMcp.key,
+    endpoint: mockMcp.enabled && mockMcp.key ? mockMcpEndpoint() : null,
+  });
+
   // Channels with behaviour a test depends on. Each is (event, ...args) like a
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
@@ -922,6 +937,42 @@ function install({ ipcMain }) {
       if (!active) return { success: false, error: 'No active recording' };
       global.__stenoai_e2e_set_template_calls.push(templateId);
       return { success: true };
+    },
+
+    // Local MCP server settings. Enabling with no key mints one, exactly like
+    // the real handler, so a spec can prove the toggle produces a running
+    // server with an endpoint instead of only that the switch moved.
+    'mcp-get-status': async () => mockMcpStatus(),
+    'mcp-get-key': async () =>
+      mockMcp.key
+        ? { success: true, key: mockMcp.key }
+        : { success: false, error: 'No key set' },
+    'mcp-set-key': async (_event, key) => {
+      if (typeof key !== 'string' || !key.trim()) {
+        return { success: false, error: 'Key is required' };
+      }
+      if (key.length > 4096) return { success: false, error: 'Key is too long' };
+      mockMcp.key = key.trim();
+      return { success: true };
+    },
+    'mcp-regenerate-key': async () => {
+      mockMcp.key = `mock-mcp-key-${Math.random().toString(36).slice(2, 10)}`;
+      return { success: true, key: mockMcp.key };
+    },
+    'mcp-set-enabled': async (_event, enabled) => {
+      mockMcp.enabled = enabled === true;
+      if (mockMcp.enabled && !mockMcp.key) {
+        mockMcp.key = `mock-mcp-key-${Math.random().toString(36).slice(2, 10)}`;
+      }
+      return { success: true, ...mockMcpStatus() };
+    },
+    'mcp-set-port': async (_event, port) => {
+      const n = Number(port);
+      if (!Number.isInteger(n) || n < 1024 || n > 65535) {
+        return { success: false, error: 'Port must be between 1024 and 65535' };
+      }
+      mockMcp.port = n;
+      return { success: true, ...mockMcpStatus() };
     },
 
     // Notification handlers — the real ones return { success, shown } after the
