@@ -2098,6 +2098,49 @@ def set_silence_auto_stop_minutes_cmd(minutes: int):
         }))
 
 
+
+@cli.command(name='get-mcp-settings')
+def get_mcp_settings_cmd():
+    """Get the local MCP server settings (enabled status and port)."""
+    from src.config import get_config
+    config = get_config()
+    print(json.dumps({
+        "mcp_enabled": config.get_mcp_enabled(),
+        "mcp_port": config.get_mcp_port(),
+    }))
+
+
+@cli.command(name='set-mcp-settings')
+@click.option('--enabled/--disabled', 'enabled', default=None, help='Enable or disable the local MCP server')
+@click.option('--port', type=int, default=None, help='Port for the local MCP server (1024-65535)')
+def set_mcp_settings_cmd(enabled, port):
+    """Set the local MCP server settings (secret-free).
+
+    The MCP API key is stored separately (encrypted by Electron in .mcp-api-key)
+    and must never be placed in config.json.
+    """
+    import sys
+    from src.config import get_config
+    config = get_config()
+
+    if port is not None and not (config.MIN_MCP_PORT <= port <= config.MAX_MCP_PORT):
+        print(json.dumps({
+            "success": False,
+            "error": f"Invalid MCP port: {port}; expected integer between {config.MIN_MCP_PORT} and {config.MAX_MCP_PORT}",
+        }))
+        sys.exit(1)
+
+    if enabled is not None or port is not None:
+        if not config.set_mcp_settings(enabled=enabled, port=port):
+            print(json.dumps({"success": False, "error": "Failed to persist MCP settings"}))
+            sys.exit(1)
+
+    print(json.dumps({
+        "success": True,
+        "mcp_enabled": config.get_mcp_enabled(),
+        "mcp_port": config.get_mcp_port(),
+    }))
+
 @cli.command()
 def status():
     """Show recorder status.

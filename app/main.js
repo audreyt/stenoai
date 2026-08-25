@@ -115,6 +115,9 @@ const os = require('os');
 const { URL, URLSearchParams } = require('url');
 const crypto = require('crypto');
 const { EXPORT_CANCELED } = require('./ipc-sentinels');
+const { handleRpc, SUPPORTED_VERSIONS, MODERN_VERSION } = require('./mcp-protocol');
+const { createMcpServer } = require('./mcp-server');
+const { createMcpTools } = require('./mcp-tools');
 const { mayExposeMainWindow } = require('./e2e-window-visibility');
 const { PostHog } = require('posthog-node');
 const { initMain } = require('electron-audio-loopback');
@@ -526,11 +529,40 @@ const { getBackendPath, getBackendCwd, runPythonScript } = createBackendCli({
   attachProcessingStderr,
   forwardDiagnosticStdout,
 });
-// Quit teardown registry (RFC #327 ground rule 4). No consumers yet — domains
-// that own a child process/timer (Ollama, mic monitor, recording runtime, …)
-// register an idempotent dispose() as they move out of main.js. Drained in
-// will-quit below.
+// Quit teardown registry (RFC #327 ground rule 4). Domains that own a child
+// process, timer, or local server register an idempotent dispose() here instead
+// of each installing a bespoke quit hook. Drained in will-quit below.
 const teardown = createTeardownRegistry();
+const mcpTools = createMcpTools({
+  runPythonScript,
+  validateMeetingFilePath,
+  getOutputDir,
+  timeoutMs: LIVE_QUERY_TIMEOUT_MS,
+});
+let mcpApiKeyForServer = null;
+const mcpServer = createMcpServer({
+  handleRpc: ({ headers, body }) => handleRpc({
+    headers,
+    body,
+    tools: mcpTools.definitions,
+    callTool: (name, args) => mcpTools.call(name, args),
+    serverInfo: {
+      name: 'stenoai',
+      version: app.getVersion(),
+      protocolVersion: MODERN_VERSION,
+      supportedVersions: SUPPORTED_VERSIONS,
+    },
+  }),
+  getApiKey: () => mcpApiKeyForServer,
+  log: (entry) => {
+    if (entry && entry.event === 'handle_rpc_error') {
+      sendDebugLog('[mcp] request failed');
+    }
+  },
+});
+teardown.register(() => {
+  void stopMcpServer();
+});
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
@@ -1895,7 +1927,10 @@ if (!gotSingleInstanceLock) {
   }
 
   app.on('before-quit', async (event) => {
-    if (isQuitting) return;
+    if (isQuitting) {
+      void stopMcpServer();
+      return;
+    }
 
     // Synchronous flag — systemAudioRecordingActive is updated via IPC on each
     // state change. Capture is renderer-driven on every platform now.
@@ -1915,6 +1950,7 @@ if (!gotSingleInstanceLock) {
         systemAudioRecordingActive = false;
         updateTrayIcon(false);
         isQuitting = true;
+        void stopMcpServer();
         app.quit();
       }
     } else if (isProcessing || processingQueue.length > 0) {
@@ -1923,10 +1959,12 @@ if (!gotSingleInstanceLock) {
       const confirmed = await showCustomQuitDialog('processing', jobCount);
       if (confirmed) {
         isQuitting = true;
+        void stopMcpServer();
         app.quit();
       }
     } else {
       isQuitting = true;
+      void stopMcpServer();
     }
   });
 
@@ -2262,6 +2300,22 @@ if (!gotSingleInstanceLock) {
       recoverPendingDeletesOnLaunch();
     } catch (e) {
       console.warn('pending-delete recovery on launch failed (non-fatal):', e?.message);
+    }
+
+    // Local MCP server (off by default). Deliberately started HERE, and
+    // deliberately NOT awaited:
+    //  - AFTER recoverPendingDeletesOnLaunch, because starting it reads settings
+    //    through a Python spawn. Awaiting that ahead of recovery let
+    //    [data-app-ready] fire while a crash-orphaned note was still hidden —
+    //    an optional, off-by-default convenience must never delay restoring a
+    //    user's note (caught by meeting-undo-delete.t2 + audio-import-collision.t2).
+    //  - not awaited, so a slow spawn, a busy port, or an undecryptable key can
+    //    never hold up launch. enqueueMcpLifecycleOp serialises lifecycle ops, so
+    //    a later enable/disable cannot race this one.
+    if (!IS_E2E_MOCK_IPC) {
+      void enqueueMcpLifecycleOp(startMcpServerFromSettings).catch(() => {
+        sendDebugLog('[mcp] startup skipped');
+      });
     }
 
     // Load the Obsidian sync config into the engine's cache (so per-note hooks
@@ -9624,6 +9678,286 @@ function loadCloudApiKey() {
 function hasCloudApiKey() {
   return fs.existsSync(getCloudKeyPath());
 }
+
+const MCP_DEFAULT_PORT = 27127;
+const MCP_MIN_PORT = 1024;
+const MCP_MAX_PORT = 65535;
+const MCP_MAX_KEY_LENGTH = 4096;
+let mcpLastError = null;
+let mcpLifecycleQueue = Promise.resolve();
+
+function getMcpKeyPath() {
+  return path.join(getUserDataDir(), '.mcp-api-key');
+}
+
+function generateMcpApiKey() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function saveMcpApiKey(key) {
+  try {
+    const keyDir = path.dirname(getMcpKeyPath());
+    if (!fs.existsSync(keyDir)) {
+      fs.mkdirSync(keyDir, { recursive: true });
+    }
+    const encrypted = getSafeStorage().encryptString(key);
+    fs.writeFileSync(getMcpKeyPath(), encrypted);
+    mcpApiKeyForServer = key;
+    return true;
+  } catch (error) {
+    console.error('Failed to save MCP API key:', error.message);
+    return false;
+  }
+}
+
+function loadMcpApiKey() {
+  const keyPath = getMcpKeyPath();
+  migrateLegacyCredentialFile(keyPath, '.mcp-api-key');
+  if (!fs.existsSync(keyPath)) return null;
+  try {
+    const encrypted = fs.readFileSync(keyPath);
+    return getSafeStorage().decryptString(encrypted);
+  } catch (error) {
+    console.error('Failed to load MCP API key:', error.message);
+    throw new Error('MCP API key could not be read. Unlock your system keychain or set a new key.');
+  }
+}
+
+function hasMcpApiKey() {
+  return fs.existsSync(getMcpKeyPath());
+}
+
+function ensureMcpApiKey() {
+  const existing = loadMcpApiKey();
+  if (existing) {
+    mcpApiKeyForServer = existing;
+    return existing;
+  }
+  const generated = generateMcpApiKey();
+  if (!saveMcpApiKey(generated)) {
+    throw new Error('Failed to save MCP API key.');
+  }
+  return generated;
+}
+
+function isValidMcpPort(port) {
+  return Number.isInteger(port) && port >= MCP_MIN_PORT && port <= MCP_MAX_PORT;
+}
+
+function normalizeMcpPort(port) {
+  return isValidMcpPort(port) ? port : MCP_DEFAULT_PORT;
+}
+
+function parseBackendJsonObject(raw, fallback = {}) {
+  const text = String(raw || '').trim();
+  const jsonMatch = text.match(/\{.*\}/s);
+  return jsonMatch ? JSON.parse(jsonMatch[0]) : fallback;
+}
+
+async function readMcpSettings() {
+  const result = await runPythonScript('simple_recorder.py', ['get-mcp-settings'], true);
+  const parsed = parseBackendJsonObject(result, {});
+  return {
+    enabled: parsed.mcp_enabled === true,
+    port: normalizeMcpPort(Number(parsed.mcp_port)),
+  };
+}
+
+async function saveMcpSettingsPatch({ enabled, port }) {
+  const args = ['set-mcp-settings'];
+  if (enabled === true) args.push('--enabled');
+  if (enabled === false) args.push('--disabled');
+  if (port !== undefined) args.push('--port', String(port));
+  const result = await runPythonScript('simple_recorder.py', args);
+  const parsed = parseBackendJsonObject(result, { success: true });
+  if (parsed.success === false) {
+    throw new Error(parsed.error || 'Failed to save MCP settings');
+  }
+  return parsed;
+}
+
+function formatMcpStartError(error, port) {
+  if (error && error.code === 'EADDRINUSE') {
+    return `MCP server port ${port} is already in use. Choose a different port in Settings.`;
+  }
+  if (error && error.message && error.message.startsWith('MCP API key')) {
+    return error.message;
+  }
+  if (error && error.message === 'Failed to save MCP API key.') {
+    return error.message;
+  }
+  const code = error && error.code ? ` (${error.code})` : '';
+  return `MCP server failed to start${code}.`;
+}
+
+function mcpEndpointForPort(port) {
+  return `http://127.0.0.1:${port}/mcp`;
+}
+
+async function stopMcpServer() {
+  mcpApiKeyForServer = null;
+  await mcpServer.stop();
+  mcpLastError = null;
+}
+
+async function startMcpServerOnPort(port) {
+  try {
+    ensureMcpApiKey();
+    if (mcpServer.isRunning()) {
+      if (mcpServer.port() === port) {
+        mcpLastError = null;
+        return;
+      }
+      await mcpServer.stop();
+    }
+    await mcpServer.start(port);
+    mcpLastError = null;
+  } catch (error) {
+    mcpApiKeyForServer = null;
+    try {
+      await mcpServer.stop();
+    } catch (_) {}
+    mcpLastError = formatMcpStartError(error, port);
+    throw new Error(mcpLastError);
+  }
+}
+
+function enqueueMcpLifecycleOp(op) {
+  const run = mcpLifecycleQueue.then(op);
+  mcpLifecycleQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function startMcpServerFromSettings() {
+  const settings = await readMcpSettings();
+  if (!settings.enabled) {
+    mcpLastError = null;
+    return settings;
+  }
+  try {
+    await startMcpServerOnPort(settings.port);
+  } catch (_) {
+    sendDebugLog('[mcp] startup failed');
+  }
+  return settings;
+}
+
+async function mcpStatusResponse() {
+  const settings = await readMcpSettings();
+  const running = mcpServer.isRunning();
+  const port = normalizeMcpPort(running ? mcpServer.port() : settings.port);
+  const response = {
+    success: true,
+    enabled: settings.enabled,
+    port,
+    running,
+    keySet: hasMcpApiKey(),
+    endpoint: mcpEndpointForPort(port),
+  };
+  if (mcpLastError) response.error = mcpLastError;
+  return response;
+}
+
+function validateMcpKeyInput(key) {
+  if (typeof key !== 'string') {
+    return { error: 'MCP API key must be a string.' };
+  }
+  const trimmed = key.trim();
+  if (!trimmed) {
+    return { error: 'MCP API key cannot be empty.' };
+  }
+  if (trimmed.length > MCP_MAX_KEY_LENGTH) {
+    return { error: 'MCP API key is too long.' };
+  }
+  return { value: trimmed };
+}
+
+ipcMain.handle('mcp-get-status', async () => {
+  try {
+    return await mcpStatusResponse();
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('mcp-get-key', async () => {
+  try {
+    return { success: true, key: loadMcpApiKey() || '' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('mcp-set-key', async (_event, key) => {
+  try {
+    const validated = validateMcpKeyInput(key);
+    if (validated.error) {
+      return { success: false, error: validated.error };
+    }
+    if (!saveMcpApiKey(validated.value)) {
+      return { success: false, error: 'Failed to save MCP API key.' };
+    }
+    return { success: true, keySet: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('mcp-regenerate-key', async () => {
+  try {
+    const key = generateMcpApiKey();
+    if (!saveMcpApiKey(key)) {
+      return { success: false, error: 'Failed to save MCP API key.' };
+    }
+    return { success: true, key };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('mcp-set-enabled', async (_event, enabled) => {
+  if (typeof enabled !== 'boolean') {
+    return { success: false, error: 'MCP enabled must be a boolean.' };
+  }
+  try {
+    return await enqueueMcpLifecycleOp(async () => {
+      if (enabled) {
+        const settings = await readMcpSettings();
+        await startMcpServerOnPort(settings.port);
+        try {
+          await saveMcpSettingsPatch({ enabled: true });
+        } catch (error) {
+          await stopMcpServer();
+          throw error;
+        }
+      } else {
+        await saveMcpSettingsPatch({ enabled: false });
+        await stopMcpServer();
+      }
+      return await mcpStatusResponse();
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('mcp-set-port', async (_event, port) => {
+  if (!isValidMcpPort(port)) {
+    return { success: false, error: 'MCP port must be an integer from 1024 to 65535.' };
+  }
+  try {
+    return await enqueueMcpLifecycleOp(async () => {
+      const wasRunning = mcpServer.isRunning();
+      await saveMcpSettingsPatch({ port });
+      if (wasRunning) {
+        await startMcpServerOnPort(port);
+      }
+      return await mcpStatusResponse();
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
 
 // Build the env additions a Python AI-driven subprocess needs. Merges
 // the encrypted-on-disk cloud key (decrypted only here, never written

@@ -494,3 +494,79 @@ test('set-recording-template rejects cleanly when no recording is active', () =>
     'set-recording-template must update currentRecordingTemplateId with the accepted id',
   );
 });
+
+test('MCP IPC channels are registered and exposed through the bridge', () => {
+  const channels = [
+    'mcp-get-status',
+    'mcp-get-key',
+    'mcp-set-key',
+    'mcp-regenerate-key',
+    'mcp-set-enabled',
+    'mcp-set-port',
+  ];
+  const registered = new Set(mainRegistrations());
+  const invocable = preloadInvokeChannels();
+  for (const channel of channels) {
+    assert.ok(registered.has(channel), `${channel} must be registered in main.js`);
+    assert.ok(invocable.has(channel), `${channel} must be invoked by preload.js`);
+  }
+});
+
+test('mcp-get-status never returns or reads the API key', () => {
+  const statusIndex = MAIN.indexOf("ipcMain.handle('mcp-get-status',");
+  assert.ok(statusIndex >= 0, 'expected mcp-get-status handler in main.js');
+  const statusBlock = MAIN.slice(statusIndex, statusIndex + 360);
+  assert.match(statusBlock, /mcpStatusResponse\(\)/);
+
+  const responseIndex = MAIN.indexOf('async function mcpStatusResponse()');
+  assert.ok(responseIndex >= 0, 'expected mcpStatusResponse helper in main.js');
+  const responseBlock = MAIN.slice(responseIndex, responseIndex + 900);
+  assert.match(responseBlock, /keySet:\s*hasMcpApiKey\(\)/);
+  assert.doesNotMatch(responseBlock, /\b(loadMcpApiKey|ensureMcpApiKey|mcpApiKeyForServer)\b/);
+});
+
+test('MCP key storage uses the isolated user-data directory', () => {
+  const keyPathIndex = MAIN.indexOf('function getMcpKeyPath()');
+  assert.ok(keyPathIndex >= 0, 'expected getMcpKeyPath helper in main.js');
+  const keyPathBlock = MAIN.slice(keyPathIndex, keyPathIndex + 180);
+  assert.match(
+    keyPathBlock,
+    /path\.join\(getUserDataDir\(\),\s*'\.mcp-api-key'\)/,
+    'MCP key must live under getUserDataDir(), never a hardcoded app-data path',
+  );
+});
+
+test('main wires MCP transport by port only and leaves localhost binding to mcp-server', () => {
+  const startIndex = MAIN.indexOf('async function startMcpServerOnPort(port)');
+  assert.ok(startIndex >= 0, 'expected startMcpServerOnPort helper in main.js');
+  const startBlock = MAIN.slice(startIndex, startIndex + 700);
+  assert.doesNotMatch(
+    startBlock,
+    /\.listen\([^)]*['"]127\.0\.0\.1['"]/,
+    'MCP lifecycle code in main.js must not bind a host; mcp-server owns localhost-only listen()',
+  );
+  assert.match(
+    startBlock,
+    /mcpServer\.start\(port\)/,
+    'main.js must pass only the configured port into mcpServer.start()',
+  );
+  assert.doesNotMatch(
+    startBlock,
+    /mcpServer\.start\([^)]*,/,
+    'main.js must not pass a host argument into mcpServer.start()',
+  );
+});
+
+test('mcp-set-port rejects ports outside the user-safe range', () => {
+  const handlerIndex = MAIN.indexOf("ipcMain.handle('mcp-set-port',");
+  assert.ok(handlerIndex >= 0, 'expected mcp-set-port handler in main.js');
+  const handlerBlock = MAIN.slice(handlerIndex, handlerIndex + 700);
+  assert.match(handlerBlock, /isValidMcpPort\(port\)/);
+
+  const guardIndex = MAIN.indexOf('function isValidMcpPort(port)');
+  assert.ok(guardIndex >= 0, 'expected isValidMcpPort helper in main.js');
+  const guardBlock = MAIN.slice(guardIndex, guardIndex + 220);
+  assert.match(guardBlock, /Number\.isInteger\(port\)/);
+  assert.match(guardBlock, /port\s*>=\s*MCP_MIN_PORT/);
+  assert.match(guardBlock, /port\s*<=\s*MCP_MAX_PORT/);
+});

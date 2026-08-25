@@ -91,6 +91,40 @@ build image. Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; a fake binary
 can be injected via `STENOAI_APPLE_LM_BIN`. Windows/Linux never resolve the
 sidecar.
 
+### Local MCP server (off by default)
+An MCP server lives **in the Electron main process** (not Python — it must
+outlive a subprocess, and every tool it exposes already has an IPC path in
+`main.js`). It speaks the **2026-07-28 Streamable HTTP** revision, which is
+stateless: POST-only single endpoint at `/mcp`, no GET stream, no protocol
+sessions. It also answers a legacy `initialize` handshake so today's clients
+work, and never mints or echoes `Mcp-Session-Id`.
+
+Three modules, split so the protocol is testable without sockets and the
+transport without semantics:
+- `app/mcp-protocol.js` — pure. Header/body validation, era selection,
+  version negotiation, JSON-RPC dispatch, spec error codes (`-32020`
+  HeaderMismatch, `-32022` UnsupportedProtocolVersion, `-32601` at HTTP 404).
+  No fs, no http.
+- `app/mcp-server.js` — `node:http` only. Binds `127.0.0.1`, gates methods,
+  validates `Origin` (403), checks `Authorization: Bearer` with
+  `timingSafeEqual` **before** parsing a body, caps the body at 1 MiB.
+- `app/mcp-tools.js` — six tools (`list_meetings`, `get_meeting`,
+  `get_meeting_transcript`, `search_meetings`, `list_folders`,
+  `ask_meetings`). Every `meeting_id` goes through `validateMeetingFilePath`;
+  `ask_meetings` is the only one that costs a model call and is timeout-bound.
+
+Settings live in `config.json` (`mcp_enabled` default false, `mcp_port`
+default 27127). The **API key does not**: it is encrypted with `safeStorage`
+into `<userData>/.mcp-api-key`, mirroring the cloud-key path — `config.json`
+is secret-free and must stay so. A key that cannot be decrypted stops the
+server rather than running it unauthenticated.
+
+`e2e/specs/mcp-server.t2.spec.ts` drives the real endpoint over real HTTP and
+is the authority on the security properties (401 without a key, 403 for a
+foreign `Origin` even WITH a valid key, 405 for GET/DELETE, and the port
+actually closing on disable). It skips loudly where `safeStorage` is
+unavailable, as on a headless runner.
+
 
 ### End-to-end tests (Playwright)
 The e2e suite drives the **real Electron app** (real window, real clicks) to catch

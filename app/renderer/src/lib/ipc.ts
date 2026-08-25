@@ -124,6 +124,15 @@ export interface CalendarEvent {
   color?: string;
 }
 
+export interface McpStatus {
+  enabled: boolean;
+  port: number;
+  running: boolean;
+  keySet: boolean;
+  endpoint: string;
+  error?: string;
+}
+
 export interface UpdateMeetingPatch {
   name?: string;
   summary?: string;
@@ -1352,6 +1361,15 @@ export interface StenoaiBridge {
       [defaultFilename: string, content: string],
       Result<{ path: string }>
     >;
+  };
+
+  mcp: {
+    getStatus: RequestFn<[], Result<McpStatus>>;
+    getKey: RequestFn<[], Result<{ key: string }>>;
+    setKey: RequestFn<[key: string], Result<{ keySet: boolean }>>;
+    regenerateKey: RequestFn<[], Result<{ key: string }>>;
+    setEnabled: RequestFn<[enabled: boolean], Result<McpStatus>>;
+    setPort: RequestFn<[port: number], Result<McpStatus>>;
   };
 
   ai: {

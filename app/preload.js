@@ -342,6 +342,15 @@ const stenoai = {
       invoke('save-diagnostics', defaultFilename, content),
   },
 
+  mcp: {
+    getStatus: () => invoke('mcp-get-status'),
+    getKey: () => invoke('mcp-get-key'),
+    setKey: (key) => invoke('mcp-set-key', key),
+    regenerateKey: () => invoke('mcp-regenerate-key'),
+    setEnabled: (enabled) => invoke('mcp-set-enabled', enabled),
+    setPort: (port) => invoke('mcp-set-port', port),
+  },
+
   ai: {
     getProvider: () => invoke('get-ai-provider'),
     setProvider: (p) => invoke('set-ai-provider', p),

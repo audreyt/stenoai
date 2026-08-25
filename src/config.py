@@ -311,6 +311,11 @@ class Config:
     }
 
     VALID_TRANSCRIPTION_ENGINES = ("parakeet", "whisper")
+    DEFAULT_MCP_ENABLED: bool = False
+    DEFAULT_MCP_PORT: int = 27127
+    MIN_MCP_PORT: int = 1024
+    MAX_MCP_PORT: int = 65535
+
 
     def __init__(self, config_path: Optional[Path] = None):
         """
@@ -368,6 +373,8 @@ class Config:
         self._seed_sample_template()
         self._normalize_recipes()
         self._normalize_voiceprints()
+        self._normalize_mcp_settings()
+
 
     def _migrate_language_zh(self) -> None:
         """Migrate the legacy single ``"zh"`` language to Simplified (``zh-Hans``).
@@ -941,6 +948,12 @@ class Config:
             # vault folder. One-way (Steno -> vault); see app/obsidian-sync.js.
             "obsidian_sync_enabled": False,
             "obsidian_vault_path": "",
+            # Local MCP server settings (#contract-item-5).
+            # Secret-free: the MCP API key is encrypted and stored separately by
+            # the Electron main process in .mcp-api-key; config.json NEVER stores
+            # credentials or tokens.
+            "mcp_enabled": False,
+            "mcp_port": 27127,
             # Default ON — when the app is idle and nothing is in flight, a
             # downloaded update installs itself and relaunches so the user
             # never has to click "Restart". The "update available/downloaded"
@@ -2150,6 +2163,115 @@ class Config:
         self._config["silence_auto_stop_minutes"] = minutes
         return self._save()
 
+
+    # --- Local MCP Server ---------------------------------------------------
+    # Secret-free: the MCP API key is encrypted and stored separately by the
+    # Electron main process in .mcp-api-key; config.json NEVER stores secrets.
+
+    def _normalize_mcp_settings(self) -> None:
+        """Coerce persisted MCP settings to valid types on load.
+
+        Secret-free: the MCP API key is stored separately (encrypted by Electron)
+        and must never be placed in config.json.
+        """
+        if self._load_failed:
+            return
+        if "mcp_enabled" in self._config:
+            val = self._config["mcp_enabled"]
+            if not isinstance(val, bool):
+                self._config["mcp_enabled"] = self.DEFAULT_MCP_ENABLED
+        if "mcp_port" in self._config:
+            val = self._config["mcp_port"]
+            if isinstance(val, int) and not isinstance(val, bool) and (self.MIN_MCP_PORT <= val <= self.MAX_MCP_PORT):
+                pass
+            else:
+                self._config["mcp_port"] = self.DEFAULT_MCP_PORT
+
+    def get_mcp_enabled(self) -> bool:
+        """Get whether the local MCP server is enabled. Default False."""
+        val = self._config.get("mcp_enabled", self.DEFAULT_MCP_ENABLED)
+        if isinstance(val, bool):
+            return val
+        return self.DEFAULT_MCP_ENABLED
+
+    def set_mcp_enabled(self, enabled: bool) -> bool:
+        """Set whether the local MCP server is enabled.
+
+        Args:
+            enabled: True to enable the local MCP server, False to disable.
+
+        Returns:
+            True if saved successfully, False otherwise.
+        """
+        self._config["mcp_enabled"] = bool(enabled)
+        return self._save()
+
+    def get_mcp_port(self) -> int:
+        """Get the local MCP server port. Default 27127 (range 1024-65535)."""
+        val = self._config.get("mcp_port", self.DEFAULT_MCP_PORT)
+        if isinstance(val, int) and not isinstance(val, bool) and (self.MIN_MCP_PORT <= val <= self.MAX_MCP_PORT):
+            return val
+        return self.DEFAULT_MCP_PORT
+
+    def set_mcp_port(self, port: int) -> bool:
+        """Set the local MCP server port.
+
+        Args:
+            port: Port number between 1024 and 65535.
+
+        Returns:
+            True if valid and saved successfully, False if rejected or save failed.
+        """
+        if isinstance(port, bool) or not isinstance(port, int):
+            return False
+        if not (self.MIN_MCP_PORT <= port <= self.MAX_MCP_PORT):
+            logger.error(
+                f"Invalid MCP port: {port}; expected integer between "
+                f"{self.MIN_MCP_PORT} and {self.MAX_MCP_PORT}"
+            )
+            return False
+        self._config["mcp_port"] = port
+        return self._save()
+
+    def get_mcp_settings(self) -> Dict[str, Any]:
+        """Get the local MCP server settings (secret-free).
+
+        Returns:
+            Dictionary with 'mcp_enabled' (bool) and 'mcp_port' (int).
+            Note: The API key is stored encrypted separately by the Electron
+            main process and is NEVER stored in config.json.
+        """
+        return {
+            "mcp_enabled": self.get_mcp_enabled(),
+            "mcp_port": self.get_mcp_port(),
+        }
+
+    def set_mcp_settings(
+        self,
+        enabled: Optional[bool] = None,
+        port: Optional[int] = None,
+    ) -> bool:
+        """Set local MCP settings atomically.
+
+        Args:
+            enabled: Optional bool to enable/disable.
+            port: Optional int port (1024-65535).
+
+        Returns:
+            True if valid and saved, False if rejected or save failed.
+        """
+        if port is not None:
+            if isinstance(port, bool) or not isinstance(port, int) or not (self.MIN_MCP_PORT <= port <= self.MAX_MCP_PORT):
+                logger.error(
+                    f"Invalid MCP port: {port}; expected integer between "
+                    f"{self.MIN_MCP_PORT} and {self.MAX_MCP_PORT}"
+                )
+                return False
+        if enabled is not None:
+            self._config["mcp_enabled"] = bool(enabled)
+        if port is not None:
+            self._config["mcp_port"] = port
+        return self._save()
 
     def get_transcription_engine(self) -> str:
         """Return the active ASR engine ('parakeet' or 'whisper').
