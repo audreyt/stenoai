@@ -538,6 +538,8 @@ const mcpTools = createMcpTools({
   validateMeetingFilePath,
   getOutputDir,
   timeoutMs: LIVE_QUERY_TIMEOUT_MS,
+  spawnBackend: (args) => spawn(getBackendPath(), args, { cwd: getBackendCwd() }),
+  killBackendTree: (pid) => killProcessTree(pid),
 });
 let mcpApiKeyForServer = null;
 const mcpServer = createMcpServer({

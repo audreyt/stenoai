@@ -421,15 +421,23 @@ const TOOL_DEFINITIONS = [
  * @param {(summaryFile: string) => Promise<{ realPath?: string, error?: string }>} deps.validateMeetingFilePath
  * @param {() => string} [deps.getOutputDir]
  * @param {number} [deps.timeoutMs]
+ * @param {(args: string[]) => import('child_process').ChildProcess} deps.spawnBackend
+ * @param {(pid: number) => void} deps.killBackendTree
  */
-function createMcpTools({ runPythonScript, validateMeetingFilePath, getOutputDir, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function createMcpTools({
+  runPythonScript,
+  validateMeetingFilePath,
+  getOutputDir,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  spawnBackend,
+  killBackendTree,
+} = {}) {
   if (typeof runPythonScript !== 'function') {
     throw new TypeError('createMcpTools requires runPythonScript function');
   }
   if (typeof validateMeetingFilePath !== 'function') {
     throw new TypeError('createMcpTools requires validateMeetingFilePath function');
   }
-
   async function handleListMeetings(args = {}) {
     const limit = clampLimit(args.limit);
     let raw;
@@ -874,56 +882,96 @@ function createMcpTools({ runPythonScript, validateMeetingFilePath, getOutputDir
       cliArgs.push('-f', folderId);
     }
 
-    let timeoutTimer = null;
-    let procRef = null;
-
-    const execPromise = (async () => {
-      const res = runPythonScript('simple_recorder.py', cliArgs, true);
-      if (res && typeof res === 'object') {
-        if (res.child) procRef = res.child;
-        else if (res.process) procRef = res.process;
-      }
-      return await res;
-    })();
-
-    if (execPromise && typeof execPromise === 'object') {
-      if (execPromise.child) procRef = execPromise.child;
-      else if (execPromise.process) procRef = execPromise.process;
-    }
-
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutTimer = setTimeout(() => {
-        if (procRef && typeof procRef.kill === 'function') {
-          try {
-            procRef.kill();
-          } catch (_) {}
-        }
-        const err = new Error('Cross-note chat timed out');
-        err.isTimeout = true;
-        reject(err);
-      }, timeoutMs);
-    });
-
-    let stdout;
-    try {
-      stdout = await Promise.race([execPromise, timeoutPromise]);
-    } catch (err) {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (err && err.isTimeout) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: 'Cross-note chat timed out' }],
-          structuredContent: { error: 'Cross-note chat timed out' },
-        };
-      }
+    if (typeof spawnBackend !== 'function') {
+      // A silent fallback to runPythonScript would reintroduce the unkillable-child defect
       return {
         isError: true,
         content: [{ type: 'text', text: 'Cross-note chat failed' }],
         structuredContent: { error: 'Cross-note chat failed' },
       };
-    } finally {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
     }
+
+    const maxStdoutBytes = 10 * 1024 * 1024; // 10 MiB safety cap
+    const execResult = await new Promise((resolve) => {
+      let child;
+      let timeoutTimer = null;
+      let isResolved = false;
+
+      const done = (result) => {
+        if (isResolved) return;
+        isResolved = true;
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+        }
+        resolve(result);
+      };
+
+      try {
+        child = spawnBackend(cliArgs);
+      } catch (_) {
+        return done({ ok: false, error: 'Cross-note chat failed' });
+      }
+
+      if (!child) {
+        return done({ ok: false, error: 'Cross-note chat failed' });
+      }
+
+      timeoutTimer = setTimeout(() => {
+        if (typeof killBackendTree === 'function' && child.pid !== undefined) {
+          try {
+            killBackendTree(child.pid);
+          } catch (_) {}
+        } else if (typeof child.kill === 'function') {
+          try {
+            child.kill();
+          } catch (_) {}
+        }
+        done({ ok: false, isTimeout: true, error: 'Cross-note chat timed out' });
+      }, timeoutMs);
+
+      let stdout = '';
+      if (child.stdout) {
+        child.stdout.on('data', (data) => {
+          if (stdout.length < maxStdoutBytes) {
+            stdout += data.toString();
+          }
+        });
+      }
+
+      // Drain stderr to prevent pipe-buffer deadlock (~64KB OS buffer fills on chatty runs);
+      // explicitly do not log stderr content to preserve privacy boundaries.
+      if (child.stderr) {
+        if (typeof child.stderr.resume === 'function') {
+          child.stderr.resume();
+        } else if (typeof child.stderr.on === 'function') {
+          child.stderr.on('data', () => {});
+        }
+      }
+
+      child.once('error', () => {
+        done({ ok: false, error: 'Cross-note chat failed' });
+      });
+
+      child.once('close', (code) => {
+        if (code === 0) {
+          done({ ok: true, stdout });
+        } else {
+          done({ ok: false, error: 'Cross-note chat failed' });
+        }
+      });
+    });
+
+    if (!execResult.ok) {
+      const errText = execResult.isTimeout ? 'Cross-note chat timed out' : 'Cross-note chat failed';
+      return {
+        isError: true,
+        content: [{ type: 'text', text: errText }],
+        structuredContent: { error: errText },
+      };
+    }
+
+    const stdout = execResult.stdout || '';
 
     const parsedStream = parseChatStreamOutput(stdout);
     if (parsedStream.error) {

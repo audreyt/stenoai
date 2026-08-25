@@ -111,8 +111,14 @@ function resolveProtocolVersion(legacyBody) {
 }
 
 async function handleRpc({ headers = {}, body, tools = [], callTool, serverInfo } = {}) {
-  const isLegacy = !hasHeader(headers, 'mcp-protocol-version');
+  if (!isObject(body)) {
+    return {
+      status: 400,
+      body: jsonRpcError(null, -32600, 'Invalid Request'),
+    };
+  }
 
+  const isLegacy = !hasHeader(headers, 'mcp-protocol-version');
   if (!isLegacy) {
     let protocolVersion;
     try {

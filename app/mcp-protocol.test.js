@@ -325,4 +325,33 @@ test('mcp handleRpc modern+legacy protocol semantics', async (t) => {
     assertNoError(result.body);
     assert.strictEqual(result.body.result.isError, true);
   });
+
+  await t.test('non-object body ([], 42, null) -> 400 with -32600 Invalid Request', async () => {
+    const testBodies = [[], 42, null, 'string', true];
+    for (const testBody of testBodies) {
+      // Without MCP-Protocol-Version header (legacy)
+      const legacyRes = await handleRpc({
+        headers: {},
+        body: testBody,
+        tools,
+        callTool: async () => ({ content: [] }),
+      });
+      assert.strictEqual(legacyRes.status, 400);
+      assert.strictEqual(legacyRes.body.error.code, -32600);
+      assert.strictEqual(legacyRes.body.error.message, 'Invalid Request');
+      assert.strictEqual(legacyRes.body.id, null);
+
+      // With MCP-Protocol-Version header (modern)
+      const modernRes = await handleRpc({
+        headers: modernHeaders({ 'mcp-method': 'ping' }),
+        body: testBody,
+        tools,
+        callTool: async () => ({ content: [] }),
+      });
+      assert.strictEqual(modernRes.status, 400);
+      assert.strictEqual(modernRes.body.error.code, -32600);
+      assert.strictEqual(modernRes.body.error.message, 'Invalid Request');
+      assert.strictEqual(modernRes.body.id, null);
+    }
+  });
 });

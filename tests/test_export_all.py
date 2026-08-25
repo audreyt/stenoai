@@ -85,6 +85,46 @@ class ExportAllCliTests(unittest.TestCase):
             self.assertEqual(tricky_row[5], tricky_summary)
             self.assertEqual(tricky_row[6], tricky_transcript)
 
+    def test_csv_export_guards_formula_trigger_characters(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            notes_dir = tmp / "notes"
+            notes_dir.mkdir(parents=True, exist_ok=True)
+            export_target = tmp / "exports" / "guarded_export.csv"
+
+            self._create_note(
+                notes_dir, "meeting_formula", "=SUM(A1:A9)", "2026-08-01",
+                duration=60, folders=["+finance", "-ops"], attendees=["@boss"],
+                summary="- bullet point starting with dash",
+                transcript="[00:01] Alice: Regular transcript not modified",
+            )
+
+            with patch("src.config.get_data_dirs", return_value={"output": notes_dir, "transcripts": tmp}):
+                runner = CliRunner()
+                res = runner.invoke(export_all, ["--format", "csv", "--out", str(export_target)])
+                self.assertEqual(res.exit_code, 0)
+                data = json.loads(res.output)
+                self.assertTrue(data["success"])
+
+            with open(export_target, "r", encoding="utf-8", newline="") as fh:
+                reader = csv.reader(fh)
+                rows = list(reader)
+
+            self.assertEqual(len(rows), 2)
+            row = rows[1]
+            # Title starting with = gets quote prefix
+            self.assertEqual(row[0], "'=SUM(A1:A9)")
+            self.assertEqual(row[1], "2026-08-01")
+            self.assertEqual(row[2], "60")
+            # Folders starting with + gets quote prefix
+            self.assertEqual(row[3], "'+finance, -ops")
+            # Attendees starting with @ gets quote prefix
+            self.assertEqual(row[4], "'@boss")
+            # Summary starting with - gets quote prefix
+            self.assertEqual(row[5], "'- bullet point starting with dash")
+            # Transcript starting with [ is unmodified
+            self.assertEqual(row[6], "[00:01] Alice: Regular transcript not modified")
+
     def test_md_export_writes_one_file_per_note(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)

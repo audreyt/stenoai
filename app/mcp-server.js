@@ -21,12 +21,9 @@ function safeCompareStrings(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') {
     return false;
   }
-  const bufA = Buffer.from(a, 'utf8');
-  const bufB = Buffer.from(b, 'utf8');
-  if (bufA.length !== bufB.length) {
-    return false;
-  }
-  return crypto.timingSafeEqual(bufA, bufB);
+  const hashA = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hashB = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }
 
 function sendJson(res, statusCode, bodyObj, headers = {}) {

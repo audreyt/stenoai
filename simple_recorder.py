@@ -5610,6 +5610,15 @@ def export_all(export_format, out):
             with open(csv_file, 'w', encoding='utf-8', newline='') as fh:
                 writer = csv.writer(fh)
                 writer.writerow(["title", "date", "duration", "folders", "attendees", "summary", "transcript"])
+                # Guard against spreadsheet formula/DDE interpretation of leading trigger characters
+                # (=, +, -, @, \t, \r) which otherwise cause Excel to evaluate cell content or error with #NAME?
+                def _guard_csv_cell(val):
+                    if not isinstance(val, str):
+                        return val
+                    if val and val[0] in ('=', '+', '-', '@', '\t', '\r'):
+                        return "'" + val
+                    return val
+
                 count = 0
                 for stem, src_file, data in summaries:
                     info = data.get("session_info", {}) or {}
@@ -5635,13 +5644,13 @@ def export_all(export_format, out):
                                 pass
 
                     writer.writerow([
-                        title,
+                        _guard_csv_cell(title),
                         date,
                         duration_str,
-                        folders_str,
-                        attendees_str,
-                        summary,
-                        transcript,
+                        _guard_csv_cell(folders_str),
+                        _guard_csv_cell(attendees_str),
+                        _guard_csv_cell(summary),
+                        _guard_csv_cell(transcript),
                     ])
                     count += 1
             print(json.dumps({"success": True, "count": count}))

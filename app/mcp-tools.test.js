@@ -383,23 +383,27 @@ test('list_folders: returns folder list with text and structuredContent', async 
   assert.deepEqual(res.structuredContent, { folders: fakeFolders });
 });
 
-test('ask_meetings: assembles multiple CHAT_CHUNK lines, honours --meeting and -f flags', async () => {
+test('ask_meetings: assembles multiple CHAT_CHUNK lines, honours --meeting and -f flags (success path)', async () => {
+  const { EventEmitter } = require('events');
   const executedCalls = [];
   const chunk1 = Buffer.from('Here is ').toString('base64');
   const chunk2 = Buffer.from('the assembled ').toString('base64');
   const chunk3 = Buffer.from('answer across meetings.').toString('base64');
 
-  const stdoutPayload = [
-    `CHAT_CHUNK:${chunk1}`,
-    `CHAT_CHUNK:${chunk2}`,
-    `CHAT_CHUNK:${chunk3}`,
-    'CHAT_STREAM_COMPLETE',
-  ].join('\n');
-
   const tools = createMcpTools({
-    runPythonScript: async (script, args, wantString) => {
-      executedCalls.push({ script, args, wantString });
-      return stdoutPayload;
+    runPythonScript: async () => '',
+    spawnBackend: (args) => {
+      executedCalls.push({ args });
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 12345;
+      setImmediate(() => {
+        child.stdout.emit('data', Buffer.from(`CHAT_CHUNK:${chunk1}\n`));
+        child.stdout.emit('data', Buffer.from(`CHAT_CHUNK:${chunk2}\nCHAT_CHUNK:${chunk3}\nCHAT_STREAM_COMPLETE\n`));
+        child.emit('close', 0);
+      });
+      return child;
     },
     validateMeetingFilePath: async (target) => {
       if (target.includes('invalid')) {
@@ -451,12 +455,68 @@ test('ask_meetings: assembles multiple CHAT_CHUNK lines, honours --meeting and -
   ]);
 });
 
+test('ask_meetings: drains large stderr while streaming stdout and completes successfully', async () => {
+  const { EventEmitter } = require('events');
+  const chunk = Buffer.from('Completed answer despite chatty stderr.').toString('base64');
+
+  const tools = createMcpTools({
+    runPythonScript: async () => '',
+    spawnBackend: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      let resumed = false;
+      child.stderr.resume = () => {
+        resumed = true;
+      };
+      child.pid = 23456;
+      setImmediate(() => {
+        // Emit large stderr (simulating chatty backend logging >64KB)
+        const largeLog = Buffer.alloc(128 * 1024, 'X');
+        child.stderr.emit('data', largeLog);
+        child.stdout.emit('data', Buffer.from(`CHAT_CHUNK:${chunk}\nCHAT_STREAM_COMPLETE\n`));
+        child.emit('close', 0);
+      });
+      return child;
+    },
+    validateMeetingFilePath: async (p) => ({ realPath: p }),
+  });
+
+  const res = await tools.call('ask_meetings', {
+    question: 'Testing stderr drain',
+  });
+
+  assert.equal(res.isError, undefined);
+  assert.equal(res.content[0].text, 'Completed answer despite chatty stderr.');
+  assert.deepEqual(res.structuredContent, {
+    question: 'Testing stderr drain',
+    answer: 'Completed answer despite chatty stderr.',
+  });
+});
+
+test('ask_meetings: fails loudly with isError when spawnBackend is missing (no silent fallback)', async () => {
+  const tools = createMcpTools({
+    runPythonScript: async () => 'Should not be called',
+    validateMeetingFilePath: async (p) => ({ realPath: p }),
+  });
+
+  const res = await tools.call('ask_meetings', {
+    question: 'Missing spawnBackend dependency',
+  });
+
+  assert.equal(res.isError, true);
+  assert.equal(res.content[0].text, 'Cross-note chat failed');
+  assert.deepEqual(res.structuredContent, {
+    error: 'Cross-note chat failed',
+  });
+});
+
 test('ask_meetings: rejects unvalidated meeting_ids before backend invocation', async () => {
   let backendInvoked = false;
   const tools = createMcpTools({
-    runPythonScript: async () => {
+    runPythonScript: async () => '',
+    spawnBackend: () => {
       backendInvoked = true;
-      return '';
     },
     validateMeetingFilePath: async (p) => {
       if (p.includes('bad_note')) return { error: 'Access denied' };
@@ -475,9 +535,19 @@ test('ask_meetings: rejects unvalidated meeting_ids before backend invocation', 
 });
 
 test('ask_meetings: turns CHAT_STREAM_ERROR into isError response', async () => {
+  const { EventEmitter } = require('events');
   const tools = createMcpTools({
-    runPythonScript: async () => {
-      return 'CHAT_STREAM_ERROR:Local Ollama model failed to load\n';
+    runPythonScript: async () => '',
+    spawnBackend: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 12346;
+      setImmediate(() => {
+        child.stdout.emit('data', Buffer.from('CHAT_STREAM_ERROR:Local Ollama model failed to load\n'));
+        child.emit('close', 0);
+      });
+      return child;
     },
     validateMeetingFilePath: async (p) => ({ realPath: p }),
   });
@@ -493,25 +563,27 @@ test('ask_meetings: turns CHAT_STREAM_ERROR into isError response', async () => 
   });
 });
 
-test('ask_meetings: kills child process on timeout and returns isError', async () => {
-  let killed = false;
-  const fakeProc = {
-    kill: () => {
-      killed = true;
-    },
-  };
+test('ask_meetings: kills process tree on timeout, handles late close, and returns isError', async () => {
+  const { EventEmitter } = require('events');
+  let killedPid = null;
+  let lateChild = null;
 
   const tools = createMcpTools({
-    runPythonScript: () => {
-      const promise = new Promise((resolve) => {
-        // Deliberately hang longer than timeoutMs
-        setTimeout(() => resolve('CHAT_STREAM_COMPLETE'), 500);
-      });
-      promise.child = fakeProc;
-      return promise;
+    runPythonScript: async () => '',
+    spawnBackend: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 998877;
+      lateChild = child;
+      // Never emit close before timeout
+      return child;
+    },
+    killBackendTree: (pid) => {
+      killedPid = pid;
     },
     validateMeetingFilePath: async (p) => ({ realPath: p }),
-    timeoutMs: 50, // 50ms timeout for test
+    timeoutMs: 50,
   });
 
   const res = await tools.call('ask_meetings', {
@@ -519,13 +591,47 @@ test('ask_meetings: kills child process on timeout and returns isError', async (
   });
 
   assert.equal(res.isError, true);
-  assert.equal(killed, true);
+  assert.equal(killedPid, 998877);
   assert.match(res.content[0].text, /timed out/i);
   assert.deepEqual(res.structuredContent, {
     error: 'Cross-note chat timed out',
   });
+
+  // (c) late close after timeout does not double-resolve or throw
+  assert.doesNotThrow(() => {
+    lateChild.emit('close', 0);
+  });
 });
 
+test('ask_meetings: non-zero exit returns isError with no stderr in result', async () => {
+  const { EventEmitter } = require('events');
+  const tools = createMcpTools({
+    runPythonScript: async () => '',
+    spawnBackend: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 554433;
+      setImmediate(() => {
+        if (child.stderr) child.stderr.emit('data', Buffer.from('Traceback (most recent call last): SecretInternalDetails'));
+        child.emit('close', 1);
+      });
+      return child;
+    },
+    validateMeetingFilePath: async (p) => ({ realPath: p }),
+  });
+
+  const res = await tools.call('ask_meetings', {
+    question: 'Failing call',
+  });
+
+  assert.equal(res.isError, true);
+  assert.equal(res.content[0].text, 'Cross-note chat failed');
+  assert.deepEqual(res.structuredContent, {
+    error: 'Cross-note chat failed',
+  });
+  assert.equal(res.content[0].text.includes('SecretInternalDetails'), false);
+});
 test('call: returns error for unknown tool name', async () => {
   const tools = createMcpTools({
     runPythonScript: async () => {},
