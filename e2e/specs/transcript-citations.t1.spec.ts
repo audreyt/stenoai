@@ -2,7 +2,7 @@ import { test, expect } from '../fixtures/electron';
 import type { Page } from '@playwright/test';
 
 /**
- * T1 — renderer-only, mock IPC. Verifies Granola-style transcript citations:
+ * T1 — renderer-only, mock IPC. Verifies transcript citations:
  *  - Generated bullets with confident evidence render a magnifying-glass
  *    citation button (data-testid="citation-<section>-<index>").
  *  - Clicking the citation button opens the transcript bar and scrolls the

@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures/electron';
 
 /**
- * T1 — renderer-only, mock IPC. Validates Granola-parity Chat Recipes:
+ * T1 — renderer-only, mock IPC. Validates saved chat recipes:
  * - Typing '/' at start of empty input opens recipes menu with presets & saved recipes.
  * - Selecting an item fills the composer with that prompt.
  * - Typing '/' mid-sentence does NOT open the menu.

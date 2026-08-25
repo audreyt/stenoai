@@ -274,7 +274,7 @@ const AUDIO_SEED_MEETINGS = [
 ];
 
 // Seed meetings with varied attendee counts and transcript-only keywords
-// for Granola-parity metadata and search tests (STENOAI_E2E_SEED_ATTENDEES=1).
+// for attendee-metadata and transcript-search tests (STENOAI_E2E_SEED_ATTENDEES=1).
 const ATTENDEES_SEED_MEETINGS = [
   {
     session_info: {

@@ -3,7 +3,7 @@ import type { Page } from '@playwright/test';
 
 /**
  * T1 — renderer-only, mock IPC.
- * Verifies Granola-parity note metadata and search affordances:
+ * Verifies note metadata and search affordances:
  *  1. Attendees render as quiet metadata chips on notes that have them,
  *     collapsing gracefully for large meetings, and never as transcript speakers.
  *  2. Notes without attendees render no attendee chip at all.

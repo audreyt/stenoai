@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures/electron';
 
 /**
- * T1 — renderer-only, mock IPC. Validates Granola's People directory:
+ * T1 — renderer-only, mock IPC. Validates the People directory:
  * - Lists attendees discovered across notes with accurate note counts.
  * - Selecting a person filters the view to that person's notes.
  * - The scoped ask form opens a new chat carrying exactly that person's summaryFiles.

@@ -167,7 +167,7 @@ export function PrimaryDock({ showAskBar }: { showAskBar: boolean }) {
         </div>
       ) : (
         // Idle: the standalone transcript toggle sits left of the Ask bar
-        // (Granola-style), alongside the pre-recording template choice picker.
+        // alongside the pre-recording template choice picker.
         // While recording, the pill owns the left slot.
         <div className={cn('flex items-center gap-2 shrink-0', showAskBar && 'mb-1')}>
           <TranscriptToggle />
