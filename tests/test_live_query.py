@@ -24,6 +24,12 @@ class _Config:
     def get_language(self):
         return "auto"
 
+    def get_ai_provider(self):
+        return "cloud"
+
+    def get_model(self):
+        return "gpt-4"
+
 
 class LiveQueryCliTests(unittest.TestCase):
     def _run(
@@ -32,14 +38,17 @@ class LiveQueryCliTests(unittest.TestCase):
         raw_input=None,
         transcript="The team decided to ship on Friday.",
         question="What did we decide?",
+        history=None,
         args=None,
         chunks=("They will ", "ship on Friday."),
         stream_error=None,
+        config=None,
     ):
         if raw_input is None:
-            raw_input = json.dumps(
-                {"transcript": transcript, "question": question}
-            )
+            payload = {"transcript": transcript, "question": question}
+            if history is not None:
+                payload["history"] = history
+            raw_input = json.dumps(payload)
 
         summarizer = mock.MagicMock()
         if stream_error is None:
@@ -53,7 +62,7 @@ class LiveQueryCliTests(unittest.TestCase):
                 "OllamaSummarizer",
                 return_value=summarizer,
             ) as summarizer_class,
-            mock.patch("src.config.get_config", return_value=_Config()),
+            mock.patch("src.config.get_config", return_value=config or _Config()),
             mock.patch.object(
                 simple_recorder,
                 "resolve_output_language",
@@ -100,6 +109,7 @@ class LiveQueryCliTests(unittest.TestCase):
             transcript.strip(),
             question.strip(),
             language="en",
+            history=None,
         )
 
         lines = result.output.splitlines()
@@ -137,25 +147,42 @@ class LiveQueryCliTests(unittest.TestCase):
                 self.assertNotIn("CHAT_STREAM_COMPLETE", result.output)
                 summarizer_class.assert_not_called()
 
-    def test_transcript_and_question_character_limits(self):
-        cases = (
-            (
-                {"transcript": "A" * 100_001, "question": "Q"},
-                "Live transcript exceeds maximum length",
-            ),
-            (
-                {"transcript": "A", "question": "Q" * 2_001},
-                "Live query question exceeds maximum length",
-            ),
+    def test_question_character_limit_is_still_a_hard_failure(self):
+        result, summarizer_class, _ = self._run(
+            raw_input=json.dumps(
+                {"transcript": "A", "question": "Q" * 2_001}
+            )
         )
-        for payload, expected in cases:
-            with self.subTest(expected=expected):
-                result, summarizer_class, _ = self._run(
-                    raw_input=json.dumps(payload)
-                )
-                self.assertNotEqual(result.exit_code, 0)
-                self.assertIn(f"CHAT_STREAM_ERROR:{expected}", result.output)
-                summarizer_class.assert_not_called()
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn(
+            "CHAT_STREAM_ERROR:Live query question exceeds maximum length",
+            result.output,
+        )
+        summarizer_class.assert_not_called()
+
+    def test_over_budget_transcript_is_trimmed_oldest_first(self):
+        lines = [f"OLD-{i:04d} " + ("x" * 40) for i in range(20)]
+        lines.append("NEWEST-LINE the decision was Friday")
+        transcript = "\n".join(lines)
+        budget = 180
+        with mock.patch.object(
+            simple_recorder, "_live_query_transcript_budget", return_value=budget
+        ):
+            result, summarizer_class, summarizer = self._run(
+                transcript=transcript, question="What?"
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        summarizer_class.assert_called_once_with()
+        called = summarizer.query_transcript_streaming_strict.call_args
+        trimmed = called.args[0]
+        self.assertTrue(
+            trimmed.startswith("[earlier transcript omitted]\n"),
+            trimmed[:80],
+        )
+        self.assertIn("NEWEST-LINE the decision was Friday", trimmed)
+        self.assertNotIn("OLD-0000", trimmed)
+        self.assertLessEqual(len(trimmed), budget)
+        self.assertNotIn("CHAT_STREAM_ERROR", result.output)
 
     def test_stdin_limit_is_measured_in_utf8_bytes(self):
         raw_input = json.dumps(
@@ -234,6 +261,144 @@ class LiveQueryCliTests(unittest.TestCase):
         self.assertIn("CHAT_STREAM_ERROR:Live query failed", result.output)
         self.assertNotIn("CHAT_STREAM_COMPLETE", result.output)
 
+    def test_history_is_forwarded_to_the_strict_stream(self):
+        history = [
+            {"role": "user", "content": "What was the deadline?"},
+            {"role": "assistant", "content": "Friday."},
+        ]
+        result, _, summarizer = self._run(history=history)
+        self.assertEqual(result.exit_code, 0, result.output)
+        summarizer.query_transcript_streaming_strict.assert_called_once_with(
+            "The team decided to ship on Friday.",
+            "What did we decide?",
+            language="en",
+            history=history,
+        )
+
+    def test_empty_history_list_is_forwarded_as_empty(self):
+        result, _, summarizer = self._run(history=[])
+        self.assertEqual(result.exit_code, 0, result.output)
+        summarizer.query_transcript_streaming_strict.assert_called_once_with(
+            "The team decided to ship on Friday.",
+            "What did we decide?",
+            language="en",
+            history=[],
+        )
+
+    def test_history_keeps_newest_six_entries(self):
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn-{i}"}
+            for i in range(7)
+        ]
+        result, _, summarizer = self._run(history=history)
+        self.assertEqual(result.exit_code, 0, result.output)
+        forwarded = summarizer.query_transcript_streaming_strict.call_args.kwargs[
+            "history"
+        ]
+        self.assertEqual([e["content"] for e in forwarded], [f"turn-{i}" for i in range(1, 7)])
+
+    def test_history_drops_oldest_to_fit_total_char_cap(self):
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 3000}
+            for i in range(6)
+        ]
+        result, _, summarizer = self._run(history=history)
+        self.assertEqual(result.exit_code, 0, result.output)
+        forwarded = summarizer.query_transcript_streaming_strict.call_args.kwargs[
+            "history"
+        ]
+        self.assertEqual(len(forwarded), 4)
+        self.assertLessEqual(sum(len(e["content"]) for e in forwarded), 12000)
+        self.assertEqual(forwarded[0]["content"], "x" * 3000)
+
+    def test_history_entry_over_4000_chars_is_rejected(self):
+        history = [{"role": "user", "content": "y" * 4001}]
+        result, summarizer_class, _ = self._run(history=history)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            result.output.strip(),
+            "CHAT_STREAM_ERROR:Invalid live query payload",
+        )
+        self.assertNotIn("yyyy", result.output)
+        summarizer_class.assert_not_called()
+
+    def test_malformed_history_is_rejected_with_fixed_error(self):
+        cases = (
+            {"transcript": "valid", "question": "Q", "history": "not-a-list"},
+            {"transcript": "valid", "question": "Q", "history": [{"role": "system", "content": "x"}]},
+            {"transcript": "valid", "question": "Q", "history": [{"role": "user", "content": 12}]},
+            {"transcript": "valid", "question": "Q", "history": ["bare-string"]},
+        )
+        for payload in cases:
+            with self.subTest(history=payload["history"]):
+                result, summarizer_class, _ = self._run(
+                    raw_input=json.dumps(payload)
+                )
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertEqual(
+                    result.output.strip(),
+                    "CHAT_STREAM_ERROR:Invalid live query payload",
+                )
+                self.assertNotIn("CHAT_STREAM_COMPLETE", result.output)
+                summarizer_class.assert_not_called()
+
+    def test_apple_system_budget_is_smaller_than_local_gguf(self):
+        apple = simple_recorder._live_query_transcript_budget("local", "apple:system")
+        gguf = simple_recorder._live_query_transcript_budget(
+            "local", "gemma4:e2b-it-qat"
+        )
+        cloud = simple_recorder._live_query_transcript_budget("cloud", "gpt-4")
+        self.assertGreater(apple, 0)
+        self.assertGreater(gguf, 0)
+        self.assertLess(apple, gguf)
+        self.assertEqual(cloud, 400_000)
+
+
+class QueryPromptHistoryTests(unittest.TestCase):
+    def _prompt(self, **kwargs):
+        summarizer = object.__new__(OllamaSummarizer)
+        summarizer.ollama_process = None
+        return summarizer._build_query_prompt(
+            "TRANSCRIPT_BODY",
+            "What did we decide?",
+            **kwargs,
+        )
+
+    def test_absent_or_empty_history_is_byte_identical(self):
+        baseline = self._prompt()
+        self.assertEqual(baseline, self._prompt(history=None))
+        self.assertEqual(baseline, self._prompt(history=[]))
+        self.assertNotIn("PREVIOUS QUESTIONS", baseline)
+        self.assertIn("QUESTION: What did we decide?", baseline)
+        self.assertIn("TRANSCRIPT_BODY", baseline)
+
+    def test_history_renders_in_order_between_question_and_transcript(self):
+        prompt = self._prompt(
+            history=[
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "follow up"},
+                {"role": "assistant", "content": "follow answer"},
+            ]
+        )
+        question_at = prompt.index("QUESTION: What did we decide?")
+        history_at = prompt.index(
+            "PREVIOUS QUESTIONS AND ANSWERS IN THIS CONVERSATION:"
+        )
+        transcript_at = prompt.index("TRANSCRIPT_BODY")
+        self.assertLess(question_at, history_at)
+        self.assertLess(history_at, transcript_at)
+        self.assertLess(
+            prompt.index("Q: first question"), prompt.index("A: first answer")
+        )
+        self.assertLess(
+            prompt.index("A: first answer"), prompt.index("Q: follow up")
+        )
+        self.assertLess(
+            prompt.index("Q: follow up"), prompt.index("A: follow answer")
+        )
+
+
 
 class StrictQueryStreamingTests(unittest.TestCase):
     def test_strict_stream_propagates_provider_errors(self):
@@ -256,6 +421,27 @@ class StrictQueryStreamingTests(unittest.TestCase):
             "prompt",
             timeout_seconds=300,
         )
+
+    def test_strict_stream_forwards_history_into_the_prompt(self):
+        summarizer = object.__new__(OllamaSummarizer)
+        summarizer.ollama_process = None
+        summarizer.ai_provider = "adapter"
+        summarizer._build_query_prompt = mock.MagicMock(return_value="prompt")
+        summarizer._adapter_stream = mock.MagicMock(return_value=iter(["ok"]))
+        history = [{"role": "user", "content": "earlier"}]
+
+        list(
+            summarizer.query_transcript_streaming_strict(
+                "transcript",
+                "question",
+                history=history,
+            )
+        )
+
+        summarizer._build_query_prompt.assert_called_once_with(
+            "transcript", "question", "en", history=history
+        )
+
 
     def test_strict_stream_uses_configured_local_or_remote_ollama(self):
         for provider in ("local", "remote"):

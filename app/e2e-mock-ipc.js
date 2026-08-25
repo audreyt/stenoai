@@ -563,7 +563,7 @@ function install({ ipcMain }) {
       sessionName: rec.active || rec.processing ? rec.sessionName : null,
       segments: [],
       priorSegments: seedPriorSegments(rec),
-      ready: true,
+      ready: process.env.STENOAI_E2E_MOCK_LIVE_TRANSCRIPT_NOT_READY !== '1',
       error: null,
     }),
 
@@ -1498,10 +1498,19 @@ function install({ ipcMain }) {
 
   const originalOn = ipcMain.on.bind(ipcMain);
   const activeLiveStreams = new Map();
+  if (!global.__stenoai_e2e_live_queries) {
+    global.__stenoai_e2e_live_queries = [];
+  }
   ipcMain.on = (channel, listener) => {
     if (channel === 'query-live-transcript-stream') {
-      return originalOn(channel, (event, queryId, sessionName, question) => {
+      return originalOn(channel, (event, queryId, sessionName, question, history) => {
         if (process.env.STENOAI_E2E_MOCK_LIVE_STREAM === '1') {
+          global.__stenoai_e2e_live_queries.push({
+            queryId,
+            sessionName,
+            question,
+            history: Array.isArray(history) ? history : [],
+          });
           const sender = event.sender;
           if (!queryId || typeof queryId !== 'string') return;
           if (sender.isDestroyed()) return;
@@ -1537,7 +1546,7 @@ function install({ ipcMain }) {
           activeLiveStreams.set(queryId, timers);
           return;
         }
-        return listener(event, queryId, sessionName, question);
+        return listener(event, queryId, sessionName, question, history);
       });
     }
 

@@ -67,7 +67,8 @@ type SpawnResult = { code: number | null; stdout: string; stderr: string };
 function runBackend(args: string[], userDataDir: string): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(BACKEND, args, {
-      env: { ...process.env, STENOAI_USER_DATA_DIR: userDataDir },
+      // Same Apple LM pin as the electron fixture (see auto-summarize.t2).
+      env: { ...process.env, STENOAI_USER_DATA_DIR: userDataDir, STENOAI_DISABLE_APPLE_LM: '1' },
     });
     let stdout = '';
     let stderr = '';

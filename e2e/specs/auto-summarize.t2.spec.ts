@@ -53,7 +53,11 @@ type SpawnResult = { code: number | null; stdout: string; stderr: string };
 function runBackend(args: string[], userDataDir: string): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(BACKEND, args, {
-      env: { ...process.env, STENOAI_USER_DATA_DIR: userDataDir },
+      // Model-free T2 asserts against the deterministic Ollama fixture. The
+      // electron fixture disables Apple LM for the app; a directly spawned
+      // backend needs the same pin, or a host with a built steno-apple-lm
+      // sidecar summarises on-device and never calls the mock.
+      env: { ...process.env, STENOAI_USER_DATA_DIR: userDataDir, STENOAI_DISABLE_APPLE_LM: '1' },
     });
     let stdout = '';
     let stderr = '';

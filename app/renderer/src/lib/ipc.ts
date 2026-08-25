@@ -971,6 +971,10 @@ export interface LiveTranscriptErrorEvent {
   error?: string;
   message?: string;
 }
+export interface ChatSessionsMigratedEvent {
+  fromKey: string;
+  toKey: string;
+}
 export interface UpdateAvailableEvent {
   version: string;
 }
@@ -1134,7 +1138,7 @@ export interface StenoaiBridge {
   query: {
     ask: RequestFn<[file: string, q: string], QueryResponse>;
     askStream: SendFn<[id: string, file: string, q: string]>;
-    askLiveStream: SendFn<[id: string, sessionName: string, q: string]>;
+    askLiveStream: SendFn<[id: string, sessionName: string, q: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>]>;
     chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null]>;
     cancel: SendFn<[id: string]>;
   };
@@ -1380,6 +1384,7 @@ export interface StenoaiBridge {
     liveTranscriptReady: Subscribe<LiveTranscriptReadyEvent>;
     liveTranscriptChunk: Subscribe<LiveTranscriptChunkEvent>;
     liveTranscriptError: Subscribe<LiveTranscriptErrorEvent>;
+    chatSessionsMigrated: Subscribe<ChatSessionsMigratedEvent>;
     updateAvailable: Subscribe<UpdateAvailableEvent>;
     updateDownloadProgress: Subscribe<UpdateProgressEvent>;
     updateDownloaded: Subscribe<UpdateDownloadedEvent>;

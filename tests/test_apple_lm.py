@@ -8,6 +8,11 @@ from pathlib import Path
 from unittest import mock
 from click.testing import CliRunner
 
+# `python -m unittest discover tests` uses tests/ as top_level_dir, so
+# tests/__init__.py is never imported. Seed isolation here — this module is
+# alphabetically first among test_*.py — before any src.apple_lm import.
+os.environ.setdefault("STENOAI_DISABLE_APPLE_LM", "1")
+
 import simple_recorder
 from src.apple_lm import (
     APPLE_SYSTEM_MODEL,
@@ -24,13 +29,24 @@ from src.summarizer import OllamaSummarizer, resolve_num_ctx
 
 class BaseAppleLMTest(unittest.TestCase):
     def setUp(self):
+        # Save both env keys before any test body (including the one that
+        # patch.dict-flips STENOAI_DISABLE_APPLE_LM to "0" at line 57-era).
+        self._old_disable = os.environ.get("STENOAI_DISABLE_APPLE_LM")
+        self._old_user_data = os.environ.get("STENOAI_USER_DATA_DIR")
         reset_apple_lm_cache()
         self._tmp_dir = tempfile.TemporaryDirectory()
-        self._old_user_data = os.environ.get("STENOAI_USER_DATA_DIR")
         os.environ["STENOAI_USER_DATA_DIR"] = self._tmp_dir.name
+        self.addCleanup(self._restore_apple_lm_isolation)
 
     def tearDown(self):
         reset_apple_lm_cache()
+
+    def _restore_apple_lm_isolation(self):
+        reset_apple_lm_cache()
+        if self._old_disable is not None:
+            os.environ["STENOAI_DISABLE_APPLE_LM"] = self._old_disable
+        else:
+            os.environ["STENOAI_DISABLE_APPLE_LM"] = "1"
         if self._old_user_data is not None:
             os.environ["STENOAI_USER_DATA_DIR"] = self._old_user_data
         else:

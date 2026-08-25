@@ -179,7 +179,14 @@ const stenoai = {
   query: {
     ask: (file, q) => invoke('query-transcript', file, q),
     askStream: (id, file, q) => send('query-transcript-stream', id, file, q),
-    askLiveStream: (id, sessionName, q) => send('query-live-transcript-stream', id, sessionName, q),
+    // History is forwarded verbatim. Bounding happens in the renderer hook
+    // (so a long conversation never grows the payload) and validation happens
+    // in the main process (so a malformed value returns a fixed error code
+    // instead of being silently dropped here).
+    askLiveStream: (id, sessionName, q, history) =>
+      history === undefined || history === null
+        ? send('query-live-transcript-stream', id, sessionName, q)
+        : send('query-live-transcript-stream', id, sessionName, q, history),
     chatGlobalStream: (id, q, folderId) => send('chat-global-stream', id, q, folderId ?? null),
     cancel: (id) => send('query-cancel', id),
   },
@@ -417,6 +424,7 @@ const stenoai = {
     liveTranscriptReady: (cb) => subscribe('live-transcript-ready', cb),
     liveTranscriptChunk: (cb) => subscribe('live-transcript-chunk', cb),
     liveTranscriptError: (cb) => subscribe('live-transcript-error', cb),
+    chatSessionsMigrated: (cb) => subscribe('chat-sessions-migrated', cb),
     updateAvailable: (cb) => subscribe('update-available', cb),
     updateDownloadProgress: (cb) => subscribe('update-download-progress', cb),
     updateDownloaded: (cb) => subscribe('update-downloaded', cb),

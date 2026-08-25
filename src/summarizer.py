@@ -1901,18 +1901,35 @@ TITLE:"""
             )
             return None
 
-    def _build_query_prompt(self, transcript: str, question: str, language: str = "en") -> str:
+    def _build_query_prompt(
+        self,
+        transcript: str,
+        question: str,
+        language: str = "en",
+        history: Optional[list[dict[str, str]]] = None,
+    ) -> str:
         if language and language not in ("en", "auto"):
             from .config import get_config
             language_name = get_config().get_language_name(language)
             query_lang_instruction = f"\nRespond in {language_name}." if language_name != "Unknown" else ""
         else:
             query_lang_instruction = ""
+
+        history_section = ""
+        if history:
+            history_lines = ["PREVIOUS QUESTIONS AND ANSWERS IN THIS CONVERSATION:"]
+            for entry in history:
+                role = entry.get("role")
+                prefix = "Q:" if role == "user" else "A:"
+                content = entry.get("content", "")
+                history_lines.append(f"{prefix} {content}")
+            history_section = "\n\n" + "\n".join(history_lines)
+
         return f"""Answer the following question based on the meeting content below (summary, key topics, and transcript).
 Be concise and direct. If the answer requires inference from what was discussed, that's fine.
 Only say you don't know if the topic truly wasn't discussed at all.{query_lang_instruction}
 
-QUESTION: {question}
+QUESTION: {question}{history_section}
 
 {transcript}
 
@@ -1923,6 +1940,7 @@ ANSWER:"""
         transcript: str,
         question: str,
         language: str = "en",
+        history: Optional[list[dict[str, str]]] = None,
     ):
         """Yield query chunks while propagating provider and protocol errors."""
         if not transcript or transcript.strip() == "":
@@ -1930,7 +1948,9 @@ ANSWER:"""
         if not question or question.strip() == "":
             raise ValueError("Please provide a question.")
 
-        prompt = self._build_query_prompt(transcript, question, language)
+        prompt = self._build_query_prompt(
+            transcript, question, language, history=history
+        )
 
         if self.ai_provider == "adapter":
             # Interactive query — user is waiting at the AskBar. Fail fast on
@@ -1993,6 +2013,7 @@ ANSWER:"""
         transcript: str,
         question: str,
         language: str = "en",
+        history: Optional[list[dict[str, str]]] = None,
     ):
         """Yield query chunks and preserve the legacy inline error response."""
         if not transcript or transcript.strip() == "":
@@ -2007,12 +2028,19 @@ ANSWER:"""
                 transcript,
                 question,
                 language=language,
+                history=history,
             )
         except Exception as e:
             logger.error(f"Streaming query failed: {e}")
             yield f"\n[Error: {e}]"
 
-    def query_transcript(self, transcript: str, question: str, language: str = "en") -> Optional[str]:
+    def query_transcript(
+        self,
+        transcript: str,
+        question: str,
+        language: str = "en",
+        history: Optional[list[dict[str, str]]] = None,
+    ) -> Optional[str]:
         """
         Query a transcript with a question using Ollama.
 
@@ -2020,6 +2048,7 @@ ANSWER:"""
             transcript: The meeting transcript text
             question: The question to ask about the transcript
             language: Language code for the response
+            history: Optional list of conversation history turns
 
         Returns:
             Answer string or None if query failed
@@ -2031,8 +2060,9 @@ ANSWER:"""
             if not question or question.strip() == "":
                 return "Please provide a question."
 
-            prompt = self._build_query_prompt(transcript, question, language)
-
+            prompt = self._build_query_prompt(
+                transcript, question, language, history=history
+            )
             logger.info(f"Querying transcript with question ({len(question)} chars)")
 
             if self.ai_provider == "adapter":

@@ -23,6 +23,53 @@ export interface StreamOptions {
   onError?: (err: Error) => void;
   onComplete?: (result: StreamResult) => void;
 }
+const MAX_LIVE_HISTORY_ENTRIES = 6;
+const MAX_LIVE_HISTORY_ENTRY_CHARS = 4000;
+const MAX_TOTAL_LIVE_HISTORY_CHARS = 12000;
+
+export function normalizeLiveHistory(
+  rawHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
+): Array<{ role: 'user' | 'assistant'; content: string }> | undefined {
+  if (!Array.isArray(rawHistory) || rawHistory.length === 0) return undefined;
+
+  const valid = rawHistory.filter(
+    (entry) =>
+      entry &&
+      (entry.role === 'user' || entry.role === 'assistant') &&
+      typeof entry.content === 'string' &&
+      entry.content.trim().length > 0
+  );
+  if (valid.length === 0) return undefined;
+
+  const sliced = valid.slice(-MAX_LIVE_HISTORY_ENTRIES);
+  const boundedEntries = sliced.map((entry) => ({
+    role: entry.role,
+    content: entry.content.slice(0, MAX_LIVE_HISTORY_ENTRY_CHARS),
+  }));
+
+  const result: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  let totalChars = 0;
+  for (let i = boundedEntries.length - 1; i >= 0; i--) {
+    const entry = boundedEntries[i];
+    if (totalChars + entry.content.length <= MAX_TOTAL_LIVE_HISTORY_CHARS) {
+      result.unshift(entry);
+      totalChars += entry.content.length;
+    } else {
+      const remaining = MAX_TOTAL_LIVE_HISTORY_CHARS - totalChars;
+      if (remaining > 0) {
+        result.unshift({
+          role: entry.role,
+          content: entry.content.slice(0, remaining),
+        });
+        totalChars += remaining;
+      }
+      break;
+    }
+  }
+
+  return result.length > 0 ? result : undefined;
+}
+
 function newId() {
   return `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -246,7 +293,15 @@ export function useStreamingQuery() {
    *  provider and model as summaries. Chunks land on the standard query
    *  stream channels so the existing subscription drives the UI. */
   const startLiveStream = React.useCallback(
-    (sessionName: string, question: string, options?: StreamOptions): string => {
+    (
+      sessionName: string,
+      question: string,
+      historyOrOptions?: Array<{ role: 'user' | 'assistant'; content: string }> | StreamOptions,
+      options?: StreamOptions
+    ): string => {
+      const history = Array.isArray(historyOrOptions) ? historyOrOptions : undefined;
+      const opts = Array.isArray(historyOrOptions) ? options : historyOrOptions;
+
       const id = newId();
       setStreams((prev) => ({
         ...prev,
@@ -263,7 +318,7 @@ export function useStreamingQuery() {
             if (!current) return prev;
             return { ...prev, [id]: { ...current, text: current.text + chunk } };
           });
-          options?.onChunk?.(chunk);
+          opts?.onChunk?.(chunk);
         },
         onDone: () => {
           setStreams((prev) => {
@@ -272,8 +327,8 @@ export function useStreamingQuery() {
             return { ...prev, [id]: { ...current, status: 'done' } };
           });
           detachStream(id);
-          options?.onDone?.();
-          options?.onComplete?.({ text: accumulatedText, status: 'done', error: null });
+          opts?.onDone?.();
+          opts?.onComplete?.({ text: accumulatedText, status: 'done', error: null });
         },
         onError: (err) => {
           setStreams((prev) => {
@@ -282,12 +337,18 @@ export function useStreamingQuery() {
             return { ...prev, [id]: { ...current, status: 'error', error: err.message } };
           });
           detachStream(id);
-          options?.onError?.(err);
-          options?.onComplete?.({ text: accumulatedText, status: 'error', error: err.message });
+          opts?.onError?.(err);
+          opts?.onComplete?.({ text: accumulatedText, status: 'error', error: err.message });
         },
       });
       unsubsRef.current.set(id, off);
-      ipc().query.askLiveStream(id, sessionName, question);
+
+      const boundedHistory = normalizeLiveHistory(history);
+      if (boundedHistory && boundedHistory.length > 0) {
+        ipc().query.askLiveStream(id, sessionName, question, boundedHistory);
+      } else {
+        ipc().query.askLiveStream(id, sessionName, question);
+      }
       return id;
     },
     []

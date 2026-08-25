@@ -380,3 +380,17 @@ test('live query cancellation is bound to the renderer that started it', () => {
     'query-cancel must verify activeLiveQuery.sender === sender',
   );
 });
+
+test('chat-sessions-migrated is emitted by main.js when live sessions are migrated to a note', () => {
+  const migrateIndex = MAIN.indexOf("'chat-sessions-migrated'");
+  assert.ok(
+    migrateIndex >= 0,
+    'expected chat-sessions-migrated send in main.js',
+  );
+  const migrateBlock = MAIN.slice(migrateIndex, migrateIndex + 200);
+  assert.match(
+    migrateBlock,
+    /fromKey.*toKey|toKey.*fromKey/,
+    'chat-sessions-migrated payload must include fromKey and toKey',
+  );
+});

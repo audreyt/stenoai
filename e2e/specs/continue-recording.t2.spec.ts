@@ -54,7 +54,10 @@ type SpawnResult = { code: number | null; stdout: string; stderr: string };
 function runBackend(args: string[], userDataDir: string): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(BACKEND, args, {
-      env: { ...process.env, STENOAI_USER_DATA_DIR: userDataDir },
+      // Same Apple LM pin as the electron fixture: a directly spawned backend
+      // on a host with a built sidecar would summarise on-device and never
+      // reach the deterministic Ollama fixture this spec counts calls on.
+      env: { ...process.env, STENOAI_USER_DATA_DIR: userDataDir, STENOAI_DISABLE_APPLE_LM: '1' },
     });
     let stdout = '';
     let stderr = '';

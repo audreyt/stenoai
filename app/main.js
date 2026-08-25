@@ -3513,7 +3513,7 @@ function handleLiveQueryProtocolLine(line, queryId, sender, proc, state, cleanup
   }
 }
 
-ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, question) => {
+ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, question, history) => {
   const sender = event?.sender;
   const responseQueryId =
     typeof queryId === 'string' && queryId.length <= 256 ? queryId : '';
@@ -3527,7 +3527,7 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
   }
 
   // Validate inputs
-  const validation = validateLiveQueryInputs({ queryId, sessionName, question });
+  const validation = validateLiveQueryInputs({ queryId, sessionName, question, history });
   if (!validation.valid) {
     done({ success: false, error: validation.error });
     return;
@@ -3542,7 +3542,7 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
   const snapshot = buildLiveTranscriptQuerySnapshot({
     sessionName,
     activeSessionName: currentRecordingSessionName,
-    systemAudioRecordingActive,
+    recordingActive: currentRecordingProcess !== null || systemAudioRecordingActive,
     liveTranscriptState,
   });
   if (snapshot.error) {
@@ -3677,10 +3677,14 @@ ipcMain.on('query-live-transcript-stream', (event, queryId, sessionName, questio
   });
 
   try {
-    const payload = JSON.stringify({
+    const payloadObj = {
       transcript: snapshot.transcript,
       question,
-    });
+    };
+    if (validation.history && validation.history.length > 0) {
+      payloadObj.history = validation.history;
+    }
+    const payload = JSON.stringify(payloadObj);
     proc.stdin.end(payload, 'utf-8');
   } catch {
     if (!state.done) {
@@ -4101,7 +4105,7 @@ function chatSessionsLegacyPath() {
   return path.join(app.getPath('userData'), CHAT_SESSIONS_LEGACY_FILENAME);
 }
 
-ipcMain.handle('save-chat-sessions', async (event, data) => {
+function writeChatSessionsV2(data) {
   const filePath = chatSessionsV2Path();
   const tmpPath = `${filePath}.tmp`;
   try {
@@ -4112,6 +4116,69 @@ ipcMain.handle('save-chat-sessions', async (event, data) => {
     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
     return { success: false, error: err.message };
   }
+}
+
+function migrateLiveChatSessions(sessionName, summaryFile) {
+  if (
+    typeof sessionName !== 'string' ||
+    !sessionName.trim() ||
+    typeof summaryFile !== 'string' ||
+    !summaryFile.trim()
+  ) {
+    return;
+  }
+  const fromKey = 'live:' + sessionName;
+  const v2Path = chatSessionsV2Path();
+  if (!fs.existsSync(v2Path)) return;
+
+  let data;
+  try {
+    const raw = fs.readFileSync(v2Path, 'utf-8');
+    data = JSON.parse(raw);
+  } catch (_) {
+    return;
+  }
+
+  if (!data || !Array.isArray(data.sessions)) return;
+
+  // The path we hold is canonical (start-recording-ui stores
+  // validateMeetingFilePath's realPath), but the renderer keys its sessions by
+  // the meetings-list path it was handed. Those are the same string under
+  // ~/Library/Application Support, and different under a symlinked
+  // STENOAI_USER_DATA_DIR (macOS $TMPDIR is /var -> /private/var). Keying the
+  // carried-over conversation on a string the renderer never uses would hide
+  // it, so reuse the note's existing session key whenever there is one.
+  const canonicalTarget = canonicalPathForCompare(summaryFile);
+  let toKey = summaryFile;
+  for (const session of data.sessions) {
+    if (!session || typeof session.summaryFile !== 'string') continue;
+    if (session.summaryFile === fromKey || session.summaryFile.startsWith('live:')) continue;
+    if (canonicalPathForCompare(session.summaryFile) === canonicalTarget) {
+      toKey = session.summaryFile;
+      break;
+    }
+  }
+
+  let migratedCount = 0;
+  for (const session of data.sessions) {
+    if (session && session.summaryFile === fromKey) {
+      session.summaryFile = toKey;
+      migratedCount++;
+    }
+  }
+
+  if (migratedCount === 0) return;
+
+  const writeResult = writeChatSessionsV2(data);
+  if (writeResult.success) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('chat-sessions-migrated', { fromKey, toKey });
+    }
+  }
+}
+
+ipcMain.handle('save-chat-sessions', async (event, data) => {
+  return writeChatSessionsV2(data);
 });
 
 ipcMain.handle('load-chat-sessions', async () => {
@@ -6649,6 +6716,8 @@ ipcMain.handle('stop-recording-ui', async () => {
     // → no live buffer to carry anyway).
     if (instantSummaryFile) {
       liveTranscriptState.summaryFile = instantSummaryFile;
+      const sessionName = currentRecordingSessionName || liveTranscriptState.sessionName || 'Note';
+      migrateLiveChatSessions(sessionName, instantSummaryFile);
     }
     systemAudioRecordingActive = false;
     applyRecordingBackgroundThrottling();

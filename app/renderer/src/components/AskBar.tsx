@@ -8,6 +8,7 @@ import { useGlobalStreaming, type StreamResult } from '@/hooks/useStreamingQuery
 import { OrgTranscriptPanelContent, TranscriptPanelContent } from '@/components/TranscriptPanel';
 import { useMeeting } from '@/hooks/useMeetings';
 import { useRecording } from '@/hooks/useRecording';
+import { useLiveTranscriptStatus } from '@/hooks/useLiveTranscript';
 import { buildTranscriptBundle } from '@/lib/transcriptBundle';
 
 // ---------------------------------------------------------------------------
@@ -214,10 +215,10 @@ export function TranscriptToggle() {
 /**
  * The floating chat composer. `disabled` renders it visible-but-inert only
  * for genuinely unsupported cases (no caller-override path). While a recording
- * is active or paused the composer stays enabled and routes to the live
- * transcript stream instead of the processed-note backend, so chat is usable
- * throughout the meeting (input reads "Ask about the live transcript…"). It
- * renders with no active meeting while recording so the transcription pill
+ * is active or paused, the composer routes to the live transcript stream only
+ * after that live transcript sidecar is ready; otherwise it stays inert instead
+ * of submitting a question that can only fail.
+ * It renders with no active meeting while recording so the transcription pill
  * always has the bar beside it.
  */
 export function AskBar({ disabled = false }: { disabled?: boolean }) {
@@ -236,6 +237,8 @@ export function AskBar({ disabled = false }: { disabled?: boolean }) {
   const recording = useRecording();
   const isRecording = recording.status === 'recording' || recording.status === 'paused';
   const liveSessionName = recording.sessionName ?? undefined;
+  const liveTranscript = useLiveTranscriptStatus(isRecording && liveSessionName ? liveSessionName : null);
+  const isLiveTranscriptReady = isRecording ? liveTranscript.status === 'streaming' : false;
 
   // Session key for live recording: stable synthetic key that won't collide
   // with saved notes (summaryFile paths) or org notes (org:id).
@@ -265,6 +268,7 @@ export function AskBar({ disabled = false }: { disabled?: boolean }) {
       isRecording={isRecording}
       liveSessionName={liveSessionName}
       disabled={disabled}
+      liveTranscriptReady={isLiveTranscriptReady}
       transcriptOpen={transcriptOpen}
       setTranscriptOpen={setTranscriptOpen}
     />
@@ -280,6 +284,7 @@ interface AskBarComposerProps {
   isRecording: boolean;
   liveSessionName: string | undefined;
   disabled: boolean;
+  liveTranscriptReady: boolean;
   transcriptOpen: boolean;
   setTranscriptOpen: (open: boolean) => void;
 }
@@ -293,6 +298,7 @@ function AskBarComposer({
   isRecording,
   liveSessionName,
   disabled,
+  liveTranscriptReady,
   transcriptOpen,
   setTranscriptOpen,
 }: AskBarComposerProps) {
@@ -314,9 +320,8 @@ function AskBarComposer({
   const session = chat.activeSession;
   const hasMessages = (session?.messages.length ?? 0) > 0;
 
-  // canSend: during recording the disabled prop is irrelevant (live chat is
-  // always available); otherwise honour the caller's disabled flag.
-  const canSend = input.trim().length > 0 && !isStreaming && (isRecording || !disabled);
+  const composerDisabled = isRecording ? !liveTranscriptReady : disabled;
+  const canSend = input.trim().length > 0 && !isStreaming && !composerDisabled;
 
   // Clean up any in-flight stream on unmount (e.g. when sessionKey changes or component unmounts)
   const cancelStream = streaming.cancelStream;
@@ -390,9 +395,7 @@ function AskBarComposer({
 
   const submitPrompt = async (raw: string) => {
     const q = raw.trim();
-    // During recording: not disabled; no summaryFile needed — use live route.
-    if (!q || isStreaming) return;
-    if (!isRecording && disabled) return;
+    if (!q || isStreaming || composerDisabled) return;
     if (!isRecording && !activeSummaryFile && !activeOrgMeeting) return;
     if (submittingRef.current) return;
     submittingRef.current = true;
@@ -415,7 +418,11 @@ function AskBarComposer({
 
       if (isRecording && liveSessionName) {
         // Live route — question sent against the in-progress recording.
-        streamId = streaming.startLiveStream(liveSessionName, q, { onComplete });
+        const history = (session?.messages ?? []).map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+        streamId = streaming.startLiveStream(liveSessionName, q, history, { onComplete });
       } else if (activeOrgMeeting) {
         // Org route — system prompt built from the shared note's body.
         const system =
@@ -563,7 +570,7 @@ function AskBarComposer({
           ref={inputRef}
           className="mv-chat-input"
           value={input}
-          disabled={disabled && !isRecording}
+          disabled={composerDisabled}
           onChange={(e) => setInput(e.target.value)}
           onFocus={handleInputFocus}
           onKeyDown={(e) => {
@@ -579,7 +586,9 @@ function AskBarComposer({
           }}
           placeholder={
             isRecording
-              ? 'Ask about the live transcript…'
+              ? liveTranscriptReady
+                ? 'Ask about the live transcript…'
+                : 'Live transcript unavailable'
               : disabled
                 ? 'Chat available after recording'
                 : hasMessages

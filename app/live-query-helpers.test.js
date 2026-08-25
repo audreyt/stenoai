@@ -12,6 +12,7 @@ const {
   formatLiveQueryTimestamp,
   isMeaningfulLiveQueryText,
   formatLiveTranscriptSegments,
+  normalizeLiveQueryHistory,
   validateLiveQueryInputs,
   buildLiveTranscriptQuerySnapshot,
 } = require('./live-query-helpers');
@@ -149,7 +150,7 @@ test('validateLiveQueryInputs validates queryId, sessionName, and question lengt
       sessionName: 'session-20260824',
       question: 'What was decided about the budget?',
     }),
-    { valid: true },
+    { valid: true, history: [] },
   );
 
   // Invalid queryId
@@ -274,7 +275,7 @@ test('buildLiveTranscriptQuerySnapshot returns error when live transcript has on
   assert.deepStrictEqual(result, { error: FIXED_LIVE_QUERY_ERRORS.EMPTY_TRANSCRIPT });
 });
 
-test('buildLiveTranscriptQuerySnapshot concatenates priorSegments and current segments into clean transcript', () => {
+test('buildLiveTranscriptQuerySnapshot two-block format for resumed recordings', () => {
   const fullState = {
     sessionName: 'session-zh',
     priorSegments: [
@@ -293,8 +294,214 @@ test('buildLiveTranscriptQuerySnapshot concatenates priorSegments and current se
   });
 
   assert.strictEqual(result.error, undefined);
-  assert.strictEqual(
-    result.transcript,
-    '[00:00 - 00:05] You: 我們現在開始會議\n[00:05 - 00:12] Others: 好的，確認收到',
+  const lines = result.transcript.split('\n');
+  assert.strictEqual(lines[0], 'EARLIER IN THIS MEETING (before resume):');
+  // Prior segment has no timestamp
+  assert.match(lines[1], /You: 我們現在開始會議/);
+  assert.doesNotMatch(lines[1], /\d\d:\d\d/);
+  // Separator blank line then CURRENT RECORDING: header
+  assert.strictEqual(lines[2], '');
+  assert.strictEqual(lines[3], 'CURRENT RECORDING:');
+  // Current segment has timestamp
+  assert.match(lines[4], /\[00:05 - 00:12\] Others: 好的，確認收到/);
+});
+
+test('buildLiveTranscriptQuerySnapshot no-prior-segments is unchanged (identity case)', () => {
+  const state = {
+    sessionName: 's1',
+    priorSegments: [],
+    segments: [
+      { start: 0, end: 3, speaker: 'You', text: 'Hello world', isFinal: true },
+    ],
+  };
+
+  const result = buildLiveTranscriptQuerySnapshot({
+    sessionName: 's1',
+    activeSessionName: 's1',
+    systemAudioRecordingActive: true,
+    liveTranscriptState: state,
+  });
+
+  assert.strictEqual(result.error, undefined);
+  // No headers in a normal never-resumed recording
+  assert.doesNotMatch(result.transcript, /EARLIER IN THIS MEETING/);
+  assert.doesNotMatch(result.transcript, /CURRENT RECORDING/);
+  assert.strictEqual(result.transcript, '[00:00 - 00:03] You: Hello world');
+});
+
+test('formatLiveTranscriptSegments two-block format drops prior lines before current under cap', () => {
+  // Create segments where prior block must be dropped to respect the cap
+  const currentLines = [
+    { start: 0, end: 5, speaker: 'You', text: 'First current', isFinal: true },
+    { start: 5, end: 10, speaker: 'Others', text: 'Second current', isFinal: true },
+  ];
+  const priorLines = [
+    { start: 0, end: 5, speaker: 'You', text: 'Prior content that should be dropped', isFinal: true },
+  ];
+
+  // Calculate rough size of current lines with timestamps only
+  const currentOnlyResult = formatLiveTranscriptSegments(currentLines, { priorSegments: [] });
+  const capJustForCurrent = currentOnlyResult.length;
+
+  // With such a small cap, prior block should be dropped
+  const resultSmallCap = formatLiveTranscriptSegments(currentLines, {
+    priorSegments: priorLines,
+    maxChars: capJustForCurrent,
+  });
+
+  assert.doesNotMatch(resultSmallCap, /EARLIER IN THIS MEETING/);
+  assert.doesNotMatch(resultSmallCap, /Prior content/);
+  // Current lines are preserved
+  assert.match(resultSmallCap, /First current/);
+  assert.match(resultSmallCap, /Second current/);
+
+  // With a generous cap, prior block appears before current
+  const resultLargeCap = formatLiveTranscriptSegments(currentLines, {
+    priorSegments: priorLines,
+    maxChars: 2000,
+  });
+  assert.match(resultLargeCap, /EARLIER IN THIS MEETING/);
+  assert.match(resultLargeCap, /Prior content/);
+  assert.match(resultLargeCap, /CURRENT RECORDING/);
+  assert.ok(resultLargeCap.indexOf('EARLIER IN THIS MEETING') < resultLargeCap.indexOf('CURRENT RECORDING'));
+});
+
+test('buildLiveTranscriptQuerySnapshot recordingActive true via currentRecordingProcess only', () => {
+  const state = {
+    sessionName: 'session-rec',
+    priorSegments: [],
+    segments: [
+      { start: 0, end: 3, speaker: 'You', text: 'Active via process', isFinal: true },
+    ],
+  };
+
+  // recordingActive=true but systemAudioRecordingActive=false (capture blip scenario)
+  const result = buildLiveTranscriptQuerySnapshot({
+    sessionName: 'session-rec',
+    activeSessionName: 'session-rec',
+    recordingActive: true,
+    systemAudioRecordingActive: false,
+    liveTranscriptState: state,
+  });
+
+  assert.strictEqual(result.error, undefined);
+  assert.match(result.transcript, /Active via process/);
+});
+
+test('INVALID_HISTORY is in the frozen FIXED_LIVE_QUERY_ERRORS map', () => {
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(FIXED_LIVE_QUERY_ERRORS, 'INVALID_HISTORY'),
+    'FIXED_LIVE_QUERY_ERRORS must have INVALID_HISTORY key',
   );
+  assert.strictEqual(typeof FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY, 'string');
+  assert.ok(FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY.length > 0);
+  // Must be frozen
+  assert.throws(() => { FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY = 'hacked'; }, TypeError);
+});
+
+test('normalizeLiveQueryHistory accepts absent, null, and empty history', () => {
+  assert.deepStrictEqual(normalizeLiveQueryHistory(undefined), { valid: true, history: [] });
+  assert.deepStrictEqual(normalizeLiveQueryHistory(null), { valid: true, history: [] });
+  assert.deepStrictEqual(normalizeLiveQueryHistory([]), { valid: true, history: [] });
+});
+
+test('normalizeLiveQueryHistory rejects non-array and malformed entries', () => {
+  assert.deepStrictEqual(
+    normalizeLiveQueryHistory('bad'),
+    { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY },
+  );
+  assert.deepStrictEqual(
+    normalizeLiveQueryHistory(42),
+    { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY },
+  );
+  // Bad role
+  assert.deepStrictEqual(
+    normalizeLiveQueryHistory([{ role: 'system', content: 'x' }]),
+    { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY },
+  );
+  // Non-string content
+  assert.deepStrictEqual(
+    normalizeLiveQueryHistory([{ role: 'user', content: 42 }]),
+    { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY },
+  );
+  // Content too long (>4000 chars)
+  assert.deepStrictEqual(
+    normalizeLiveQueryHistory([{ role: 'user', content: 'x'.repeat(4001) }]),
+    { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY },
+  );
+  // Null entry in array
+  assert.deepStrictEqual(
+    normalizeLiveQueryHistory([null]),
+    { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY },
+  );
+});
+
+test('normalizeLiveQueryHistory enforces max 6 entries (keeps newest)', () => {
+  const entries = Array.from({ length: 8 }, (_, i) => ({
+    role: i % 2 === 0 ? 'user' : 'assistant',
+    content: `message ${i}`,
+  }));
+  const result = normalizeLiveQueryHistory(entries);
+  assert.strictEqual(result.valid, true);
+  assert.strictEqual(result.history.length, 6);
+  // Should be the 6 newest (entries[2] through entries[7])
+  assert.strictEqual(result.history[0].content, 'message 2');
+  assert.strictEqual(result.history[5].content, 'message 7');
+});
+
+test('normalizeLiveQueryHistory enforces 4000 char per-entry limit', () => {
+  const valid = normalizeLiveQueryHistory([{ role: 'user', content: 'x'.repeat(4000) }]);
+  assert.strictEqual(valid.valid, true);
+  const invalid = normalizeLiveQueryHistory([{ role: 'user', content: 'x'.repeat(4001) }]);
+  assert.strictEqual(invalid.valid, false);
+  assert.strictEqual(invalid.error, FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY);
+});
+
+test('normalizeLiveQueryHistory enforces 12000 total char limit by dropping oldest entries', () => {
+  // 6 entries each with 2001 chars = 12006 total > 12000: oldest should be dropped
+  const entries = Array.from({ length: 6 }, (_, i) => ({
+    role: i % 2 === 0 ? 'user' : 'assistant',
+    content: 'x'.repeat(2001),
+  }));
+  const result = normalizeLiveQueryHistory(entries);
+  assert.strictEqual(result.valid, true);
+  // Total must be <= 12000
+  const total = result.history.reduce((sum, e) => sum + e.content.length, 0);
+  assert.ok(total <= 12000, `total history chars ${total} exceeds 12000`);
+  // Some entries were dropped
+  assert.ok(result.history.length < 6);
+});
+
+test('validateLiveQueryInputs accepts valid history and rejects INVALID_HISTORY', () => {
+  // Valid empty history
+  const r1 = validateLiveQueryInputs({ queryId: 'q1', sessionName: 's1', question: 'Q', history: [] });
+  assert.deepStrictEqual(r1, { valid: true, history: [] });
+
+  // Valid history with proper entries
+  const r2 = validateLiveQueryInputs({
+    queryId: 'q1',
+    sessionName: 's1',
+    question: 'Q',
+    history: [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello' }],
+  });
+  assert.strictEqual(r2.valid, true);
+  assert.strictEqual(r2.history.length, 2);
+
+  // Invalid history: bad role
+  const r3 = validateLiveQueryInputs({
+    queryId: 'q1',
+    sessionName: 's1',
+    question: 'Q',
+    history: [{ role: 'system', content: 'x' }],
+  });
+  assert.deepStrictEqual(r3, { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY });
+
+  // Invalid history: not an array
+  const r4 = validateLiveQueryInputs({
+    queryId: 'q1',
+    sessionName: 's1',
+    question: 'Q',
+    history: { role: 'user', content: 'x' },
+  });
+  assert.deepStrictEqual(r4, { valid: false, error: FIXED_LIVE_QUERY_ERRORS.INVALID_HISTORY });
 });

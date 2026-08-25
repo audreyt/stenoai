@@ -4039,11 +4039,11 @@ MAX_LIVE_QUERY_ANSWER_BYTES = 1024 * 1024  # 1 MiB
 def query_live_streaming(ctx):
     """Answer a question from the finalized live transcript.
 
-    Reads bounded JSON ``{"transcript": "...", "question": "..."}`` from
-    stdin and uses the same persisted provider and model as meeting summaries.
-    Streams ``CHAT_CHUNK:<base64>`` lines, then ``CHAT_STREAM_COMPLETE`` (or a
-    fixed ``CHAT_STREAM_ERROR`` on failure). Transcript and question content
-    never enters argv, logs, or error text.
+    Reads bounded JSON ``{"transcript": "...", "question": "...", "history": [...]}``
+    from stdin (``history`` optional) and uses the same persisted provider and
+    model as meeting summaries. Streams ``CHAT_CHUNK:<base64>`` lines, then
+    ``CHAT_STREAM_COMPLETE`` (or a fixed ``CHAT_STREAM_ERROR`` on failure).
+    Transcript, question, and history content never enters argv, logs, or error text.
     """
     import sys
     import json
@@ -4094,6 +4094,7 @@ def query_live_streaming(ctx):
 
     transcript = data.get("transcript")
     question = data.get("question")
+    raw_history = data.get("history")
 
     if not isinstance(transcript, str) or not transcript.strip():
         print(
@@ -4109,13 +4110,6 @@ def query_live_streaming(ctx):
         )
         sys.exit(1)
 
-    if len(transcript) > MAX_LIVE_QUERY_TRANSCRIPT_CHARS:
-        print(
-            "CHAT_STREAM_ERROR:Live transcript exceeds maximum length",
-            flush=True,
-        )
-        sys.exit(1)
-
     if len(question) > MAX_LIVE_QUERY_QUESTION_CHARS:
         print(
             "CHAT_STREAM_ERROR:Live query question exceeds maximum length",
@@ -4123,19 +4117,76 @@ def query_live_streaming(ctx):
         )
         sys.exit(1)
 
+    history = None
+    if raw_history is not None:
+        if not isinstance(raw_history, list):
+            print(
+                "CHAT_STREAM_ERROR:Invalid live query payload",
+                flush=True,
+            )
+            sys.exit(1)
+        valid_entries = []
+        for entry in raw_history:
+            if not isinstance(entry, dict):
+                print(
+                    "CHAT_STREAM_ERROR:Invalid live query payload",
+                    flush=True,
+                )
+                sys.exit(1)
+            role = entry.get("role")
+            if role not in ("user", "assistant"):
+                print(
+                    "CHAT_STREAM_ERROR:Invalid live query payload",
+                    flush=True,
+                )
+                sys.exit(1)
+            content = entry.get("content")
+            if not isinstance(content, str):
+                print(
+                    "CHAT_STREAM_ERROR:Invalid live query payload",
+                    flush=True,
+                )
+                sys.exit(1)
+            if len(content) > 4000:
+                print(
+                    "CHAT_STREAM_ERROR:Invalid live query payload",
+                    flush=True,
+                )
+                sys.exit(1)
+            valid_entries.append({"role": role, "content": content})
+
+        valid_entries = valid_entries[-6:]
+        while valid_entries and sum(len(e["content"]) for e in valid_entries) > 12000:
+            valid_entries.pop(0)
+        history = valid_entries
+
     from src.config import get_config
+
+    config = get_config()
+    ai_provider = config.get_ai_provider()
+    model = config.get_model()
+    raw_budget = _live_query_transcript_budget(ai_provider, model)
+    effective_budget = min(MAX_LIVE_QUERY_TRANSCRIPT_CHARS, raw_budget)
+
+    trimmed_transcript = _trim_live_transcript(transcript.strip(), effective_budget)
+    if not trimmed_transcript or not trimmed_transcript.strip():
+        print(
+            "CHAT_STREAM_ERROR:Empty live transcript (nothing to query)",
+            flush=True,
+        )
+        sys.exit(1)
 
     # Reuse the same language resolution the query prompt uses so the live
     # answer respects the user's language pin / detection like every other path.
     language = resolve_output_language(
-        get_config().get_language(), None, transcript.strip()
+        config.get_language(), None, trimmed_transcript
     )
 
     try:
         summarizer = OllamaSummarizer()
         total_answer_bytes = 0
         for chunk in summarizer.query_transcript_streaming_strict(
-            transcript.strip(), question.strip(), language=language
+            trimmed_transcript, question.strip(), language=language, history=history
         ):
             if not isinstance(chunk, str):
                 raise TypeError("Live query provider returned a non-text chunk")
@@ -4150,6 +4201,34 @@ def query_live_streaming(ctx):
     except Exception:
         print("CHAT_STREAM_ERROR:Live query failed", flush=True)
         sys.exit(1)
+
+
+def _live_query_transcript_budget(ai_provider: str, model: str) -> int:
+    """Char budget for the live transcript query, sized to the active model.
+
+    Matches _chat_corpus_char_budget: generous for cloud/adapter, derived from
+    resolve_num_ctx for local/remote Ollama/Apple LM models.
+    """
+    if ai_provider in ("local", "remote"):
+        from src.summarizer import resolve_num_ctx
+        return int(resolve_num_ctx(model) * 3.5 * 0.55)
+    return 400_000
+
+
+def _trim_live_transcript(transcript: str, budget: int) -> str:
+    """Trim transcript oldest-first by whole leading lines until it fits budget."""
+    if len(transcript) <= budget:
+        return transcript
+    marker = "[earlier transcript omitted]"
+    lines = transcript.split("\n")
+    for i in range(1, len(lines)):
+        candidate = marker + "\n" + "\n".join(lines[i:])
+        if len(candidate) <= budget:
+            return candidate
+    if len(marker) <= budget:
+        return marker
+    return ""
+
 
 def _chat_corpus_char_budget(ai_provider: str, model: str) -> int:
     """Char budget for the cross-note chat corpus, sized to the active model.
