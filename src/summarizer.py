@@ -120,6 +120,16 @@ _SNAPSHOT_MAX_CHARS = 2800
 _SNAPSHOT_PROMPT_OVERHEAD_CHARS = 900
 _SNAPSHOT_HEAD_RATIO = 0.6
 
+# Interactive (AskBar / live-question) deadline for the Apple sidecar, as
+# opposed to the summarisation-grade 7200 s default in src.apple_lm. Sized
+# against two measured facts: a guardrail refusal comes back in well under a
+# second, and a healthy interactive answer streams its first chunk in a few
+# seconds. Deliberately far below main.js's LIVE_QUERY_TIMEOUT_MS (300 s, after
+# which it SIGKILLs the backend and reports its fixed TIMEOUT error), so a
+# merely slow sidecar leaves most of the user-facing budget to the fallback
+# instead of consuming all of it and being killed mid-retry.
+APPLE_INTERACTIVE_TIMEOUT_S = 45
+
 
 def resolve_num_ctx(model_name: str) -> int:
     """Context window (num_ctx) to request from Ollama for ``model_name``.
@@ -1991,15 +2001,24 @@ ANSWER:"""
             from src.apple_lm import is_apple_system_model, stream_complete
             emitted = False
             try:
-                for chunk in stream_complete(prompt, timeout=300):
+                for chunk in stream_complete(prompt, timeout=APPLE_INTERACTIVE_TIMEOUT_S):
                     emitted = True
                     yield chunk
                 return
+            except TimeoutError:
+                # A hung sidecar is NOT retried. main.js kills the live query at
+                # LIVE_QUERY_TIMEOUT_MS (300 s) and reports its fixed TIMEOUT
+                # error, so a fallback started after a full-length Apple stall
+                # would be killed before it could emit anything — the user would
+                # simply wait longer for the same outcome. Surface it instead,
+                # and keep the Apple attempt short enough (below) that a merely
+                # slow sidecar still leaves budget for the fallback.
+                raise
             except Exception:
                 # Apple Intelligence reports itself available and then refuses
                 # individual requests: its guardrails reject some entirely
                 # ordinary meeting content (measured — a transcript line naming
-                # a person and an action is enough), deterministically, for the
+                # a person and an action was enough), deterministically, for the
                 # same prompt shape that answers fine one sentence later. A
                 # question about the user's own meeting must not die on that,
                 # so serve it with the model __init__ already downgrades to

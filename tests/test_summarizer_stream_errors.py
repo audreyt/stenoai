@@ -292,6 +292,44 @@ class AppleInteractiveQueryFallbackTests(unittest.TestCase):
         self.assertEqual(got, ["Ana "])
         fallback_client.chat.assert_not_called()
 
+    def test_timeout_is_not_retried_on_the_fallback(self):
+        """A hung sidecar must surface, not silently start a second attempt.
+
+        main.js kills the live query at LIVE_QUERY_TIMEOUT_MS (300 s) and
+        reports its own fixed TIMEOUT error, so a fallback begun after a
+        full-length Apple stall gets killed before it can emit anything: the
+        user would wait longer for the identical outcome.
+        """
+        s = self._apple_summarizer()
+        stall = TimeoutError("Apple Intelligence stream timed out")
+        fallback_client = mock.Mock()
+        with mock.patch("src.apple_lm.is_apple_system_model", side_effect=_only_apple_sentinel), \
+             mock.patch("src.apple_lm.stream_complete", side_effect=_gen_raising(stall)), \
+             mock.patch.object(OllamaSummarizer, "_ensure_ollama_ready", return_value=True), \
+             mock.patch("src.summarizer.ollama.Client", return_value=fallback_client):
+            with self.assertRaises(TimeoutError) as ctx:
+                list(s.query_transcript_streaming_strict("You: hi.", "What?"))
+        self.assertIs(ctx.exception, stall)
+        fallback_client.chat.assert_not_called()
+
+    def test_interactive_attempt_uses_the_short_deadline(self):
+        """The Apple attempt must be bounded well below main's 300 s kill so a
+        slow sidecar still leaves budget for the fallback."""
+        from src.summarizer import APPLE_INTERACTIVE_TIMEOUT_S
+
+        s = self._apple_summarizer()
+        seen = {}
+
+        def _record(prompt, timeout=None):
+            seen["timeout"] = timeout
+            yield "ok"
+
+        with mock.patch("src.apple_lm.is_apple_system_model", side_effect=_only_apple_sentinel), \
+             mock.patch("src.apple_lm.stream_complete", side_effect=_record):
+            list(s.query_transcript_streaming_strict("You: hi.", "What?"))
+        self.assertEqual(seen["timeout"], APPLE_INTERACTIVE_TIMEOUT_S)
+        self.assertLess(APPLE_INTERACTIVE_TIMEOUT_S, 300)
+
 
 if __name__ == "__main__":
     unittest.main()
