@@ -55,6 +55,7 @@ export interface Meeting {
   session_info: SessionInfo;
   summary: string;
   participants?: unknown[];
+  attendees?: string[];
   discussion_areas?: unknown[];
   key_points?: string[];
   action_items?: unknown[];
@@ -89,6 +90,8 @@ export interface Folder {
   color: string;
   order: number;
   icon?: string;
+  template_id?: string | null;
+  recurring_titles?: string[];
 }
 
 export interface ListedModel {
@@ -1047,7 +1050,7 @@ export interface StenoaiBridge {
      *  existing note to append this recording's transcript to
      *  (continue-recording) instead of creating a new note. */
     start: RequestFn<
-      [name?: string, trigger?: RecordingTrigger, appendTo?: string],
+      [name?: string, trigger?: RecordingTrigger, appendTo?: string, templateId?: string],
       StartRecordingResponse
     >;
     stop: RequestFn<[], StopRecordingResponse>;
@@ -1158,6 +1161,14 @@ export interface StenoaiBridge {
     addMeeting: RequestFn<[summaryFile: string, folderId: string], Result<Record<string, never>>>;
     removeMeeting: RequestFn<
       [summaryFile: string, folderId: string],
+      Result<Record<string, never>>
+    >;
+    setTemplate: RequestFn<
+      [folderId: string, templateId?: string | null],
+      Result<Record<string, never>>
+    >;
+    setRecurring: RequestFn<
+      [folderId: string, titles: string[]],
       Result<Record<string, never>>
     >;
   };

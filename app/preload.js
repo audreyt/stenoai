@@ -109,8 +109,8 @@ const stenoai = {
   },
 
   recording: {
-    start: (name, trigger, appendTo) =>
-      invoke('start-recording-ui', name, trigger, appendTo),
+    start: (name, trigger, appendTo, templateId) =>
+      invoke('start-recording-ui', name, trigger, appendTo, templateId),
     stop: () => invoke('stop-recording-ui'),
     pause: () => invoke('pause-recording-ui'),
     resume: () => invoke('resume-recording-ui'),
@@ -205,6 +205,8 @@ const stenoai = {
     reorder: (ids) => invoke('reorder-folders', ids),
     addMeeting: (summaryFile, folderId) => invoke('add-meeting-to-folder', summaryFile, folderId),
     removeMeeting: (summaryFile, folderId) => invoke('remove-meeting-from-folder', summaryFile, folderId),
+    setTemplate: (id, templateId) => invoke('set-folder-template', id, templateId),
+    setRecurring: (id, titles) => invoke('set-folder-recurring', id, titles),
   },
 
   templates: {

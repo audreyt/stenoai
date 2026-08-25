@@ -5871,6 +5871,16 @@ async function processNextInQueue() {
     if (currentProcessingJob.appendTo && fs.existsSync(currentProcessingJob.appendTo)) {
       processArgs.push('--append-to', currentProcessingJob.appendTo);
     }
+    if (currentProcessingJob.templateId && typeof currentProcessingJob.templateId === 'string') {
+      processArgs.push('--template-id', currentProcessingJob.templateId);
+    }
+    if (Array.isArray(currentProcessingJob.attendees)) {
+      for (const attendee of currentProcessingJob.attendees) {
+        if (typeof attendee === 'string' && attendee.trim()) {
+          processArgs.push('--attendee', attendee.trim());
+        }
+      }
+    }
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), processArgs, {
@@ -6386,8 +6396,8 @@ function sweepStuckProcessingFlags() {
   }
 }
 
-function addToProcessingQueue(audioFile, sessionName, notesFile, liveTranscriptFile, appendTo, summaryFile) {
-  processingQueue.push({ audioFile, sessionName, notesFile, liveTranscriptFile, appendTo, summaryFile });
+function addToProcessingQueue(audioFile, sessionName, notesFile, liveTranscriptFile, appendTo, summaryFile, templateId, attendees) {
+  processingQueue.push({ audioFile, sessionName, notesFile, liveTranscriptFile, appendTo, summaryFile, templateId, attendees });
   console.log(`📋 Added to processing queue: ${sessionName} (Queue size: ${processingQueue.length})`);
   processNextInQueue();
 }
@@ -6398,12 +6408,14 @@ function addToProcessingQueue(audioFile, sessionName, notesFile, liveTranscriptF
 // the segment's transcript is folded into that note instead of creating a
 // new one.
 let currentRecordingAppendTarget = null;
+let currentRecordingTemplateId = null;
+let currentRecordingAttendees = [];
 
 // Valid recording_started `trigger` values. Whitelisted so a stale/forged
 // renderer arg can't smuggle an arbitrary string into PostHog.
 const RECORDING_TRIGGERS = new Set(['manual', 'notification_click', 'hotkey', 'tray', 'url_scheme']);
 
-ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) => {
+ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo, templateId) => {
   try {
     if (currentRecordingProcess) {
       return { success: false, error: 'Recording already in progress' };
@@ -6421,6 +6433,14 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     // _append_segment_to_note. A bad target degrades to a normal new-note
     // recording rather than failing the start.
     currentRecordingAppendTarget = null;
+    currentRecordingTemplateId = null;
+    currentRecordingAttendees = [];
+    if (templateId && typeof templateId === 'string') {
+      const trimmed = templateId.trim();
+      if (trimmed.length > 0 && trimmed.length <= 128) {
+        currentRecordingTemplateId = trimmed;
+      }
+    }
     if (appendTo && typeof appendTo === 'string') {
       const validatedAppend = await validateMeetingFilePath(appendTo);
       if (!validatedAppend.error) {
@@ -6514,6 +6534,11 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     const recordingTrigger = RECORDING_TRIGGERS.has(trigger) ? trigger : 'manual';
     withTimeout(getCalendarEventForNow(), 2500)
       .then((calEvent) => {
+        if (calEvent && Array.isArray(calEvent.attendees)) {
+          currentRecordingAttendees = calEvent.attendees
+            .filter((name) => typeof name === 'string' && name.trim().length > 0 && !name.includes('@'))
+            .map((name) => name.trim());
+        }
         trackEvent('recording_started', {
           trigger: recordingTrigger,
           matched_calendar_event: Boolean(calEvent),
@@ -6537,6 +6562,8 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     systemAudioRecordingActive = false;
     currentRecordingSessionName = null;
     currentRecordingAppendTarget = null;
+    currentRecordingTemplateId = null;
+    currentRecordingAttendees = [];
     resetRecordingRuntimeState();
     updateTrayIcon(false);
     trackEvent('error_occurred', { error_type: 'start_recording_ui', reason: classifyErrorReason(error) });
@@ -9920,6 +9947,10 @@ ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, se
     // starts clean.
     const appendTo = currentRecordingAppendTarget;
     currentRecordingAppendTarget = null;
+    const templateId = currentRecordingTemplateId;
+    currentRecordingTemplateId = null;
+    const attendees = currentRecordingAttendees;
+    currentRecordingAttendees = [];
 
     // Instant stop: the note the pipeline will write to. For an append it's the
     // existing note; for a new Parakeet recording it's the deterministic
@@ -9934,7 +9965,7 @@ ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, se
         : undefined;
 
     // Use the existing processing queue to avoid concurrent Ollama/Whisper runs
-    addToProcessingQueue(audioFilePath, actualSessionName, notesPath, liveTranscriptFile, appendTo, jobSummaryFile);
+    addToProcessingQueue(audioFilePath, actualSessionName, notesPath, liveTranscriptFile, appendTo, jobSummaryFile, templateId, attendees);
 
     // recording_stopped is NOT tracked here -- stop-recording-ui already
     // fires it (with the real duration_bucket) for every stop. This handler
@@ -11660,6 +11691,19 @@ function normalizeCalendarEvent(event) {
     eventColor = event.calendarBackgroundColor;
   }
 
+  const attendees = [];
+  if (Array.isArray(event.attendees)) {
+    for (const a of event.attendees) {
+      if (!a) continue;
+      const name = (typeof a.displayName === 'string' && a.displayName.trim()) ||
+                   (typeof a.name === 'string' && a.name.trim()) ||
+                   '';
+      if (name && !name.includes('@')) {
+        attendees.push(name);
+      }
+    }
+  }
+
   return {
     id: event._sourceCalendarId ? `${event._sourceCalendarId}_${event.id}` : event.id,
     title: event.summary || event.title || 'No title',
@@ -11673,9 +11717,9 @@ function normalizeCalendarEvent(event) {
     is_all_day: isAllDay,
     response_status: responseStatus,
     color: eventColor,
+    attendees,
   };
 }
-
 ipcMain.handle('get-calendar-events', async () => {
   try {
     // Check which provider is connected (only one at a time)
