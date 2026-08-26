@@ -45,9 +45,9 @@ Steno has no meeting bot. It records audio from your Mac's audio system -- the o
 
 ## Accuracy and language support
 
-Both tools offer high transcription accuracy for clear, English-language audio. Steno transcribes on-device with two engines -- Parakeet (the default) and Whisper (optional) -- and performs well across accents and in noisy environments.
+Both tools offer high transcription accuracy for clear audio. Steno uses Apple SpeechTranscriber by default on macOS 26+, with Parakeet and Whisper fallbacks. Apple provides live Traditional and Simplified Chinese plus broad locale coverage without uploading audio.
 
-Otter is primarily optimized for English. Steno's default Parakeet engine covers 25 European languages, including English; switching to the Whisper engine adds automatic detection across 99 languages.
+Otter primarily targets English. Steno's Apple runtime exposes 45 locales; Parakeet covers 25 European languages; Whisper adds 99-language post-stop coverage.
 
 ## Team features
 
@@ -76,5 +76,5 @@ Yes. They do not conflict. Some users run Steno for sensitive or private meeting
 </Accordion>
 
 <Accordion title="How does transcription accuracy compare?">
-Both use strong transcription engines and perform similarly for clear, English-language audio. Steno's main advantage is that it runs on-device without sending audio anywhere; its default Parakeet engine covers 25 European languages, including English, and the optional Whisper engine adds language breadth (99 languages vs Otter's primarily English focus).
+Both use strong transcription engines. Steno's main advantage is local audio processing: Apple SpeechTranscriber is the default on macOS 26+, while Parakeet and Whisper provide portable and broad-language fallbacks.
 </Accordion>

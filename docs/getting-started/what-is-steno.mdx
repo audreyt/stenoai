@@ -1,20 +1,20 @@
 ---
 title: "What is Steno?"
-description: "Steno is a macOS app that records, transcribes, and summarizes meetings entirely on-device. Your audio never leaves your Mac."
+description: "Steno records and transcribes meetings on-device, with live local chat and self-hosted summaries."
 ---
 
-Steno is a macOS app that records, transcribes, and summarizes meetings using AI models that run entirely on your device. By default there are no cloud uploads and no accounts required; the only outbound requests are model downloads during setup, periodic update checks, and anonymous usage analytics (no meeting content) that you can turn off in Settings. Your audio, transcripts, and summaries are stored locally in `~/Library/Application Support/stenoai/` (you can change the location in Settings).
+Steno records microphone and system audio, transcribes it on your device, and stores transcripts and notes under `~/Library/Application Support/stenoai/` (or a storage location you choose). No account is required. The fork's maintained summary/chat profile uses a self-hosted loopback model.
 
 ## How it works
 
 Steno runs a local pipeline on every recording:
 
-1. **Record** -- always captures microphone audio, with system audio (both sides of a call) as an optional add-on toggle
-2. **Transcribe** -- runs a local speech-to-text engine to produce a verbatim transcript with speaker labels when system audio is on. Steno ships two engines: Parakeet (the default, which also shows a live transcript while you record) and Whisper (an optional alternate you can switch to in Settings)
-3. **Summarize** -- passes the transcript to a small language model running via [Ollama](https://ollama.com) on your Mac to produce structured notes: summary, key topics, and action items
-4. **Query** -- ask natural-language questions against any saved note from the inline ask bar
+1. **Record** -- captures microphone audio and, when enabled, system audio from the other side of a call
+2. **Transcribe** -- uses Apple SpeechTranscriber by default on macOS 26+, including live Traditional Chinese switching; Parakeet and Whisper remain fallbacks
+3. **Summarize** -- sends the completed transcript to the configured language-model route; the maintained fork profile uses `ornith-1.5:9b` on `127.0.0.1:11443`
+4. **Query** -- ask questions during the meeting from finalized live segments, or query saved notes and the full library afterward
 
-Recording, transcription, and summarization all run offline. Steno does not send meeting content to any external server unless you explicitly configure a non-local backend (a cloud model such as OpenAI, Anthropic, AWS Bedrock, or a custom OpenAI-compatible endpoint, or a remote Ollama / organization adapter) as an optional alternative to the local model.
+Audio and transcription stay on the device. Transcript-derived prompts go to the LLM route you choose. The maintained Ornith profile uses loopback; optional cloud and organisation adapter routes remain available for users who configure them.
 
 ## Who it's for
 
@@ -46,7 +46,7 @@ All data is stored in `~/Library/Application Support/stenoai/`. This includes re
 </Accordion>
 
 <Accordion title="Is Steno open source?">
-Yes. The source code is available at [github.com/stenolabs/stenoai](https://github.com/stenolabs/stenoai) under the MIT license.
+Yes. The maintained fork is available at [github.com/audreyt/stenoai](https://github.com/audreyt/stenoai) under the MIT license.
 </Accordion>
 
 <Accordion title="What hardware does Steno need?">

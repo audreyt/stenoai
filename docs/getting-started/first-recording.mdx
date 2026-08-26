@@ -15,7 +15,7 @@ This guide walks through making a short test recording so you can verify the ful
   <Step title="Press Record">
     Click **New note**. Steno starts capturing audio immediately and generates a title automatically from the transcript -- you can rename it later from the note's detail view.
 
-    You will see a live timer in the top bar, and with the default Parakeet engine a live transcript appears while you record.
+    You will see a live timer in the top bar. On macOS 26+, Apple SpeechTranscriber builds the live transcript; Parakeet provides the live fallback on older systems and Windows.
   </Step>
 
   <Step title="Say something">
@@ -60,11 +60,11 @@ Summaries and transcripts are plain Markdown files. You can open, edit, and sync
 ---
 
 <Accordion title="Transcription is taking a long time -- is that normal?">
-Transcription speed depends on which engine you use. It runs entirely on-device and is fast on Apple Silicon; the default Parakeet engine also shows a live transcript as you record. The optional Whisper engine runs more slowly, since it transcribes only after you stop. You can switch engines in **Settings → Transcribe**.
+Transcription is normally faster than real time on Apple Silicon. Apple SpeechTranscriber and Parakeet both show live text; Whisper runs after stop. Pin a concrete Apple language when the meeting language differs from the Mac system locale.
 </Accordion>
 
 <Accordion title="The summary is not very useful -- what can I do?">
-Try a larger summarization model. In **Settings → AI**, switch from the default `gemma4:e2b-it-qat` to `qwen3.5:9b` or `gpt-oss:20b`. Larger models produce better-structured notes but take longer to run.
+The maintained fork profile uses `ornith-1.5:9b` for summaries. If a summary misses details, ask a focused question from the meeting chat or regenerate after adding notes; other configured Ollama/cloud models remain available in **Settings → AI**.
 </Accordion>
 
 <Accordion title="I can only see my own voice -- how do I record both sides of a call?">

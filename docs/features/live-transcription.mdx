@@ -1,19 +1,19 @@
 ---
 title: "Live transcription"
-description: "On macOS, Steno shows a live transcript while you record — text appears as people speak, entirely on-device. No audio leaves your Mac."
+description: "Apple SpeechTranscriber and Parakeet show live on-device text while you record. Switch Traditional Chinese live and ask questions before the meeting ends."
 ---
 
-Live transcription shows the transcript building in real time while you record. Words appear on screen as people speak, processed entirely on your Mac. It runs on the **Parakeet** engine (the default on macOS), so there is nothing to enable — start a recording and the live transcript appears.
+Live transcription shows the meeting as people speak. On macOS 26+, Apple SpeechTranscriber is the default and uses the system's speech assets. Parakeet provides the live fallback on older supported Macs and Windows.
 
 ## How it works
 
-While recording, Steno feeds audio through voice-activity detection and the Parakeet model to produce a running transcript. When you stop, the same recording is finalized into the saved transcript that your notes are built from. The live view is a convenience during the meeting; the saved transcript is the source of record.
+The renderer sends separate microphone and system-audio channels to the active live engine. Final segments retain timestamps and `[You]` or `[Others]` attribution. Changing the language during Apple transcription drains the current sidecar and restarts it with the selected locale, so a `zh-Hant` switch takes effect during the same recording.
 
-When the model is still loading at the start of a recording, Steno shows that it is warming up while audio continues to be captured — nothing is lost.
+The Ask bar remains active while recording. Each question uses finalized segments available at that moment; partial words stay out of the prompt. Answers stream from the configured LLM endpoint and can be cancelled.
 
 ## Engine requirements
 
-Live transcription is available when the **Parakeet** engine is active (Settings → Transcribe). If you switch to the **Whisper** engine, recordings transcribe **after** you stop rather than live. See [Transcription models](/models/transcription-models) for the difference between the two engines.
+Apple live transcription requires macOS 26+. Parakeet provides live transcription where Apple SpeechTranscriber is unavailable. Whisper remains post-stop only. See [Transcription models](/models/transcription-models) for details.
 
 ---
 

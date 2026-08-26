@@ -9,11 +9,13 @@
  */
 
 // ---------- shared result envelope ----------
-export type Result<T> = ({ success: true } & T) | {
-  success: false;
-  error: string;
-  error_code?: string;
-};
+export type Result<T> =
+  | ({ success: true } & T)
+  | {
+      success: false;
+      error: string;
+      error_code?: string;
+    };
 
 // ---------- domain types ----------
 export interface SessionInfo {
@@ -725,7 +727,16 @@ export type ParakeetStatusResponse = Result<{
   installed: boolean;
 }>;
 
-export type TranscriptionEngine = 'parakeet' | 'whisper';
+export type AppleSpeechStatusResponse = Result<{
+  available: boolean;
+  supported: boolean;
+  installed: boolean;
+  locale: string | null;
+  display_name: string;
+  system_managed: boolean;
+}>;
+
+export type TranscriptionEngine = 'apple' | 'parakeet' | 'whisper';
 
 export type GetTranscriptionEngineResponse = Result<{
   engine: TranscriptionEngine;
@@ -1261,6 +1272,11 @@ export interface StenoaiBridge {
     list: RequestFn<[], ListParakeetModelsResponse>;
     pull: RequestFn<[id?: string | null], Result<{ model?: string; already_installed?: boolean }>>;
     status: RequestFn<[], ParakeetStatusResponse>;
+  };
+
+  appleSpeech: {
+    status: RequestFn<[language?: string], AppleSpeechStatusResponse>;
+    prepare: RequestFn<[language?: string], AppleSpeechStatusResponse>;
   };
 
   transcriptionEngine: {

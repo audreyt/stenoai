@@ -1762,7 +1762,7 @@ def set_whisper_model_cmd(model_size: str):
 
 @cli.command(name='get-transcription-engine')
 def get_transcription_engine_cmd():
-    """Get the active ASR engine ('parakeet' or 'whisper')."""
+    """Get the active ASR engine."""
     from src.config import get_config
     config = get_config()
     print(json.dumps({
@@ -1786,6 +1786,29 @@ def set_transcription_engine_cmd(engine: str):
             "valid_engines": list(config.VALID_TRANSCRIPTION_ENGINES),
         }))
 
+
+@cli.command(name='apple-speech-status')
+@click.argument('language', required=False, default='auto')
+def apple_speech_status_cmd(language: str):
+    """Report Apple SpeechTranscriber availability and asset state."""
+    from src.apple_speech import status
+    try:
+        print(json.dumps(status(language)))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+        sys.exit(1)
+
+
+@cli.command(name='prepare-apple-speech')
+@click.argument('language', required=False, default='auto')
+def prepare_apple_speech_cmd(language: str):
+    """Install the system-managed Apple speech asset when needed."""
+    from src.apple_speech import prepare
+    try:
+        print(json.dumps(prepare(language)))
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+        sys.exit(1)
 
 @cli.command(name='list-parakeet-models')
 def list_parakeet_models_cmd():
@@ -4320,6 +4343,7 @@ def query_live_streaming(ctx):
         )
         sys.exit(1)
 
+
     if len(question) > MAX_LIVE_QUERY_QUESTION_CHARS:
         print(
             "CHAT_STREAM_ERROR:Live query question exceeds maximum length",
@@ -4533,7 +4557,6 @@ def _extract_transcript_excerpt(question: str, transcript: str, max_chars: int =
     if start_idx + len(selected_lines) < len(lines):
         excerpt = excerpt + "\n…"
     return excerpt
-
 
 def _chat_corpus_char_budget(ai_provider: str, model: str) -> int:
     """Char budget for the cross-note chat corpus, sized to the active model.

@@ -716,6 +716,26 @@ function install({ ipcMain }) {
       installed: process.env.STENOAI_E2E_MOCK_PARAKEET_INSTALLED === '1',
     }),
 
+    'apple-speech-status': async () => ({
+      success: true,
+      available: true,
+      supported: true,
+      installed: process.env.STENOAI_E2E_MOCK_APPLE_INSTALLED === '1',
+      locale: 'en_US',
+      display_name: 'Apple On-Device',
+      system_managed: true,
+    }),
+
+    'prepare-apple-speech': async () => ({
+      success: true,
+      available: true,
+      supported: true,
+      installed: true,
+      locale: 'en_US',
+      display_name: 'Apple On-Device',
+      system_managed: true,
+    }),
+
     'get-ai-provider': async () => ({
       success: true,
       ai_provider: state.provider,
@@ -1075,6 +1095,9 @@ function install({ ipcMain }) {
     // end. Without the flag they resolve success, matching the permissive
     // default so nothing else changes.
     'setup-parakeet': async (event) => {
+      if (process.env.STENOAI_E2E_FAIL_ON_PARAKEET_SETUP === '1') {
+        throw new Error('Parakeet setup must not run for Apple transcription');
+      }
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
         if (wc && !wc.isDestroyed()) {
@@ -1478,7 +1501,7 @@ function install({ ipcMain }) {
           updateAvailable: true,
           currentVersion: '0.0.0-e2e',
           latestVersion: '9.9.9',
-          releaseUrl: 'https://github.com/stenolabs/stenoai/releases/latest',
+          releaseUrl: 'https://github.com/audreyt/stenoai/releases/latest',
           releaseName: 'Version 9.9.9',
           downloadUrl: null,
           osUpdateEligible: false,

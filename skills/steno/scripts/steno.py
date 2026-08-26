@@ -8,7 +8,7 @@
 #   users run it — and bootstrap a Python if they have none — via `uv run`.
 """Read-only access to a local Steno meeting-note store, for agents.
 
-Steno (https://github.com/stenolabs/stenoai) records, transcribes, and
+Steno (https://github.com/audreyt/stenoai) records, transcribes, and
 summarizes meetings entirely on-device. Each meeting is stored as a Markdown
 summary plus a plain-text transcript under a per-OS data directory. This script
 locates that store and lets an agent list, read, and search notes without

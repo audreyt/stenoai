@@ -5,10 +5,10 @@
 ## Key facts
 
 - Platform: macOS (macOS 14.4 Sonoma or later; Apple Silicon, M1 or later -- Intel Macs are not supported since v0.4.0) and Windows 10/11 (x64) in alpha (unsigned; Windows SmartScreen warns on first launch).
-- Cost: free and open source (MIT license, no usage restrictions). A paid managed Enterprise deployment tier is a separate, optional offering (details coming soon). Source at https://github.com/stenolabs/stenoai
+- Cost: free and open source (MIT license, no usage restrictions). Source at https://github.com/audreyt/stenoai
 - No meeting bot: records system audio + microphone locally; no participant is notified by Steno.
-- Transcription: two on-device engines — Parakeet (default, with a live transcript while recording; 25 European languages, including English) and Whisper (optional; 99 languages). No audio is uploaded.
-- Summarization: local models via Ollama by default (default model Gemma 4 E2B). Optional off-device alternatives -- a cloud model (OpenAI, Anthropic, AWS Bedrock, or a custom endpoint), a self-hosted "Private Server" remote Ollama instance, or an organization adapter -- receive the transcript and any typed notes only, never audio.
+- Transcription: Apple SpeechTranscriber is the default on macOS 26+, with system-managed locale assets and live Traditional Chinese switching. Parakeet and Whisper remain fallbacks; Windows uses Parakeet through ONNX Runtime.
+- Summarization and in-meeting chat: the maintained fork profile uses self-hosted `ornith-1.5:9b` through `http://127.0.0.1:11443`. Optional cloud and organisation adapter routes remain available.
 - Privacy: recording, transcription, and summarization are on-device by default. The app has anonymous usage analytics (no meeting content, on by default) that can be turned off during setup or later in Settings.
 - Data location: ~/Library/Application Support/stenoai/ on macOS, %APPDATA%\stenoai\ on Windows (recordings, transcripts, output).
 

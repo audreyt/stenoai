@@ -1,43 +1,44 @@
 ---
 title: "How on-device processing works"
-description: "Steno transcribes and summarizes your meetings using AI models that run entirely on your Mac. No audio is sent to any server."
+description: "Steno keeps audio and transcription on your Mac. Summaries and chat can use a self-hosted loopback model."
 ---
 
-Steno processes your recordings using two AI models that run locally on your hardware. Your audio, transcripts, and summaries stay on your Mac unless you optionally configure a cloud summarization model (see below) -- meeting content is never uploaded by default. The app does send anonymous product-usage analytics (see below), which is on by default and can be turned off in Settings.
+Steno keeps recorded audio and speech recognition on your Mac. Transcripts and summaries live in the local Steno data directory. Summary and chat prompts go only to the LLM route you configure; this fork's maintained profile uses a self-hosted loopback service.
 
 ## The processing pipeline
 
-When you stop a recording, Steno runs this sequence entirely on your device:
+When you stop a recording, Steno runs this sequence:
 
 ```
 Audio file (local)
-  → Parakeet or Whisper (on-device transcription)
+  → Apple SpeechTranscriber, Parakeet, or Whisper (on-device transcription)
   → transcript.txt (saved locally)
-  → Ollama (on-device LLM)
+  → configured Ollama-compatible service
   → summary.md (saved locally)
 ```
 
-In the default local configuration, no step in this pipeline contacts an external server. The models are downloaded once during setup and then run offline indefinitely. If a cloud summarization model is configured, the transcript step is sent to that provider's API instead of local Ollama.
+On macOS 26+, Apple SpeechTranscriber is the default and its locale assets are managed by the operating system. The maintained fork profile sends transcript-derived prompts over loopback to Ornith at `127.0.0.1:11443`. Audio never goes to the LLM service.
 
 ## What runs on your Mac
 
-**Transcription -- Parakeet or Whisper**
+**Transcription: Apple SpeechTranscriber, Parakeet, or Whisper**
 
-Steno transcribes with one of two on-device engines. **Parakeet** (the default) runs via MLX on Apple Silicon and produces a live transcript while you record. **Whisper** (`large-v3-turbo`) is an optional alternate for the full 99-language set, selectable in **Settings → Transcribe**. Both run entirely in-process -- the model weights are stored under `~/Library/Application Support/stenoai/` and there is no transcription API call.
+Apple SpeechTranscriber is the default on macOS 26+ and provides live and batch transcription through system-managed locale assets. Parakeet remains the live fallback for older macOS versions and Windows. Whisper provides broader post-stop language coverage. All three process audio locally.
 
-**Summarization -- Ollama**
+**Summary and chat: Ollama-compatible service**
 
-Steno bundles [Ollama](https://ollama.com), which manages and runs small language models locally. When Steno starts, it launches a local Ollama server that by default listens only on `127.0.0.1` (loopback). All summarization and query requests go to `http://localhost:11434` -- they do not leave your machine unless `OLLAMA_HOST` is overridden in your environment.
+The maintained fork profile uses `ornith-1.5:9b` at `http://127.0.0.1:11443` for summaries and chat during recording. The upstream local-Ollama route on `127.0.0.1:11434`, remote Ollama, cloud, and organisation adapter options remain available.
 
 ## What network requests does Steno make?
 
 | Request | When | Why |
 |---------|------|-----|
-| Model download | First launch / setup only | Downloads transcription and Ollama model weights |
-| Update check | On app launch, then periodically | Checks `github.com/stenolabs/stenoai` for new releases |
+| System speech asset | First use of an Apple locale | macOS installs the selected SpeechTranscriber locale when it is not already present |
+| Optional model download | When you choose Parakeet, Whisper, or a bundled Ollama model | Downloads the explicitly selected fallback/model weights |
+| Update check | On app launch, then periodically | Checks `github.com/audreyt/stenoai` for fork releases |
 | Anonymous usage analytics | On events like recording start/stop, transcription/summarization completion, and errors | Anonymous product-usage telemetry (event names and counts only -- never meeting content); on by default, can be turned off in **Settings → Advanced** |
 
-None of these requests include your audio, transcript, or summary content. To verify this yourself, you can monitor network traffic with [Little Snitch](https://www.obdev.at/products/littlesnitch/) or macOS's built-in `nettop` while Steno is processing a recording.
+Audio never leaves the machine. Transcript-derived prompts go to the configured summary/chat endpoint; with the maintained Ornith profile, that traffic stays on loopback. Monitor the process with [Little Snitch](https://www.obdev.at/products/littlesnitch/) or macOS `nettop` if you want to inspect the connection directly.
 
 ## Where your data is stored
 

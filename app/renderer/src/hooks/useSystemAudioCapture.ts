@@ -61,10 +61,9 @@ export function useSystemAudioCapture() {
   const systemAudio = useSystemAudioSetting();
   const systemAudioSupport = useSystemAudioSupport();
   const engineQuery = useTranscriptionEngine();
-  // Whisper recordings have no live transcript: the transcribe-stream
-  // sidecar isn't spawned by main.js, so any chunks we'd push would be
-  // silently dropped. Skip the tap setup entirely on whisper.
-  const liveTapEnabled = (engineQuery.data ?? 'parakeet') === 'parakeet';
+  // Apple and Parakeet both consume the 16 kHz live tap. Whisper is post-stop
+  // only, so pushing these chunks would be wasted work.
+  const liveTapEnabled = (engineQuery.data ?? 'apple') !== 'whisper';
   // Read into a ref so the tap callback (closed over once at startCapture)
   // can be a no-op if the engine flips mid-recording without rebuilding
   // the AudioContext graph.
@@ -175,7 +174,9 @@ export function useSystemAudioCapture() {
       sysStreamRef.current?.getTracks().forEach((t) => t.stop());
       mixedStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-        audioCtxRef.current.close().catch(() => { /* already closed */ });
+        audioCtxRef.current.close().catch(() => {
+          /* already closed */
+        });
       }
       micStreamRef.current = null;
       sysStreamRef.current = null;
@@ -226,9 +227,15 @@ export function useSystemAudioCapture() {
             })
           ).device_id;
         } catch (micPrefErr) {
-          console.warn('[systemAudioCapture] failed to read microphone preference, using system default', micPrefErr);
+          console.warn(
+            '[systemAudioCapture] failed to read microphone preference, using system default',
+            micPrefErr
+          );
         }
-        if (cancelled()) { stopAcquired(); return; }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
         try {
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -252,7 +259,10 @@ export function useSystemAudioCapture() {
             micErr instanceof DOMException &&
             (micErr.name === 'OverconstrainedError' || micErr.name === 'NotFoundError');
           if (!pinnedDeviceId || !isMissingDeviceError) throw micErr;
-          console.warn('[systemAudioCapture] pinned microphone unavailable, falling back to system default', micErr);
+          console.warn(
+            '[systemAudioCapture] pinned microphone unavailable, falling back to system default',
+            micErr
+          );
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               echoCancellation: true,
@@ -261,7 +271,10 @@ export function useSystemAudioCapture() {
             },
           });
         }
-        if (cancelled()) { stopAcquired(); return; }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
         micStreamRef.current = micStream;
 
         // 2. System audio loopback — OPTIONAL + BEST-EFFORT. Skipped entirely
@@ -281,12 +294,18 @@ export function useSystemAudioCapture() {
             throw new Error('loopback disabled');
           }
           await bridge.recording.enableLoopbackAudio();
-          if (cancelled()) { stopAcquired(); return; }
+          if (cancelled()) {
+            stopAcquired();
+            return;
+          }
           sysStream = await navigator.mediaDevices.getDisplayMedia({
             video: true,
             audio: true,
           });
-          if (cancelled()) { stopAcquired(); return; }
+          if (cancelled()) {
+            stopAcquired();
+            return;
+          }
           sysStream.getVideoTracks().forEach((t) => {
             t.stop();
             sysStream!.removeTrack(t);
@@ -315,12 +334,19 @@ export function useSystemAudioCapture() {
               void bridge.settings.showSystemAudioMicOnlyNotification();
             }
             // eslint-disable-next-line no-console
-            console.warn('[systemAudioCapture] loopback unavailable, continuing mic-only', loopbackErr);
+            console.warn(
+              '[systemAudioCapture] loopback unavailable, continuing mic-only',
+              loopbackErr
+            );
           }
           sysStream?.getTracks().forEach((t) => t.stop());
           sysStream = null;
           sysStreamRef.current = null;
-          try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+          try {
+            await bridge.recording.disableLoopbackAudio();
+          } catch {
+            /* */
+          }
         }
 
         // 3. Build the stereo graph. AudioContext at 48 kHz matches the
@@ -361,8 +387,8 @@ export function useSystemAudioCapture() {
         }
 
         const merger = ctx.createChannelMerger(2);
-        micGain.connect(merger, 0, 0);  // mic → L
-        if (sysGain) sysGain.connect(merger, 0, 1);  // sys → R (silent when mic-only)
+        micGain.connect(merger, 0, 0); // mic → L
+        if (sysGain) sysGain.connect(merger, 0, 1); // sys → R (silent when mic-only)
 
         const dest = ctx.createMediaStreamDestination();
         merger.connect(dest);
@@ -395,12 +421,12 @@ export function useSystemAudioCapture() {
         //     downstream consumer to fire — no audio plays.
         if (liveTapEnabledRef.current) {
           const tapMerger = ctx.createChannelMerger(2);
-          micGain.connect(tapMerger, 0, 0);  // mic → L
-          if (sysGain) sysGain.connect(tapMerger, 0, 1);  // sys → R (silent when mic-only)
+          micGain.connect(tapMerger, 0, 0); // mic → L
+          if (sysGain) sysGain.connect(tapMerger, 0, 1); // sys → R (silent when mic-only)
 
-          const TAP_BUFFER = 4096;       // 48 kHz frames per callback (~85 ms)
-          const DECIMATION = 3;           // 48 kHz / 16 kHz
-          const SEND_FRAMES = 4096;       // 16 kHz stereo frames per IPC push (~256 ms)
+          const TAP_BUFFER = 4096; // 48 kHz frames per callback (~85 ms)
+          const DECIMATION = 3; // 48 kHz / 16 kHz
+          const SEND_FRAMES = 4096; // 16 kHz stereo frames per IPC push (~256 ms)
           const tapNode = ctx.createScriptProcessor(TAP_BUFFER, 2, 2);
           const micTapBuffer: number[] = [];
           const sysTapBuffer: number[] = [];
@@ -496,7 +522,7 @@ export function useSystemAudioCapture() {
                 // eslint-disable-next-line no-console
                 console.error('[systemAudioCapture] chunk append failed:', res.error);
                 bridge.recording.reportCaptureError(
-                  `Recording may be incomplete: ${res.error || 'failed to write audio'}`,
+                  `Recording may be incomplete: ${res.error || 'failed to write audio'}`
                 );
               }
             })
@@ -541,9 +567,7 @@ export function useSystemAudioCapture() {
         };
 
         const micBuf = new Uint8Array(new ArrayBuffer(micAnalyser.fftSize));
-        const sysBuf = sysAnalyser
-          ? new Uint8Array(new ArrayBuffer(sysAnalyser.fftSize))
-          : null;
+        const sysBuf = sysAnalyser ? new Uint8Array(new ArrayBuffer(sysAnalyser.fftSize)) : null;
         let lastActiveAtMs = Date.now();
         // Latch the in-flight stop attempt instead of tearing the
         // interval down: a stop failure (Python crash, queue lock, race
@@ -581,7 +605,7 @@ export function useSystemAudioCapture() {
         {
           const armedCfg = silenceConfigRef.current;
           logAutoStop(
-            `armed: enabled=${armedCfg.enabled} minutes=${armedCfg.minutes} systemAudio=${sysAnalyser !== null}`,
+            `armed: enabled=${armedCfg.enabled} minutes=${armedCfg.minutes} systemAudio=${sysAnalyser !== null}`
           );
         }
 
@@ -595,11 +619,7 @@ export function useSystemAudioCapture() {
             lastActiveAtMs = Date.now();
             // Log the idle transition once (not every tick) so the Developer
             // log shows WHY the timer keeps resetting.
-            const reason = !cfg.enabled
-              ? 'disabled'
-              : isPausedRef.current
-                ? 'paused'
-                : 'inactive';
+            const reason = !cfg.enabled ? 'disabled' : isPausedRef.current ? 'paused' : 'inactive';
             if (reason !== idleReason) {
               idleReason = reason;
               logAutoStop(`idle (${reason}) - timer reset`);
@@ -621,7 +641,7 @@ export function useSystemAudioCapture() {
             if (wasSilent) {
               wasSilent = false;
               logAutoStop(
-                `activity (mic=${micRms.toFixed(4)} sys=${sysRms.toFixed(4)}) - timer reset`,
+                `activity (mic=${micRms.toFixed(4)} sys=${sysRms.toFixed(4)}) - timer reset`
               );
             }
             lastActiveAtMs = Date.now();
@@ -630,9 +650,7 @@ export function useSystemAudioCapture() {
           if (!wasSilent) {
             wasSilent = true;
             lastHeartbeatAtMs = Date.now();
-            logAutoStop(
-              `silence started (mic=${micRms.toFixed(4)} sys=${sysRms.toFixed(4)})`,
-            );
+            logAutoStop(`silence started (mic=${micRms.toFixed(4)} sys=${sysRms.toFixed(4)})`);
           }
           const silenceMs = Date.now() - lastActiveAtMs;
           const limitMs = cfg.minutes * 60 * 1000;
@@ -644,7 +662,7 @@ export function useSystemAudioCapture() {
             const elapsedSec = Math.round((Date.now() - lastActiveAtMs) / 1000);
             const limitSec = Math.round(limitMs / 1000);
             logAutoStop(
-              `still silent ${elapsedSec}s / ${limitSec}s (mic=${micRms.toFixed(4)} sys=${sysRms.toFixed(4)})`,
+              `still silent ${elapsedSec}s / ${limitSec}s (mic=${micRms.toFixed(4)} sys=${sysRms.toFixed(4)})`
             );
           }
           if (silenceMs < limitMs) return;
@@ -721,16 +739,24 @@ export function useSystemAudioCapture() {
         activeRef.current = false;
         // Close any file opened before the failure so we don't leak the
         // main-side write stream (no-op if open never ran).
-        try { await bridge.recording.closeSystemAudioFile(); } catch { /* */ }
+        try {
+          await bridge.recording.closeSystemAudioFile();
+        } catch {
+          /* */
+        }
         // Tell main to drop the stuck "recording" pill — its optimistic
         // systemAudioRecordingActive flag was set on start-recording-ui.
         bridge.recording.reportSystemAudioState(false);
         // Surface the failure to the user (native notification) — otherwise a
         // denied mic permission looks like a silent no-op.
         bridge.recording.reportCaptureError(
-          err instanceof Error ? err.message : 'Recording could not start',
+          err instanceof Error ? err.message : 'Recording could not start'
         );
-        try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+        try {
+          await bridge.recording.disableLoopbackAudio();
+        } catch {
+          /* */
+        }
       }
     };
 
@@ -744,7 +770,11 @@ export function useSystemAudioCapture() {
       const recorder = recorderRef.current;
       if (!recorder || recorder.state === 'inactive') {
         teardownStreams();
-        try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+        try {
+          await bridge.recording.disableLoopbackAudio();
+        } catch {
+          /* */
+        }
         bridge.recording.reportSystemAudioState(false);
         return;
       }
@@ -777,7 +807,8 @@ export function useSystemAudioCapture() {
                 saveNotes: async (n, notes) => unwrap(await bridge.meetings.saveNotes(n, notes)),
                 processRecording: (fp, n) => bridge.recording.processSystemAudio(fp, n),
                 // eslint-disable-next-line no-console
-                onFlushError: (err) => console.error('[systemAudioCapture] notes flush failed', err),
+                onFlushError: (err) =>
+                  console.error('[systemAudioCapture] notes flush failed', err),
               });
             }
           } catch (err) {
@@ -785,7 +816,11 @@ export function useSystemAudioCapture() {
             console.error('[systemAudioCapture] handoff failed', err);
           } finally {
             teardownStreams();
-            try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+            try {
+              await bridge.recording.disableLoopbackAudio();
+            } catch {
+              /* */
+            }
             bridge.recording.reportSystemAudioState(false);
             resolve();
           }
@@ -801,15 +836,9 @@ export function useSystemAudioCapture() {
     // (read via loopbackEnabledRef inside startCapture).
     if (status === 'recording' && !activeRef.current) {
       void startCapture();
-    } else if (
-      status === 'paused' &&
-      recorderRef.current?.state === 'recording'
-    ) {
+    } else if (status === 'paused' && recorderRef.current?.state === 'recording') {
       recorderRef.current.pause();
-    } else if (
-      status === 'recording' &&
-      recorderRef.current?.state === 'paused'
-    ) {
+    } else if (status === 'recording' && recorderRef.current?.state === 'paused') {
       recorderRef.current.resume();
     } else if (
       (status === 'idle' || status === 'processing') &&
@@ -851,9 +880,7 @@ export function useSystemAudioCapture() {
       // ondataavailable); fall back to an immediate chain when there's no live
       // recorder. Best-effort either way — unmount cleanup can't await.
       const closeFile = () => {
-        void appendChainRef.current.finally(() =>
-          bridge.recording.closeSystemAudioFile(),
-        );
+        void appendChainRef.current.finally(() => bridge.recording.closeSystemAudioFile());
       };
       const recorder = recorderRef.current;
       // activeRef.current is still true only when THIS unmount owns the live
@@ -862,20 +889,30 @@ export function useSystemAudioCapture() {
       const hadOpenFile = activeRef.current;
       if (hadOpenFile && recorder && recorder.state !== 'inactive') {
         recorder.onstop = closeFile;
-        try { recorder.stop(); } catch { closeFile(); }
+        try {
+          recorder.stop();
+        } catch {
+          closeFile();
+        }
       } else if (hadOpenFile) {
         // Open file but no live recorder (failed mid-start) — close directly.
         closeFile();
       } else if (recorder && recorder.state !== 'inactive') {
         // stopCapture is handling the stop; just ensure the recorder stops
         // without overwriting its onstop flush+close handoff.
-        try { recorder.stop(); } catch { /* already stopping */ }
+        try {
+          recorder.stop();
+        } catch {
+          /* already stopping */
+        }
       }
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       sysStreamRef.current?.getTracks().forEach((t) => t.stop());
       mixedStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-        audioCtxRef.current.close().catch(() => { /* already closed */ });
+        audioCtxRef.current.close().catch(() => {
+          /* already closed */
+        });
       }
       micStreamRef.current = null;
       sysStreamRef.current = null;

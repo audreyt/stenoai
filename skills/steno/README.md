@@ -1,7 +1,7 @@
 # steno
 
 A skill that makes an AI agent aware of your local
-[Steno](https://github.com/stenolabs/stenoai) meeting notes, so you can run
+[Steno](https://github.com/audreyt/stenoai) meeting notes, so you can run
 `/steno` (or just mention your meetings) and have the agent pull the right notes
 in and act on them — answer a question, recap your week, extract action items, or
 use the meetings as source material to draft a spec, PRD, or follow-up.
