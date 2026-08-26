@@ -232,11 +232,12 @@ class AppleInteractiveQueryFallbackTests(unittest.TestCase):
         client.chat.return_value = [{"message": {"content": c}} for c in chunks]
         return client
 
-    def test_refusal_before_first_chunk_falls_back(self):
+    def test_refusal_before_first_chunk_falls_back_when_installed(self):
         s = self._apple_summarizer()
         refusal = RuntimeError("Apple Intelligence request failed")
         with mock.patch("src.apple_lm.is_apple_system_model", side_effect=_only_apple_sentinel), \
              mock.patch("src.apple_lm.stream_complete", side_effect=_gen_raising(refusal)), \
+             mock.patch("src.summarizer._is_ollama_model_installed", return_value=True), \
              mock.patch.object(OllamaSummarizer, "_ensure_ollama_ready", return_value=True), \
              mock.patch(
                  "src.summarizer.ollama.Client",
@@ -244,6 +245,26 @@ class AppleInteractiveQueryFallbackTests(unittest.TestCase):
              ):
             out = list(s.query_transcript_streaming_strict("You: Ana owns the migration.", "Who owns it?"))
         self.assertEqual("".join(out), "Ana owns it.")
+
+    def test_refusal_does_not_fall_back_or_pull_when_model_not_installed(self):
+        """Rule: Apple refusal fallback must never download a missing model.
+
+        When the downgrade model is not installed locally, the original Apple
+        exception must propagate immediately without initializing Ollama or
+        calling chat.
+        """
+        s = self._apple_summarizer()
+        refusal = RuntimeError("Apple Intelligence request failed: guardrail refusal")
+        fallback_client = mock.Mock()
+        with mock.patch("src.apple_lm.is_apple_system_model", side_effect=_only_apple_sentinel), \
+             mock.patch("src.apple_lm.stream_complete", side_effect=_gen_raising(refusal)), \
+             mock.patch("src.summarizer._is_ollama_model_installed", return_value=False), \
+             mock.patch.object(OllamaSummarizer, "_ensure_ollama_ready", return_value=True), \
+             mock.patch("src.summarizer.ollama.Client", return_value=fallback_client):
+            with self.assertRaises(RuntimeError) as ctx:
+                list(s.query_transcript_streaming_strict("You: Ana owns the migration.", "Who owns it?"))
+        self.assertIs(ctx.exception, refusal)
+        fallback_client.chat.assert_not_called()
 
     def test_fallback_uses_the_downgrade_model_not_the_apple_sentinel(self):
         s = self._apple_summarizer()
@@ -257,6 +278,7 @@ class AppleInteractiveQueryFallbackTests(unittest.TestCase):
         client.chat.side_effect = _capture
         with mock.patch("src.apple_lm.is_apple_system_model", side_effect=_only_apple_sentinel), \
              mock.patch("src.apple_lm.stream_complete", side_effect=_gen_raising(RuntimeError("boom"))), \
+             mock.patch("src.summarizer._is_ollama_model_installed", return_value=True), \
              mock.patch.object(OllamaSummarizer, "_ensure_ollama_ready", return_value=True), \
              mock.patch("src.summarizer.ollama.Client", return_value=client):
             list(s.query_transcript_streaming_strict("You: hi.", "What?"))
@@ -270,7 +292,6 @@ class AppleInteractiveQueryFallbackTests(unittest.TestCase):
             f"fallback asked for {seen['model']!r}, expected the "
             f"{Config.DEFAULT_MODEL!r} family",
         )
-
     def test_failure_after_a_chunk_propagates_without_duplicating(self):
         s = self._apple_summarizer()
         err = RuntimeError("Apple Intelligence stream timed out")

@@ -151,6 +151,31 @@ def resolve_num_ctx(model_name: str) -> int:
     base = _OLLAMA_MODEL_NUM_CTX.get(model_name, OLLAMA_NUM_CTX_DEFAULT)
     return max(OLLAMA_NUM_CTX_FLOOR, min(base, OLLAMA_NUM_CTX_CEILING))
 
+def _is_ollama_model_installed(model_name: str, host: Optional[str] = None) -> bool:
+    """Fast check whether a model (resolved for runtime tag) is installed in Ollama.
+
+    Guards against OllamaSummarizer.__init__ triggering a multi-GB model download
+    during interactive error fallbacks. Times out in 2 seconds; returns False on
+    unreachable Ollama or missing model.
+    """
+    from src.config import resolve_runtime_tag
+    target = resolve_runtime_tag(model_name)
+    try:
+        import httpx
+        url = f"{host.rstrip('/')}/api/tags" if host else "http://127.0.0.1:11434/api/tags"
+        resp = httpx.get(url, timeout=2.0)
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+        models = data.get("models", []) or []
+        for m in models:
+            name = m.get("name") or m.get("model") or ""
+            if name == target or name.split(":")[0] == target:
+                return True
+        return False
+    except Exception:
+        return False
+
 
 class OllamaSummarizer:
     def __init__(self, model_name: Optional[str] = None, ai_provider: Optional[str] = None, config: Optional['Config'] = None):
@@ -2023,9 +2048,12 @@ PRE-MEETING BRIEF:"""
                 return
             except TimeoutError:
                 raise
-            except Exception:
+            except Exception as apple_exc:
                 if emitted or is_apple_system_model(Config.DEFAULT_MODEL):
                     raise
+                fallback_host = self.remote_url if self.ai_provider == "remote" else None
+                if not _is_ollama_model_installed(Config.DEFAULT_MODEL, host=fallback_host):
+                    raise apple_exc
                 logger.warning(
                     "Apple Intelligence refused brief query; falling back to %s",
                     Config.DEFAULT_MODEL,
@@ -2124,7 +2152,7 @@ PRE-MEETING BRIEF:"""
                 # and keep the Apple attempt short enough (below) that a merely
                 # slow sidecar still leaves budget for the fallback.
                 raise
-            except Exception:
+            except Exception as apple_exc:
                 # Apple Intelligence reports itself available and then refuses
                 # individual requests: its guardrails reject some entirely
                 # ordinary meeting content (measured — a transcript line naming
@@ -2136,8 +2164,18 @@ PRE-MEETING BRIEF:"""
                 # mid-answer (falling back would duplicate text already
                 # yielded), and a downgrade target that is itself the Apple
                 # sentinel (falling back would re-enter this arm forever).
+                #
+                # Rule: The Apple-refusal fallback must NEVER download a model.
+                # Constructing OllamaSummarizer runs _ensure_ollama_ready, which
+                # pulls the model when absent — a silent multi-GB download
+                # standing in for an answer is a user-visible hang. If the
+                # resolved fallback model is not already installed, or Ollama
+                # is unreachable, re-raise the original Apple exception.
                 if emitted or is_apple_system_model(Config.DEFAULT_MODEL):
                     raise
+                fallback_host = self.remote_url if self.ai_provider == "remote" else None
+                if not _is_ollama_model_installed(Config.DEFAULT_MODEL, host=fallback_host):
+                    raise apple_exc
                 logger.warning(
                     "Apple Intelligence refused an interactive query; "
                     "falling back to %s", Config.DEFAULT_MODEL

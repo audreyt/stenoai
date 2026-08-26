@@ -541,6 +541,117 @@ class StrictQueryStreamingTests(unittest.TestCase):
 
         self.assertEqual(chunks, ["\n[Error: provider unavailable]"])
 
+class FinishedNoteQueryBudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = CliRunner()
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _make_config(self, model="apple:system", provider="local"):
+        cfg = mock.MagicMock()
+        cfg.get_model.return_value = model
+        cfg.get_ai_provider.return_value = provider
+        cfg.get_language.return_value = "en"
+        cfg.get_language_name.return_value = "English"
+        return cfg
+
+    def test_finished_note_query_streaming_trims_over_budget_apple_system(self):
+        """Over-budget note transcript is trimmed newest-first with omission marker."""
+        large_text = "\n".join(f"Line {i:04d}: discussing point number {i} in detail." for i in range(1500))
+        self.assertGreater(len(large_text), 50_000)
+        note_file = os.path.join(self.temp_dir.name, "large_note.txt")
+        with open(note_file, "w", encoding="utf-8") as f:
+            f.write(large_text)
+
+        captured_transcripts = []
+
+        def _mock_query_streaming(transcript, question, language="en", history=None):
+            captured_transcripts.append(transcript)
+            yield "Answer chunk"
+
+        mock_summarizer = mock.MagicMock()
+        mock_summarizer.query_transcript_streaming.side_effect = _mock_query_streaming
+
+        cfg = self._make_config(model="apple:system", provider="local")
+        with mock.patch("src.config.get_config", return_value=cfg), \
+             mock.patch("simple_recorder.OllamaSummarizer", return_value=mock_summarizer):
+            res = self.runner.invoke(
+                simple_recorder.cli,
+                ["query-streaming", note_file, "-q", "What were the decisions?"],
+            )
+
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(captured_transcripts), 1)
+        passed_transcript = captured_transcripts[0]
+        budget = simple_recorder._live_query_transcript_budget("local", "apple:system")
+        self.assertLessEqual(len(passed_transcript), budget)
+        self.assertTrue(passed_transcript.startswith("[earlier transcript omitted]\n"))
+        self.assertIn("Line 1499", passed_transcript)
+        self.assertNotIn("Line 0001:", passed_transcript)
+
+    def test_finished_note_query_streaming_leaves_small_note_untouched(self):
+        """Small note transcript within budget is passed untouched byte-for-byte."""
+        small_text = "Alice: We decided to deploy AFM.\nBob: Sounds good."
+        note_file = os.path.join(self.temp_dir.name, "small_note.txt")
+        with open(note_file, "w", encoding="utf-8") as f:
+            f.write(small_text)
+
+        captured_transcripts = []
+
+        def _mock_query_streaming(transcript, question, language="en", history=None):
+            captured_transcripts.append(transcript)
+            yield "Answer chunk"
+
+        mock_summarizer = mock.MagicMock()
+        mock_summarizer.query_transcript_streaming.side_effect = _mock_query_streaming
+
+        cfg = self._make_config(model="apple:system", provider="local")
+        with mock.patch("src.config.get_config", return_value=cfg), \
+             mock.patch("simple_recorder.OllamaSummarizer", return_value=mock_summarizer):
+            res = self.runner.invoke(
+                simple_recorder.cli,
+                ["query-streaming", note_file, "-q", "What did Alice say?"],
+            )
+
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(captured_transcripts), 1)
+        passed_transcript = captured_transcripts[0]
+        self.assertEqual(passed_transcript, small_text)
+        self.assertNotIn("[earlier transcript omitted]", passed_transcript)
+
+    def test_finished_note_query_non_streaming_trims_over_budget(self):
+        """Non-streaming query command also trims over-budget transcript."""
+        large_text = "\n".join(f"Line {i:04d}: discussing topic {i}" for i in range(1200))
+        note_file = os.path.join(self.temp_dir.name, "large_note_sync.txt")
+        with open(note_file, "w", encoding="utf-8") as f:
+            f.write(large_text)
+
+        captured_transcripts = []
+
+        def _mock_query(transcript, question, language="en", history=None):
+            captured_transcripts.append(transcript)
+            return "Sync answer"
+
+        mock_summarizer = mock.MagicMock()
+        mock_summarizer.query_transcript.side_effect = _mock_query
+
+        cfg = self._make_config(model="apple:system", provider="local")
+        with mock.patch("src.config.get_config", return_value=cfg), \
+             mock.patch("simple_recorder.OllamaSummarizer", return_value=mock_summarizer):
+            res = self.runner.invoke(
+                simple_recorder.cli,
+                ["query", note_file, "-q", "Summary of topics?"],
+            )
+
+        self.assertEqual(res.exit_code, 0)
+        self.assertEqual(len(captured_transcripts), 1)
+        passed_transcript = captured_transcripts[0]
+        budget = simple_recorder._live_query_transcript_budget("local", "apple:system")
+        self.assertLessEqual(len(passed_transcript), budget)
+        self.assertTrue(passed_transcript.startswith("[earlier transcript omitted]\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

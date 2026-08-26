@@ -3995,6 +3995,38 @@ def regen_title(summary_file):
         print(f"ERROR: Failed to regenerate title: {e}")
         sys.exit(1)
 
+MAX_LIVE_QUERY_STDIN_BYTES = 1024 * 1024  # 1 MiB
+MAX_LIVE_QUERY_TRANSCRIPT_CHARS = 100_000
+MAX_LIVE_QUERY_QUESTION_CHARS = 2_000
+MAX_LIVE_QUERY_ANSWER_BYTES = 1024 * 1024  # 1 MiB
+
+
+def _live_query_transcript_budget(ai_provider: str, model: str) -> int:
+    """Char budget for the transcript query, sized to the active model.
+
+    Matches _chat_corpus_char_budget: generous for cloud/adapter, derived from
+    resolve_num_ctx for local/remote Ollama/Apple LM models.
+    """
+    if ai_provider in ("local", "remote"):
+        from src.summarizer import resolve_num_ctx
+        return int(resolve_num_ctx(model) * 3.5 * 0.55)
+    return 400_000
+
+
+def _trim_live_transcript(transcript: str, budget: int) -> str:
+    """Trim transcript oldest-first by whole leading lines until it fits budget."""
+    if len(transcript) <= budget:
+        return transcript
+    marker = "[earlier transcript omitted]"
+    lines = transcript.split("\n")
+    for i in range(1, len(lines)):
+        candidate = marker + "\n" + "\n".join(lines[i:])
+        if len(candidate) <= budget:
+            return candidate
+    if len(marker) <= budget:
+        return marker
+    return ""
+
 
 @cli.command()
 @click.argument('transcript_file')
@@ -4088,8 +4120,16 @@ def query(transcript_file, question):
         language = resolve_persisted_output_language(
             session_info, detect_text or transcript_text, config.get_language()
         )
+        ai_provider = config.get_ai_provider()
+        model = config.get_model()
+        raw_budget = _live_query_transcript_budget(ai_provider, model)
+        effective_budget = min(MAX_LIVE_QUERY_TRANSCRIPT_CHARS, raw_budget)
+        trimmed_transcript = _trim_live_transcript(transcript_text.strip(), effective_budget)
+        if not trimmed_transcript or not trimmed_transcript.strip():
+            print(json.dumps({"success": False, "error": "Transcript is empty"}))
+            return
         summarizer = OllamaSummarizer()
-        answer = summarizer.query_transcript(transcript_text, question, language=language)
+        answer = summarizer.query_transcript(trimmed_transcript, question, language=language)
 
         if answer:
             print(json.dumps({"success": True, "answer": answer}))
@@ -4166,7 +4206,12 @@ def query_streaming(transcript_file, question):
             print(f"STREAM_ERROR:Failed to read file: {e}", flush=True)
             return
 
+    if not transcript_text or transcript_text.strip() == "":
+        print("STREAM_ERROR:Transcript is empty", flush=True)
+        return
+
     from src.config import get_config
+    config = get_config()
     # Provenance-aware: honour the note's saved language only when it was a real
     # pin or a Whisper detection, else re-detect (over the RAW transcript) so a
     # stale Parakeet "en" (#283) doesn't lock chat to English. CLI contract
@@ -4174,10 +4219,18 @@ def query_streaming(transcript_file, question):
     language = resolve_persisted_output_language(
         session_info, detect_text or transcript_text, get_config().get_language()
     )
+    ai_provider = config.get_ai_provider()
+    model = config.get_model()
+    raw_budget = _live_query_transcript_budget(ai_provider, model)
+    effective_budget = min(MAX_LIVE_QUERY_TRANSCRIPT_CHARS, raw_budget)
+    trimmed_transcript = _trim_live_transcript(transcript_text.strip(), effective_budget)
+    if not trimmed_transcript or not trimmed_transcript.strip():
+        print("STREAM_ERROR:Transcript is empty", flush=True)
+        return
 
     try:
         summarizer = OllamaSummarizer()
-        for chunk in summarizer.query_transcript_streaming(transcript_text, question, language=language):
+        for chunk in summarizer.query_transcript_streaming(trimmed_transcript, question, language=language):
             encoded = base64.b64encode(chunk.encode('utf-8')).decode('ascii')
             sys.stdout.write(f"CHAT_CHUNK:{encoded}\n")
             sys.stdout.flush()
@@ -4360,31 +4413,6 @@ def query_live_streaming(ctx):
         sys.exit(1)
 
 
-def _live_query_transcript_budget(ai_provider: str, model: str) -> int:
-    """Char budget for the live transcript query, sized to the active model.
-
-    Matches _chat_corpus_char_budget: generous for cloud/adapter, derived from
-    resolve_num_ctx for local/remote Ollama/Apple LM models.
-    """
-    if ai_provider in ("local", "remote"):
-        from src.summarizer import resolve_num_ctx
-        return int(resolve_num_ctx(model) * 3.5 * 0.55)
-    return 400_000
-
-
-def _trim_live_transcript(transcript: str, budget: int) -> str:
-    """Trim transcript oldest-first by whole leading lines until it fits budget."""
-    if len(transcript) <= budget:
-        return transcript
-    marker = "[earlier transcript omitted]"
-    lines = transcript.split("\n")
-    for i in range(1, len(lines)):
-        candidate = marker + "\n" + "\n".join(lines[i:])
-        if len(candidate) <= budget:
-            return candidate
-    if len(marker) <= budget:
-        return marker
-    return ""
 
 
 _ENGLISH_STOPWORDS = {
