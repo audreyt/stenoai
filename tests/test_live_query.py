@@ -372,6 +372,16 @@ class QueryPromptHistoryTests(unittest.TestCase):
         self.assertIn("QUESTION: What did we decide?", baseline)
         self.assertIn("TRANSCRIPT_BODY", baseline)
 
+    def test_query_prompt_contains_transcript_header_and_no_parroting_refusal(self):
+        prompt = self._prompt()
+        self.assertIn("TRANSCRIPT:\nTRANSCRIPT_BODY", prompt)
+        self.assertIn(
+            "If the transcript below contains no speech, reply that there is no meeting content yet.",
+            prompt,
+        )
+        self.assertNotIn("Only say you don't know", prompt)
+        self.assertNotIn("topic truly wasn't discussed", prompt)
+
     def test_history_renders_in_order_between_question_and_transcript(self):
         prompt = self._prompt(
             history=[
