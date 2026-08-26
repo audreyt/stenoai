@@ -49,6 +49,7 @@ private func printStatus() throws {
     switch model.availability {
     case .available:
         var payload: [String: Any] = ["available": true]
+        #if STENO_HAS_MODEL_VARIANT
         if #available(macOS 27.0, *) {
             let variant = model.variant
             if variant == .coreAdvanced3 {
@@ -63,6 +64,9 @@ private func printStatus() throws {
             payload["variant"] = "core3"
             payload["display_name"] = "Apple Intelligence"
         }
+        #else
+        payload["display_name"] = "Apple Intelligence"
+        #endif
         try printJSON(payload)
     case .unavailable(let reason):
         try printJSON([

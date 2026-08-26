@@ -60,7 +60,9 @@ class SetupCheckJsonTests(unittest.TestCase):
         """A failing check (❌) flips its record to status=fail/ok=false and drives
         allGood to false — the JSON verdict tracks the same emoji logic the human
         report uses."""
-        with patch("src.ollama_manager.get_ollama_binary", return_value=None):
+        with patch("src.ollama_manager.get_ollama_binary", return_value=None), patch(
+            "src.apple_lm.apple_lm_available", return_value=False
+        ):
             res = CliRunner().invoke(simple_recorder.setup_check, ["--json"])
         self.assertEqual(res.exit_code, 0, res.output)
 
@@ -70,6 +72,24 @@ class SetupCheckJsonTests(unittest.TestCase):
         self.assertEqual(ollama["status"], "fail")
         self.assertFalse(ollama["ok"])
         self.assertFalse(data["allGood"])
+
+    def test_missing_ollama_is_optional_when_apple_intelligence_is_available(self):
+        with patch("simple_recorder.sys.platform", "darwin"), patch(
+            "src.ollama_manager.get_ollama_binary", return_value=None
+        ), patch(
+            "src.apple_lm.apple_lm_available", return_value=True
+        ), patch(
+            "src.apple_lm.apple_lm_status",
+            return_value={"available": True, "display_name": "Apple Intelligence"},
+        ):
+            res = CliRunner().invoke(simple_recorder.setup_check, ["--json"])
+
+        self.assertEqual(res.exit_code, 0, res.output)
+        data = _only_json(res.output)
+        ollama = next(c for c in data["checks"] if c["name"] == "Ollama")
+        self.assertEqual(ollama["status"], "warn")
+        self.assertTrue(ollama["ok"])
+        self.assertIn("Apple Intelligence is available", ollama["detail"])
 
     def test_human_output_unchanged_without_flag(self):
         """No flag → the human banner is still printed and no JSON object appears."""
