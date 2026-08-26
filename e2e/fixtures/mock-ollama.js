@@ -21,7 +21,7 @@ const OLLAMA_PORT = 11434;
 /**
  * Start the mock Ollama on 11434 (or a custom/ephemeral port).
  * @param {object} [opts]
- * @param {number} [opts.port=11434] port to bind (pass 0 for ephemeral port).
+ * @param {number} [opts.port=0] port to bind (0 for ephemeral port).
  * @param {string} [opts.chatReply='ok'] assistant content returned by /api/chat.
  * @param {string[]} [opts.chatReplyQueue=[]] queue of replies to dequeue per call; falls back to chatReply when exhausted.
  * @param {{status:number, message:string}} [opts.chatError] when set, /api/chat responds with this HTTP
@@ -33,7 +33,7 @@ const OLLAMA_PORT = 11434;
  * @returns {Promise<{ port: number, close: () => Promise<void>, lastChatPrompt: () => string|null, chatCalls: () => number, pullCalls: () => number, remainingQueueLength: () => number, lastPulledModel: () => string|null, deleteCalls: () => number, lastDeletedModel: () => string|null }>}
  */
 function startMockOllama(opts = {}) {
-  const port = opts.port ?? OLLAMA_PORT;
+  const port = opts.port ?? 0;
   const chatReply = opts.chatReply ?? 'ok';
   const chatReplyQueue = Array.isArray(opts.chatReplyQueue) ? [...opts.chatReplyQueue] : [];
   const chatError = opts.chatError ?? null;
