@@ -206,22 +206,24 @@
     },
     "dmg": {
       "title": "Steno Installer",
+      "background": "build/background.png",
+      "iconSize": 110,
       "contents": [
         {
-          "x": 130,
-          "y": 220,
+          "x": 140,
+          "y": 245,
           "type": "file"
         },
         {
-          "x": 410,
-          "y": 220,
+          "x": 500,
+          "y": 245,
           "type": "link",
           "path": "/Applications"
         }
       ],
       "window": {
-        "width": 540,
-        "height": 380
+        "width": 640,
+        "height": 420
       },
       "artifactName": "stenoAI-macos-${version}-${arch}.${ext}",
       "sign": true

@@ -18,6 +18,8 @@ app/build/*
 !app/build/icon.icns
 !app/build/icon-dragonfly.icns
 !app/build/icon.ico
+!app/build/background.png
+!app/build/background@2x.png
 develop-eggs/
 dist/
 downloads/
