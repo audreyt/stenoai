@@ -5080,6 +5080,13 @@ def setup_check(as_json):
         else:
             dir_path.mkdir(parents=True, exist_ok=True)
             checks.append((f"✅ {dir_name}/", f"created at {dir_path}"))
+
+    # Apple Intelligence is a complete local summarization backend on its own.
+    # Resolve it before checking Ollama so a macOS build that intentionally
+    # omits the Ollama executable does not get trapped in onboarding even
+    # though its selected on-device model is ready.
+    from src.apple_lm import apple_lm_available, apple_lm_status
+    apple_system_lm_available = sys.platform == "darwin" and apple_lm_available()
     
     # Check Ollama - use bundled or system Ollama
     try:
@@ -5090,10 +5097,15 @@ def setup_check(as_json):
                 checks.append(("✅ Ollama", "bundled"))
             else:
                 checks.append(("✅ Ollama", f"found at {ollama_path}"))
+        elif apple_system_lm_available:
+            checks.append(("⚠️ Ollama", "not bundled (Apple Intelligence is available)"))
         else:
             checks.append(("❌ Ollama", "not found"))
     except Exception as e:
-        checks.append(("❌ Ollama", f"Error: {e}"))
+        if apple_system_lm_available:
+            checks.append(("⚠️ Ollama", "unavailable (Apple Intelligence is available)"))
+        else:
+            checks.append(("❌ Ollama", f"Error: {e}"))
     
     # Check ffmpeg (bundled locations first, then system)
     try:
@@ -5209,8 +5221,7 @@ def setup_check(as_json):
         checks.append(("⚠️ whisper-model", "will download on first use (~500MB)"))
 
     # Check if LLM model is available (Apple System Language Model or ~/.ollama/models/)
-    from src.apple_lm import apple_lm_available, apple_lm_status
-    if sys.platform == "darwin" and apple_lm_available():
+    if apple_system_lm_available:
         status = apple_lm_status()
         variant = status.get("variant") or "available"
         checks.append(("✅ llm-model", f"Apple System Language Model ({variant})"))

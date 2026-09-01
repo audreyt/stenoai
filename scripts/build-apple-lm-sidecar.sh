@@ -27,11 +27,29 @@ mkdir -p "$ROOT/bin"
 TMP_OUT="${OUT}.tmp.$$"
 trap 'rm -f "$TMP_OUT"' EXIT
 
+# `SystemLanguageModel.variant` is a macOS 27 SDK addition. Runtime
+# availability checks alone are not enough: Xcode 26 still has to type-check
+# the member and fails before it can build the otherwise-compatible sidecar.
+# Probe the selected SDK and compile variant reporting only when that API is
+# actually present. The model itself remains available through
+# `SystemLanguageModel.default` with the macOS 26 SDK.
+SWIFT_DEFINE=""
+if xcrun swiftc \
+    -typecheck \
+    -parse-as-library \
+    -target "${ARCH}-apple-macos26.0" \
+    -framework FoundationModels \
+    -DSTENO_HAS_MODEL_VARIANT \
+    "$SRC" >/dev/null 2>&1; then
+    SWIFT_DEFINE="-DSTENO_HAS_MODEL_VARIANT"
+fi
+
 xcrun swiftc \
     -O \
     -parse-as-library \
     -target "${ARCH}-apple-macos26.0" \
     -framework FoundationModels \
+    ${SWIFT_DEFINE:+$SWIFT_DEFINE} \
     "$SRC" \
     -o "$TMP_OUT"
 
