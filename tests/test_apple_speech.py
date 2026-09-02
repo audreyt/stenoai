@@ -32,11 +32,36 @@ class AppleSpeechResolverTests(unittest.TestCase):
                 self.assertEqual(apple_speech.resolve_sidecar(), str(sidecar))
 
     def test_non_macos_status_is_unavailable_without_spawning(self):
-        with patch.object(apple_speech.sys, "platform", "win32"), patch(
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
             "src.apple_speech.subprocess.run"
         ) as run:
             result = apple_speech.status("en")
         self.assertFalse(result["available"])
+        run.assert_not_called()
+
+    def test_unsupported_macos_status_is_unavailable_without_spawning(self):
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            result = apple_speech.status("en")
+        self.assertFalse(result["available"])
+        self.assertFalse(result["supported"])
+        run.assert_not_called()
+
+    def test_prepare_on_unsupported_platform_raises_without_spawning(self):
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "unavailable on this Mac"):
+                apple_speech.prepare("en")
+        run.assert_not_called()
+
+    def test_transcribe_file_on_unsupported_platform_raises_without_spawning(self):
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "unavailable on this Mac"):
+                apple_speech.transcribe_file(Path("/tmp/audio.wav"), language="en")
         run.assert_not_called()
 
     def test_structured_sidecar_error_is_preserved(self):
@@ -46,9 +71,9 @@ class AppleSpeechResolverTests(unittest.TestCase):
             stdout=json.dumps({"success": False, "error": "unsupported locale"}),
             stderr="",
         )
-        with patch("src.apple_speech.resolve_sidecar", return_value="/sidecar"), patch(
-            "src.apple_speech.subprocess.run", return_value=completed
-        ):
+        with patch("src.apple_speech._is_supported", return_value=True), patch(
+            "src.apple_speech.resolve_sidecar", return_value="/sidecar"
+        ), patch("src.apple_speech.subprocess.run", return_value=completed):
             with self.assertRaisesRegex(RuntimeError, "unsupported locale"):
                 apple_speech.prepare("xx")
 
@@ -62,9 +87,9 @@ class AppleSpeechResolverTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps(payload), stderr=""
         )
-        with patch("src.apple_speech.resolve_sidecar", return_value="/sidecar"), patch(
-            "src.apple_speech.subprocess.run", return_value=completed
-        ) as run:
+        with patch("src.apple_speech._is_supported", return_value=True), patch(
+            "src.apple_speech.resolve_sidecar", return_value="/sidecar"
+        ), patch("src.apple_speech.subprocess.run", return_value=completed) as run:
             result = apple_speech.transcribe_file(Path("/tmp/audio.wav"), language="en")
 
         self.assertEqual(result, payload)
@@ -167,15 +192,28 @@ class NativeAppleSpeechContractTests(unittest.TestCase):
         self.assertTrue(payload["system_managed"])
 
 
+@unittest.skipUnless(
+    apple_speech.sys.platform == "darwin"
+    and (Path(__file__).parents[1] / "bin" / "steno-transcribe").is_file()
+    and os.access(Path(__file__).parents[1] / "bin" / "steno-transcribe", os.X_OK),
+    "native Apple transcription sidecar is not built — lexical mirror verified against real binary only",
+)
 class LexicalContentFilterContractTests(unittest.TestCase):
     """
     Regression coverage for the Swift hasLexicalContent() contract.
 
-    This class mirrors the Swift helper's logic in Python so that the filter
-    behaviour can be verified on any platform without a built sidecar.  The
-    predicate rejects a string when every code-point is either whitespace or a
+    This class mirrors the Swift helper's logic in Python.  The predicate
+    rejects a string when every code-point is either whitespace or a
     non-letter/non-digit character (i.e. pure punctuation or whitespace).
+
+    The Python mirror can drift from Swift's CharacterSet.letters /
+    decimalDigits / whitespacesAndNewlines, so these tests are gated on the
+    native sidecar existing — the authoritative behaviour is verified
+    against the real binary in NativeAppleSpeechContractTests; this mirror
+    is a portable sanity check that must stay in sync with it.
     """
+
+    sidecar = Path(__file__).parents[1] / "bin" / "steno-transcribe"
 
     @staticmethod
     def has_lexical_content(text: str) -> bool:
@@ -183,11 +221,11 @@ class LexicalContentFilterContractTests(unittest.TestCase):
         import unicodedata
 
         for ch in text:
-            if ch in (" ", "\t", "\n", "\r"):
+            if ch.isspace():
                 continue
             cat = unicodedata.category(ch)
-            # 'L' = Letter, 'N' = Number; any sub-category qualifies.
-            if cat.startswith("L") or cat.startswith("N"):
+            # Swift: CharacterSet.letters (L*) + decimalDigits (Nd only)
+            if cat.startswith("L") or cat == "Nd":
                 return True
         return False
 

@@ -1781,7 +1781,7 @@ class WhisperTranscriber:
             from src.config import get_config
             requested = get_config().get_transcription_engine()
         except Exception:
-            requested = "apple" if APPLE_SPEECH_AVAILABLE else "parakeet"
+            requested = "parakeet"
 
         if requested == "apple":
             if not APPLE_SPEECH_AVAILABLE:
@@ -1790,14 +1790,22 @@ class WhisperTranscriber:
                     "steno-transcribe sidecar is unavailable."
                 )
             self.backend = "apple-speech"
-        elif requested == "whisper" and WHISPER_CPP_AVAILABLE:
+        elif requested == "whisper":
+            if not WHISPER_CPP_AVAILABLE:
+                raise ImportError(
+                    "Whisper.cpp is selected, but its backend is unavailable."
+                )
             self.backend = "whisper.cpp"
             self._load_whisper_cpp()
         elif PARAKEET_AVAILABLE:
             self.backend = "parakeet-tdt-v3"
-        else:
+        elif WHISPER_CPP_AVAILABLE:
             self.backend = "whisper.cpp"
             self._load_whisper_cpp()
+        else:
+            raise ImportError(
+                "No usable ASR backend is available for the selected engine."
+            )
         expected_backend = {
             "apple": "apple-speech",
             "parakeet": "parakeet-tdt-v3",
@@ -1991,7 +1999,7 @@ class WhisperTranscriber:
 
     def _run_apple_speech(self, audio_filepath: Path, language: str) -> dict:
         """Run Apple's system-managed SpeechTranscriber sidecar."""
-        with _heartbeat_while_waiting(STENO_DIARIZE_HEARTBEAT_INTERVAL_S):
+        with _heartbeat_while_waiting("apple-speech"):
             result = _apple_transcribe_file(
                 audio_filepath,
                 language=language,

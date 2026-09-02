@@ -112,7 +112,7 @@ private actor LineEmitter {
 private struct StenoTranscribe {
     private static let displayName = "Apple On-Device"
     private static let inputFrameBytes = MemoryLayout<Float>.size * 2
-    private static let readChunkBytes = 64 * 1024
+    private static let readChunkBytes = 8 * 1024
     private static let defaultLocaleIdentifiers = [
         "en": "en_US",
         "es": "es_ES",
@@ -149,7 +149,7 @@ private struct StenoTranscribe {
                 guard arguments.count >= 2 else { throw SidecarError.usage }
                 let requestedLocale = arguments.count > 2 ? arguments[2] : "auto"
                 let locale = try await resolveLocale(requestedLocale)
-                try await ensureAsset(for: locale)
+                try await requireInstalledAsset(for: locale)
                 let output = try await transcribeFile(
                     URL(fileURLWithPath: arguments[1]),
                     locale: locale
@@ -157,7 +157,9 @@ private struct StenoTranscribe {
                 writeJSON(output)
             case "stream":
                 let requestedLocale = arguments.count > 1 ? arguments[1] : "auto"
-                try await stream(locale: try await resolveLocale(requestedLocale))
+                let locale = try await resolveLocale(requestedLocale)
+                try await requireInstalledAsset(for: locale)
+                try await stream(locale: locale)
             default:
                 throw SidecarError.usage
             }
@@ -234,6 +236,13 @@ private struct StenoTranscribe {
         return resolved
     }
 
+    private static func requireInstalledAsset(for locale: Locale) async throws {
+        let installed = await Set(SpeechTranscriber.installedLocales.map(\.identifier))
+        guard installed.contains(locale.identifier) else {
+            throw SidecarError.assetUnavailable(locale.identifier)
+        }
+    }
+
     private static func ensureAsset(for locale: Locale) async throws {
         let installed = await Set(SpeechTranscriber.installedLocales.map(\.identifier))
         if installed.contains(locale.identifier) { return }
@@ -307,7 +316,6 @@ private struct StenoTranscribe {
     }
 
     private static func stream(locale: Locale) async throws {
-        try await ensureAsset(for: locale)
 
         let leftTranscriber = SpeechTranscriber(
             locale: locale,
@@ -351,10 +359,10 @@ private struct StenoTranscribe {
         try await rightAnalyzer.prepareToAnalyze(in: format)
 
         let (leftInput, leftContinuation) = AsyncStream<AnalyzerInput>.makeStream(
-            bufferingPolicy: .bufferingNewest(64)
+            bufferingPolicy: .bufferingNewest(32)
         )
         let (rightInput, rightContinuation) = AsyncStream<AnalyzerInput>.makeStream(
-            bufferingPolicy: .bufferingNewest(64)
+            bufferingPolicy: .bufferingNewest(32)
         )
         let emitter = LineEmitter()
         let leftResults = Task {
@@ -381,7 +389,7 @@ private struct StenoTranscribe {
                 let block = Data(pending.prefix(completeBytes))
                 pending.removeFirst(completeBytes)
                 let frameCount = completeBytes / inputFrameBytes
-                leftContinuation.yield(AnalyzerInput(
+                let leftResult = leftContinuation.yield(AnalyzerInput(
                     buffer: try makeMonoBuffer(
                         from: block,
                         channel: 0,
@@ -389,7 +397,7 @@ private struct StenoTranscribe {
                         format: format
                     )
                 ))
-                rightContinuation.yield(AnalyzerInput(
+                let rightResult = rightContinuation.yield(AnalyzerInput(
                     buffer: try makeMonoBuffer(
                         from: block,
                         channel: 1,
@@ -397,6 +405,23 @@ private struct StenoTranscribe {
                         format: format
                     )
                 ))
+                if case .dropped = leftResult {
+                    await emitter.emitLiveError(
+                        stage: "transcribe",
+                        message: "Live audio buffer overflow — processing fell behind and some audio was dropped."
+                    )
+                } else if case .dropped = rightResult {
+                    await emitter.emitLiveError(
+                        stage: "transcribe",
+                        message: "Live audio buffer overflow — processing fell behind and some audio was dropped."
+                    )
+                }
+                if case .terminated = leftResult {
+                    throw CancellationError()
+                }
+                if case .terminated = rightResult {
+                    throw CancellationError()
+                }
             }
 
             leftContinuation.finish()

@@ -82,23 +82,39 @@ def _run(arguments: list[str], *, timeout: float) -> dict[str, Any]:
     return payload
 
 
+def _is_supported() -> bool:
+    """Return True iff this host can run the Apple SpeechTranscriber backend."""
+    try:
+        from src.config import apple_speech_supported
+
+        return apple_speech_supported()
+    except Exception:
+        return False
+
+
+def _unavailable_status() -> dict[str, Any]:
+    return {
+        "success": True,
+        "available": False,
+        "supported": False,
+        "installed": False,
+        "locale": None,
+        "display_name": "Apple On-Device",
+        "system_managed": True,
+    }
+
+
 def status(language: str = "auto") -> dict[str, Any]:
     """Return availability, locale support, and system-asset state."""
-    if sys.platform != "darwin":
-        return {
-            "success": True,
-            "available": False,
-            "supported": False,
-            "installed": False,
-            "locale": None,
-            "display_name": "Apple On-Device",
-            "system_managed": True,
-        }
+    if not _is_supported():
+        return _unavailable_status()
     return _run(["status", language], timeout=15)
 
 
 def prepare(language: str = "auto") -> dict[str, Any]:
     """Install the system-managed speech asset for ``language`` if needed."""
+    if not _is_supported():
+        raise RuntimeError("Apple on-device transcription is unavailable on this Mac.")
     return _run(["prepare", language], timeout=20 * 60)
 
 
@@ -109,6 +125,8 @@ def transcribe_file(
     timeout: float = 30 * 60,
 ) -> dict[str, Any]:
     """Transcribe one audio file and return the pipeline's normalized shape."""
+    if not _is_supported():
+        raise RuntimeError("Apple on-device transcription is unavailable on this Mac.")
     payload = _run(
         ["transcribe-file", str(audio_path), language],
         timeout=timeout,

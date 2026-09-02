@@ -46,6 +46,21 @@ from scripts.sidecar_bundle_guard import require_macos_sidecar
 _IS_DARWIN = sys.platform == "darwin"
 _IS_WINDOWS = sys.platform == "win32"
 
+def _macos_is_26_or_newer() -> bool:
+    """True on macOS 26+ where the SpeechTranscriber sidecar can be built."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import platform
+
+        ver = platform.mac_ver()[0]
+        return int(ver.split(".", 1)[0]) >= 26
+    except Exception:
+        return False
+
+
+_REQUIRES_TRANSCRIBE_SIDECAR = _macos_is_26_or_newer()
+
 # UPX is a binary packer that compresses executables. It's safe on macOS but
 # routinely flagged as suspicious by Windows Defender + corporate AVs because
 # malware abuses it for the same compression benefits. Leaving it on would
@@ -252,20 +267,26 @@ _OLLAMA_GPU_MARKERS = ('lib/ollama/cuda', 'lib/ollama/rocm', 'lib/ollama/vulkan'
 #   - the GPU runner libs are pruned above and there's no pip-mlx build).
 ollama_datas: list[tuple[str, str, str]] = []
 ollama_bin_dir = os.path.join(SPECPATH, 'bin')
-required_macos_sidecars = {
+required_macos_sidecars: dict[str, Path | None] = {
     'steno-diarize': require_macos_sidecar(
         Path(ollama_bin_dir) / 'steno-diarize',
         name='speaker-diarization',
         build_script='scripts/build-diarize-sidecar.sh',
         platform=sys.platform,
     ),
-    'steno-transcribe': require_macos_sidecar(
+}
+if _REQUIRES_TRANSCRIBE_SIDECAR:
+    required_macos_sidecars['steno-transcribe'] = require_macos_sidecar(
         Path(ollama_bin_dir) / 'steno-transcribe',
         name='Apple transcription',
         build_script='scripts/build-transcribe-sidecar.sh',
         platform=sys.platform,
-    ),
-}
+    )
+else:
+    # On macOS <26 the transcribe sidecar cannot be built (needs macOS 26 SDK);
+    # don't fail the bundle. The runtime (apple_speech_supported) will keep
+    # the engine unavailable there, and Parakeet/Whisper remain the defaults.
+    required_macos_sidecars['steno-transcribe'] = None
 if os.path.exists(ollama_bin_dir):
     for root, _dirs, files in os.walk(ollama_bin_dir):
         for filename in files:
