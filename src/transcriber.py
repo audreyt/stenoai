@@ -1705,7 +1705,7 @@ def _assemble_diarised_turns(
 # Apple SpeechTranscriber is exposed through a small Swift sidecar so the
 # Python/Electron pipeline can use the system-managed model without PyObjC or
 # shipping weights.
-from src.apple_speech import (
+from src.apple_speech import (  # noqa: E402
     resolve_sidecar as _resolve_apple_speech,
     transcribe_file as _apple_transcribe_file,
 )
