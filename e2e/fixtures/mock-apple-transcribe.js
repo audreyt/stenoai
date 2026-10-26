@@ -49,6 +49,7 @@ if (require.main === module) {
   let emittedSegment = false;
   const revokeControl = process.env.STENOAI_MOCK_SIDECAR_REVOKE_CONTROL;
   const revokeScenario = revokeControl && locale === 'en';
+  const finalOrder = process.env.STENOAI_MOCK_SIDECAR_FINAL_ORDER;
   let revoked = false;
   let emittedAfterRevoke = false;
   const emitSegment = (segment) => {
@@ -70,7 +71,19 @@ if (require.main === module) {
   process.stdin.on('data', () => {
     if (!emittedSegment) {
       emittedSegment = true;
-      if (revokeScenario) {
+      if (revokeScenario && (finalOrder === 'late' || finalOrder === 'duplicate')) {
+        const final = { text: 'Earlier final (en)', start: 0, end: 2, is_final: true, speaker: 'You' };
+        const partial = { text: 'Newer partial (en)', start: 3, end: 4, is_final: false, speaker: 'You' };
+        if (finalOrder === 'late') {
+          emitSegment(partial);
+          emitSegment(final);
+        } else {
+          // The duplicate earlier final is suppressed by Swift's tracker;
+          // the consumer sees only this prior final and the newer partial.
+          emitSegment(final);
+          emitSegment(partial);
+        }
+      } else if (revokeScenario) {
         emitSegment({ text: 'Retained final (en)', start: 0, end: 1, is_final: true, speaker: 'You' });
         emitSegment({ text: 'Withdraw me (en)', start: 1, end: 2, is_final: false, speaker: 'You' });
         emitSegment({ text: 'Other channel (en)', start: 1, end: 2, is_final: false, speaker: 'Others' });

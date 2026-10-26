@@ -434,17 +434,21 @@ private struct StenoTranscribe {
         speaker: String,
         emitter: LineEmitter
     ) async {
-        var seenFinals: Set<String> = []
-        var hasPartial = false
+        var tracker = LivePartialTracker()
         do {
             for try await result in transcriber.results {
                 let text = String(result.text.characters)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                switch liveTextAction(text, hasPartial: hasPartial) {
+                let start = safeSeconds(result.range.start)
+                let end = start + safeSeconds(result.range.duration)
+                let identity = "\(result.range.start.value):\(result.range.duration.value):\(text)"
+                switch tracker.action(
+                    text: text, isFinal: result.isFinal, start: start,
+                    end: end, finalIdentity: identity
+                ) {
                 case .ignore:
                     continue
                 case .revoke:
-                    hasPartial = false
                     guard let data = try? JSONSerialization.data(withJSONObject: ["speaker": speaker]),
                           let json = String(data: data, encoding: .utf8) else { continue }
                     await emitter.emit("LIVE_REVOKE:\(json)")
@@ -452,18 +456,10 @@ private struct StenoTranscribe {
                 case .segment:
                     break
                 }
-                if result.isFinal {
-                    hasPartial = false
-                    let identity = "\(result.range.start.value):\(result.range.duration.value):\(text)"
-                    guard seenFinals.insert(identity).inserted else { continue }
-                } else {
-                    hasPartial = true
-                }
-                let start = safeSeconds(result.range.start)
                 let payload: [String: Any] = [
                     "text": text,
                     "start": start,
-                    "end": start + safeSeconds(result.range.duration),
+                    "end": end,
                     "is_final": result.isFinal,
                     "speaker": speaker,
                 ]

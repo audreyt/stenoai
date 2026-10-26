@@ -278,6 +278,44 @@ test('Apple volatile withdrawal removes only its partial from main state', async
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
 });
 
+for (const finalOrder of ['late', 'duplicate'] as const) {
+  test(`Apple ${finalOrder} earlier final keeps the newer partial revocable`, async ({
+    launchApp,
+    userDataDir,
+  }) => {
+    test.setTimeout(120_000);
+    test.skip(!existsSync(BACKEND), 'backend bundle not built');
+    test.skip(process.platform !== 'darwin', 'Apple SpeechTranscriber is macOS-only');
+    const control = path.join(userDataDir, `${finalOrder}-final-revoke`);
+    writeUserConfig(userDataDir, {
+      transcription_engine: 'apple', language: 'en', system_audio_enabled: true,
+    });
+    const { page } = await launchApp({
+      fakeAudio: true,
+      env: {
+        STENOAI_TRANSCRIBE_SIDECAR_PATH: ensureMockAppleSidecarExecutable(),
+        STENOAI_MOCK_SIDECAR_REVOKE_CONTROL: control,
+        STENOAI_MOCK_SIDECAR_FINAL_ORDER: finalOrder,
+      },
+    });
+    expect((await page.evaluate(() =>
+      (window as StenoWindow).stenoai.recording.start('Apple Late Final E2E'),
+    )).success).toBe(true);
+    await expect.poll(async () => (await page.evaluate(() =>
+      (window as StenoWindow).stenoai.liveTranscript.getState(),
+    )).segments.map((segment) => segment.text), { timeout: 15_000 })
+      .toEqual(['Earlier final (en)', 'Newer partial (en)']);
+    writeFileSync(`${control}.withdraw`, 'withdraw');
+    await expect.poll(async () => (await page.evaluate(() =>
+      (window as StenoWindow).stenoai.liveTranscript.getState(),
+    )).segments.map((segment) => segment.text), { timeout: 15_000 })
+      .toEqual(['Earlier final (en)']);
+    expect((await page.evaluate(() =>
+      (window as StenoWindow).stenoai.recording.stop(),
+    )).success).toBe(true);
+  });
+}
+
 test('restarting Apple live cancels a pending withdrawal from the previous sidecar', async ({
   launchApp,
   userDataDir,
