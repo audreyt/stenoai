@@ -8,7 +8,7 @@ import { flushNotesThenProcess } from '@/lib/notesFlush';
 import { unwrap } from '@/lib/result';
 import { getLiveDraft } from './liveDraftStore';
 import { useRecording } from './useRecording';
-import { useTranscriptionEngine } from './useModels';
+import { useLiveTranscriptAvailable } from './useModels';
 import {
   settingsKeys,
   useMicrophoneSetting,
@@ -49,10 +49,8 @@ export function useSystemAudioCapture() {
   const { status, sessionName } = useRecording();
   const systemAudio = useSystemAudioSetting();
   const systemAudioSupport = useSystemAudioSupport();
-  const engineQuery = useTranscriptionEngine();
-  // Apple and Parakeet both consume the 16 kHz live tap. Whisper is post-stop
-  // only, so pushing these chunks would be wasted work.
-  const liveTapEnabled = (engineQuery.data ?? 'parakeet') !== 'whisper';
+  // The shared live-engine gate excludes Whisper and cloud ASR from the PCM tap.
+  const liveTapEnabled = useLiveTranscriptAvailable();
   // Read into a ref so the tap callback (closed over once at startCapture)
   // can be a no-op if the engine flips mid-recording without rebuilding
   // the AudioContext graph.

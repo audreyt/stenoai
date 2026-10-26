@@ -823,6 +823,9 @@ function install({ ipcMain }) {
     }),
 
     'prepare-apple-speech': async (_event, language = 'auto') => {
+      if (language === process.env.STENOAI_E2E_MOCK_APPLE_PREPARE_FAIL_LANGUAGE) {
+        return { success: false, error: 'Synthetic Apple preparation failure' };
+      }
       if (process.env.STENOAI_E2E_MOCK_APPLE_REQUIRED_LANGUAGE
           && language !== process.env.STENOAI_E2E_MOCK_APPLE_REQUIRED_LANGUAGE) {
         return { success: false, error: 'Wrong Apple Speech language prepared' };

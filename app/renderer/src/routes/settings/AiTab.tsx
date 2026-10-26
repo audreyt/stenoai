@@ -25,6 +25,7 @@ import { GoogleIcon } from '@/components/ui/google-icon';
 import { MetaIcon } from '@/components/ui/meta-icon';
 import { QwenIcon } from '@/components/ui/qwen-icon';
 import { cn, isMac } from '@/lib/utils';
+import { ipc } from '@/lib/ipc';
 import { t } from '@/i18n';
 import type { AiProvider, CloudProvider, DiarizationEngine, TranscriptionEngine } from '@/lib/ipc';
 import {
@@ -100,6 +101,10 @@ export function AiTab() {
 function TranscriptionSection() {
   const language = useLanguageSetting();
   const setLanguage = useSetLanguage();
+  const prepareApple = usePrepareAppleSpeech();
+  const [pendingLanguage, setPendingLanguage] = React.useState<string | null>(null);
+  const [languageError, setLanguageError] = React.useState<string | null>(null);
+  const languageChangeInFlight = React.useRef(false);
   const keepRecordings = useKeepRecordingsSetting();
   const setKeepRecordings = useSetKeepRecordings();
   const engineQuery = useTranscriptionEngine();
@@ -119,6 +124,33 @@ function TranscriptionSection() {
   const persisted = language.data ?? 'auto';
   const displayValue = options.some((o) => o.value === persisted) ? persisted : 'auto';
 
+  const selectLanguage = async (code: string) => {
+    if (languageChangeInFlight.current) return;
+    if (engine !== 'apple') {
+      setLanguage.mutate(code);
+      return;
+    }
+    languageChangeInFlight.current = true;
+    setPendingLanguage(code);
+    setLanguageError(null);
+    let failureMessage = t('settings.ai.apple.prepareError');
+    try {
+      const status = await ipc().appleSpeech.status(code);
+      if (!status.success || !status.available || !status.supported) {
+        failureMessage = t('settings.ai.apple.languageUnavailable');
+        throw new Error(failureMessage);
+      }
+      if (!status.installed) await prepareApple.mutateAsync(code);
+      failureMessage = t('settings.ai.apple.saveError');
+      await setLanguage.mutateAsync(code);
+    } catch {
+      setLanguageError(failureMessage);
+    } finally {
+      languageChangeInFlight.current = false;
+      setPendingLanguage(null);
+    }
+  };
+
   return (
     // Retains the pre-merge data-settings-tab="transcription" identity as a
     // nested wrapper (the page-level section is now data-settings-tab="ai").
@@ -137,8 +169,8 @@ function TranscriptionSection() {
       >
         <Select
           value={displayValue}
-          onValueChange={(v) => setLanguage.mutate(v)}
-          disabled={!language.data}
+          onValueChange={(v) => { void selectLanguage(v); }}
+          disabled={!language.data || pendingLanguage !== null}
         >
           {/* Explicit testid: the Model dropdown below is a second combobox in
               this section now, so parakeet-language-picker.t1 can no longer
@@ -154,6 +186,12 @@ function TranscriptionSection() {
             ))}
           </SelectContent>
         </Select>
+        {pendingLanguage !== null && (
+          <p role="status" className="mt-2 text-xs text-muted-foreground">
+            {t('settings.ai.apple.preparing')}
+          </p>
+        )}
+        {languageError && <p role="alert" className="mt-2 text-xs text-destructive">{languageError}</p>}
       </SettingRow>
 
       <SettingRow

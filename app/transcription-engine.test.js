@@ -27,10 +27,11 @@ test('Apple copied to an unsupported host falls back without hiding explicit eng
   assert.equal(normalizeTranscriptionEngine('parakeet', 'darwin', '25.0.0'), 'parakeet');
 });
 
-test('Apple and Parakeet are live; Whisper remains post-stop only', () => {
+test('Apple and Parakeet are live; Whisper and cloud ASR are post-stop only', () => {
   assert.equal(isLiveTranscriptionEngine('apple'), true);
   assert.equal(isLiveTranscriptionEngine('parakeet'), true);
   assert.equal(isLiveTranscriptionEngine('whisper'), false);
+  assert.equal(isLiveTranscriptionEngine('openai-asr'), false);
 });
 
 test('Apple readiness needs a successful supported installed asset', () => {
