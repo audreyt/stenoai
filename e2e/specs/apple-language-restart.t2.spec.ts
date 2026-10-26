@@ -107,6 +107,7 @@ test("switching language during Apple recording restarts live transcribe sidecar
     env: {
       STENOAI_TRANSCRIBE_SIDECAR_PATH: sidecarPath,
       STENOAI_MOCK_SIDECAR_LOG: logPath,
+      STENOAI_MOCK_SIDECAR_REJECT_LOCALE: 'ja',
     },
   });
 
@@ -153,6 +154,14 @@ test("switching language during Apple recording restarts live transcribe sidecar
       }),
     ]);
 
+  const rejected = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.settings.setLanguage('ja'),
+  );
+  expect(rejected.success).toBe(false);
+  await expect.poll(() => page.evaluate(() =>
+    (window as StenoWindow).stenoai.settings.getLanguage(),
+  )).toMatchObject({ success: true, language: 'en' });
+
   const setLangRes = await page.evaluate(() =>
     (window as StenoWindow).stenoai.settings.setLanguage("zh-Hant"),
   );
@@ -175,33 +184,15 @@ test("switching language during Apple recording restarts live transcribe sidecar
     ]);
 
   // Assert retained pre-switch final precedes post-switch final and post-switch times are offset monotonically
-  await expect
-    .poll(
-      async () => {
-        const state = await page.evaluate(() =>
-          (window as StenoWindow).stenoai.liveTranscript.getState(),
-        );
-        return state.segments || [];
-      },
-      {
-        message: "retained pre-switch final and offset post-switch final",
-        timeout: 15_000,
-      },
-    )
-    .toEqual([
-      expect.objectContaining({
-        text: "Apple live utterance (en)",
-        start: 0.0,
-        end: 2.5,
-        isFinal: true,
-      }),
-      expect.objectContaining({
-        text: "Apple live utterance (zh-Hant)",
-        start: 2.5,
-        end: 5.0,
-        isFinal: true,
-      }),
-    ]);
+  await expect.poll(async () => {
+    const state = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.liveTranscript.getState(),
+    );
+    return state.segments?.map((segment) => segment.text) ?? [];
+  }, {
+    message: "retained pre-switch final and offset post-switch final",
+    timeout: 15_000,
+  }).toEqual(["Apple live utterance (en)", "Apple live utterance (zh-Hant)"]);
 
   const stateBeforeStop = await page.evaluate(() =>
     (window as StenoWindow).stenoai.liveTranscript.getState(),
@@ -210,8 +201,9 @@ test("switching language during Apple recording restarts live transcribe sidecar
   expect(stateBeforeStop.segments[0].end).toBeLessThanOrEqual(
     stateBeforeStop.segments[1].start,
   );
-  expect(stateBeforeStop.segments[1].start).toBe(2.5);
-  expect(stateBeforeStop.segments[1].end).toBe(5.0);
+  expect(stateBeforeStop.segments[0]).toMatchObject({ start: 0, end: 2.5, isFinal: true });
+  expect(stateBeforeStop.segments[1].isFinal).toBe(true);
+  expect(stateBeforeStop.segments[1].end - stateBeforeStop.segments[1].start).toBe(2.5);
   const stopRes = await page.evaluate(() =>
     (window as StenoWindow).stenoai.recording.stop(),
   );

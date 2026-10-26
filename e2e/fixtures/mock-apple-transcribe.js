@@ -4,6 +4,7 @@
 const fs = require('fs');
 
 if (require.main === module) {
+  const [command, locale = 'auto'] = process.argv.slice(2);
   const logFile = process.env.STENOAI_MOCK_SIDECAR_LOG;
   if (logFile) {
     const entry =
@@ -19,10 +20,32 @@ if (require.main === module) {
     }
   }
 
+  if (command === 'status') {
+    const supported = locale !== process.env.STENOAI_MOCK_SIDECAR_REJECT_LOCALE;
+    process.stdout.write(JSON.stringify({
+      success: true,
+      available: true,
+      supported,
+      installed: supported,
+      locale,
+      display_name: 'Apple On-Device',
+      system_managed: true,
+    }) + '\n');
+    process.exit(0);
+  }
+  if (command === 'prepare') {
+    process.stderr.write('Unexpected model preparation in model-free test\n');
+    process.exit(1);
+  }
+  if (command === 'transcribe-file') {
+    process.stdout.write(JSON.stringify({ success: true, text: '', segments: [] }) + '\n');
+    process.exit(0);
+  }
+  if (command !== 'stream') process.exit(2);
+
   // Emit LIVE_READY protocol line so main.js marks liveTranscriptState.ready = true
   process.stdout.write('LIVE_READY:\n');
 
-  const locale = process.argv[3] || 'en';
   let emittedSegment = false;
 
   // Drain stdin and exit cleanly on stream close or signal
