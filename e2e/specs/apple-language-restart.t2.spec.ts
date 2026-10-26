@@ -5,7 +5,7 @@ import {
   ensureMockAppleSidecarExecutable,
   readSidecarLogs,
 } from "../fixtures/mock-apple-transcribe-fixture";
-import { existsSync } from "fs";
+import { existsSync, writeFileSync } from "fs";
 import path from "path";
 
 /**
@@ -210,4 +210,117 @@ test("switching language during Apple recording restarts live transcribe sidecar
   expect(stopRes.success).toBe(true);
 
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+});
+
+test('Apple volatile withdrawal removes only its partial from main state', async ({
+  launchApp,
+  userDataDir,
+}) => {
+  test.setTimeout(120_000);
+  test.skip(!existsSync(BACKEND), 'backend bundle not built');
+  test.skip(process.platform !== 'darwin', 'Apple SpeechTranscriber is macOS-only');
+  const realDirBefore = fileSig(realUserDataDir());
+  const control = path.join(userDataDir, 'revoke-control');
+  const sidecarPath = ensureMockAppleSidecarExecutable();
+  const logPath = path.join(userDataDir, 'sidecar-revoke-launches.log');
+  writeUserConfig(userDataDir, {
+    transcription_engine: 'apple', language: 'en', system_audio_enabled: true,
+  });
+  const { page } = await launchApp({
+    fakeAudio: true,
+    env: {
+      STENOAI_TRANSCRIBE_SIDECAR_PATH: sidecarPath,
+      STENOAI_MOCK_SIDECAR_LOG: logPath,
+      STENOAI_MOCK_SIDECAR_REVOKE_CONTROL: control,
+    },
+  });
+  const started = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.recording.start('Apple Revoke E2E'),
+  );
+  expect(started.success).toBe(true);
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  )).segments.map((segment) => segment.text), { timeout: 15_000 })
+    .toEqual(['Retained final (en)', 'Withdraw me (en)', 'Other channel (en)']);
+
+  writeFileSync(`${control}.withdraw`, 'withdraw');
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  )).segments.map((segment) => segment.text), { timeout: 15_000 })
+    .toEqual(['Retained final (en)', 'Other channel (en)']);
+
+  writeFileSync(`${control}.final`, 'final');
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  )).segments.map((segment) => segment.text), { timeout: 15_000 })
+    .toEqual(['Retained final (en)', 'Final after revoke (en)', 'Other channel (en)']);
+  const changed = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.settings.setLanguage('zh-Hant'),
+  );
+  expect(changed.success).toBe(true);
+  await expect.poll(() => readSidecarLogs(logPath)
+    .map((log) => log.args)
+    .filter((args) => args[0] === 'stream'), {
+    message: 'sidecar restarted after revocation and final', timeout: 15_000,
+  }).toEqual([['stream', 'en'], ['stream', 'zh-Hant']]);
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  )).segments.map((segment) => segment.text), { timeout: 15_000 })
+    .toEqual(['Retained final (en)', 'Final after revoke (en)', 'Apple live utterance (zh-Hant)']);
+  const afterRestart = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  );
+  expect(afterRestart.segments.every((segment) => segment.isFinal)).toBe(true);
+  expect(afterRestart.segments[1].end).toBeLessThanOrEqual(afterRestart.segments[2].start);
+  expect((await page.evaluate(() =>
+    (window as StenoWindow).stenoai.recording.stop(),
+  )).success).toBe(true);
+  expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+});
+
+test('restarting Apple live cancels a pending withdrawal from the previous sidecar', async ({
+  launchApp,
+  userDataDir,
+}) => {
+  test.setTimeout(120_000);
+  test.skip(!existsSync(BACKEND), 'backend bundle not built');
+  test.skip(process.platform !== 'darwin', 'Apple SpeechTranscriber is macOS-only');
+  const control = path.join(userDataDir, 'cancel-revoke-control');
+  const sidecarPath = ensureMockAppleSidecarExecutable();
+  writeUserConfig(userDataDir, {
+    transcription_engine: 'apple', language: 'en', system_audio_enabled: true,
+  });
+  const { page } = await launchApp({
+    fakeAudio: true,
+    env: {
+      STENOAI_TRANSCRIBE_SIDECAR_PATH: sidecarPath,
+      STENOAI_MOCK_SIDECAR_REVOKE_CONTROL: control,
+    },
+  });
+  expect((await page.evaluate(() =>
+    (window as StenoWindow).stenoai.recording.start('Apple Cancel Revoke E2E'),
+  )).success).toBe(true);
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  )).segments.map((segment) => segment.text), { timeout: 15_000 })
+    .toEqual(['Retained final (en)', 'Withdraw me (en)', 'Other channel (en)']);
+  expect((await page.evaluate(() =>
+    (window as StenoWindow).stenoai.settings.setLanguage('zh-Hant'),
+  )).success).toBe(true);
+  await expect.poll(async () => (await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  )).segments.map((segment) => segment.text), { timeout: 15_000 })
+    .toEqual(['Retained final (en)', 'Apple live utterance (zh-Hant)']);
+  writeFileSync(`${control}.withdraw`, 'withdraw old process');
+  await page.waitForTimeout(100);
+  const state = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.liveTranscript.getState(),
+  );
+  expect(state.segments.map((segment) => segment.text)).toEqual([
+    'Retained final (en)', 'Apple live utterance (zh-Hant)',
+  ]);
+  expect(state.segments[0].end).toBeLessThanOrEqual(state.segments[1].start);
+  expect((await page.evaluate(() =>
+    (window as StenoWindow).stenoai.recording.stop(),
+  )).success).toBe(true);
 });

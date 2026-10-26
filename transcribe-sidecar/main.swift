@@ -435,14 +435,29 @@ private struct StenoTranscribe {
         emitter: LineEmitter
     ) async {
         var seenFinals: Set<String> = []
+        var hasPartial = false
         do {
             for try await result in transcriber.results {
                 let text = String(result.text.characters)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty, hasLexicalContent(text) else { continue }
+                switch liveTextAction(text, hasPartial: hasPartial) {
+                case .ignore:
+                    continue
+                case .revoke:
+                    hasPartial = false
+                    guard let data = try? JSONSerialization.data(withJSONObject: ["speaker": speaker]),
+                          let json = String(data: data, encoding: .utf8) else { continue }
+                    await emitter.emit("LIVE_REVOKE:\(json)")
+                    continue
+                case .segment:
+                    break
+                }
                 if result.isFinal {
+                    hasPartial = false
                     let identity = "\(result.range.start.value):\(result.range.duration.value):\(text)"
                     guard seenFinals.insert(identity).inserted else { continue }
+                } else {
+                    hasPartial = true
                 }
                 let start = safeSeconds(result.range.start)
                 let payload: [String: Any] = [

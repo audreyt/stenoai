@@ -5723,6 +5723,26 @@ function handleLiveTranscribeLine(line, proc = liveTranscribeProcess) {
     }
     return;
   }
+  if (line.startsWith('LIVE_REVOKE:') && proc?._usesAppleSpeech) {
+    try {
+      const payload = JSON.parse(line.slice('LIVE_REVOKE:'.length));
+      if (payload.speaker !== 'You' && payload.speaker !== 'Others') return;
+      // A withdrawn volatile hypothesis can remove only that channel's
+      // in-progress row. Final segments remain available for the stop-time
+      // transcript and for a language restart's monotonic timeline offset.
+      liveTranscriptState.segments = liveTranscriptState.segments.filter(
+        (segment) => segment.isFinal || segment.speaker !== payload.speaker,
+      );
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('live-transcript-revoke', {
+          sessionName, speaker: payload.speaker,
+        });
+      }
+    } catch (e) {
+      sendDebugLog(`LIVE_REVOKE parse error (sidecar): ${e.message}`);
+    }
+    return;
+  }
   if (line.startsWith('LIVE_ERROR:')) {
     try {
       const payload = JSON.parse(line.slice('LIVE_ERROR:'.length));

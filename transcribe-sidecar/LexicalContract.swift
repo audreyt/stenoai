@@ -12,6 +12,10 @@ struct LexicalContract {
             precondition(hasLexicalContent(text) == expected,
                          "Lexical contract failed for \(String(reflecting: text))")
         }
-        print("Swift lexical contract: \(cases.count) cases passed")
+        precondition(liveTextAction("hello", hasPartial: false) == .segment)
+        precondition(liveTextAction("", hasPartial: true) == .revoke)
+        precondition(liveTextAction("…", hasPartial: true) == .revoke)
+        precondition(liveTextAction("", hasPartial: false) == .ignore)
+        print("Swift lexical contract: \(cases.count + 4) cases passed")
     }
 }

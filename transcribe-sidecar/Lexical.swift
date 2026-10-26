@@ -17,3 +17,14 @@ func hasLexicalContent(_ text: String) -> Bool {
     }
     return false
 }
+
+enum LiveTextAction: Equatable {
+    case segment
+    case revoke
+    case ignore
+}
+
+func liveTextAction(_ text: String, hasPartial: Bool) -> LiveTextAction {
+    if hasLexicalContent(text) { return .segment }
+    return hasPartial ? .revoke : .ignore
+}

@@ -47,29 +47,54 @@ if (require.main === module) {
   process.stdout.write('LIVE_READY:\n');
 
   let emittedSegment = false;
+  const revokeControl = process.env.STENOAI_MOCK_SIDECAR_REVOKE_CONTROL;
+  const revokeScenario = revokeControl && locale === 'en';
+  let revoked = false;
+  let emittedAfterRevoke = false;
+  const emitSegment = (segment) => {
+    process.stdout.write(`LIVE_SEG:${JSON.stringify(segment)}\n`);
+  };
+  const controlTimer = revokeScenario ? setInterval(() => {
+    if (!revoked && fs.existsSync(`${revokeControl}.withdraw`)) {
+      revoked = true;
+      process.stdout.write('LIVE_REVOKE:{"speaker":"You"}\n');
+    }
+    if (revoked && !emittedAfterRevoke && fs.existsSync(`${revokeControl}.final`)) {
+      emittedAfterRevoke = true;
+      emitSegment({ text: 'Final after revoke (en)', start: 2, end: 3, is_final: true, speaker: 'You' });
+    }
+  }, 20) : null;
 
   // Drain stdin and exit cleanly on stream close or signal
   process.stdin.resume();
   process.stdin.on('data', () => {
     if (!emittedSegment) {
       emittedSegment = true;
-      const segment = {
-        text: `Apple live utterance (${locale})`,
-        start: 0.0,
-        end: 2.5,
-        is_final: true,
-        speaker: 'You',
-      };
-      process.stdout.write(`LIVE_SEG:${JSON.stringify(segment)}\n`);
+      if (revokeScenario) {
+        emitSegment({ text: 'Retained final (en)', start: 0, end: 1, is_final: true, speaker: 'You' });
+        emitSegment({ text: 'Withdraw me (en)', start: 1, end: 2, is_final: false, speaker: 'You' });
+        emitSegment({ text: 'Other channel (en)', start: 1, end: 2, is_final: false, speaker: 'Others' });
+      } else {
+        emitSegment({
+          text: `Apple live utterance (${locale})`,
+          start: 0.0,
+          end: 2.5,
+          is_final: true,
+          speaker: 'You',
+        });
+      }
     }
   });
   process.stdin.on('end', () => {
+    if (controlTimer) clearInterval(controlTimer);
     process.exit(0);
   });
   process.on('SIGTERM', () => {
+    if (controlTimer) clearInterval(controlTimer);
     process.exit(0);
   });
   process.on('SIGINT', () => {
+    if (controlTimer) clearInterval(controlTimer);
     process.exit(0);
   });
 }

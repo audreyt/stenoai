@@ -458,6 +458,7 @@ const stenoai = {
     speakerModelsProgress: (cb) => subscribe('speaker-models-progress', cb),
     liveTranscriptReady: (cb) => subscribe('live-transcript-ready', cb),
     liveTranscriptChunk: (cb) => subscribe('live-transcript-chunk', cb),
+    liveTranscriptRevoke: (cb) => subscribe('live-transcript-revoke', cb),
     liveTranscriptError: (cb) => subscribe('live-transcript-error', cb),
     linuxLoopbackChunk: (cb) => subscribe('linux-loopback-chunk', cb),
     linuxLoopbackEnded: (cb) => subscribe('linux-loopback-ended', cb),
