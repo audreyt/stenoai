@@ -361,13 +361,15 @@ export function Setup() {
         const selected = await ipc().transcriptionEngine.get();
         const engine = selected.success ? selected.engine : 'parakeet';
         if (engine === 'apple') {
-          const status = await ipc().appleSpeech.status();
+          const language = await ipc().settings.getLanguage();
+          const code = language.success ? language.language : 'auto';
+          const status = await ipc().appleSpeech.status(code);
           if (!status.success || !status.available || !status.supported) {
             throw new Error(t('settings.ai.apple.unavailable'));
           }
           if (!status.installed) {
             setStatus('transcription', 'running', t('settings.ai.apple.preparing'));
-            const prepared = await ipc().appleSpeech.prepare();
+            const prepared = await ipc().appleSpeech.prepare(code);
             if (!prepared.success || !prepared.installed) {
               throw new Error(prepared.success ? t('settings.ai.apple.notReady') : prepared.error);
             }

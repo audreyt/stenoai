@@ -43,7 +43,8 @@ async function hasInstalledTranscriptionModel() {
   const selected = await ipc().transcriptionEngine.get();
   const engine = selected.success ? selected.engine : 'parakeet';
   if (engine === 'apple') {
-    const status = await ipc().appleSpeech.status();
+    const language = await ipc().settings.getLanguage();
+    const status = await ipc().appleSpeech.status(language.success ? language.language : 'auto');
     return status.success && status.available && status.supported && status.installed;
   }
   if (engine === 'openai-asr') return true;
