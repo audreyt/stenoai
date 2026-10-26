@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -5,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src import apple_speech
@@ -47,6 +49,21 @@ class AppleSpeechResolverTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertFalse(result["supported"])
         run.assert_not_called()
+
+    def test_macos_14_and_15_never_resolve_or_spawn_the_sidecar(self):
+        for version in ("14.4", "15.7"):
+            with self.subTest(version=version), patch(
+                "src.config.sys.platform", "darwin"
+            ), patch(
+                "src.config.platform.mac_ver", return_value=(version, ("", "", ""), "arm64")
+            ), patch("src.apple_speech.resolve_sidecar") as resolve, patch(
+                "src.apple_speech.subprocess.run"
+            ) as run:
+                self.assertFalse(apple_speech.status("en")["available"])
+                with self.assertRaisesRegex(RuntimeError, "unavailable on this Mac"):
+                    apple_speech._run(["status", "en"], timeout=15)
+                resolve.assert_not_called()
+                run.assert_not_called()
 
     def test_missing_sidecar_status_is_unavailable_without_spawning(self):
         with patch("src.config.apple_speech_supported", return_value=True), patch(
@@ -119,16 +136,74 @@ class AppleSpeechResolverTests(unittest.TestCase):
 
 class AppleSpeechConfigTests(unittest.TestCase):
     def test_platform_floor(self):
-        self.assertTrue(
-            apple_speech_supported(platform_name="darwin", mac_version="26.0")
-        )
-        for version in ("14.4", "15.7", "25.9"):
+        for version in ("16.0", "16.3", "26.0", "27.0"):
+            self.assertTrue(
+                apple_speech_supported(platform_name="darwin", mac_version=version), version
+            )
+        for version in ("14.4", "15.7", "17.0", "25.9", "unknown"):
             self.assertFalse(
-                apple_speech_supported(platform_name="darwin", mac_version=version)
+                apple_speech_supported(platform_name="darwin", mac_version=version), version
             )
         self.assertFalse(
             apple_speech_supported(platform_name="win32", mac_version="27.0")
         )
+
+    def test_actual_platform_read_uses_the_same_compat_gate(self):
+        with patch("src.config.sys.platform", "darwin"), patch(
+            "src.config.platform.mac_ver", return_value=("16.0", ("", "", ""), "arm64")
+        ):
+            self.assertTrue(apple_speech_supported())
+
+    def test_bundle_requires_sidecar_only_on_supported_macos_versions(self):
+        # Execute only the spec's version helper and transcribe-sidecar branch;
+        # the full PyInstaller spec would analyse packages and require binaries.
+        spec = ast.parse((Path(__file__).parents[1] / "stenoai.spec").read_text())
+        helper = next(
+            node for node in spec.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_macos_is_26_or_newer"
+        )
+        gate = next(
+            node for node in spec.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_REQUIRES_TRANSCRIBE_SIDECAR"
+                    for target in node.targets)
+        )
+        branch = next(
+            node for node in spec.body
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+            and node.test.id == "_REQUIRES_TRANSCRIBE_SIDECAR"
+        )
+        fragment = compile(ast.Module(body=[helper, gate, branch], type_ignores=[]),
+                           "stenoai.spec", "exec")
+        for platform_name, version, expected in (
+            ("darwin", "14.4", False),
+            ("darwin", "15.7", False),
+            ("darwin", "16.0", True),
+            ("darwin", "16.3", True),
+            ("darwin", "17.0", False),
+            ("darwin", "25.9", False),
+            ("darwin", "26.0", True),
+            ("darwin", "27.0", True),
+            ("win32", "26.0", False),
+        ):
+            require_sidecar = Mock(return_value=Path("/fake/steno-transcribe"))
+            namespace = {
+                "sys": SimpleNamespace(platform=platform_name),
+                "Path": Path,
+                "ollama_bin_dir": "/fake/bin",
+                "required_macos_sidecars": {},
+                "require_macos_sidecar": require_sidecar,
+            }
+            with self.subTest(platform=platform_name, version=version), patch(
+                "platform.mac_ver", return_value=(version, ("", "", ""), "arm64")
+            ):
+                exec(fragment, namespace)
+                self.assertEqual(namespace["_REQUIRES_TRANSCRIBE_SIDECAR"], expected)
+                self.assertEqual(require_sidecar.called, expected)
+                self.assertEqual(
+                    namespace["required_macos_sidecars"]["steno-transcribe"] is not None,
+                    expected,
+                )
 
     def test_backend_foundation_preserves_existing_parakeet_default(self):
         with tempfile.TemporaryDirectory() as tmp, patch(

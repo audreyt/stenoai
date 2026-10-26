@@ -56,7 +56,10 @@ def _macos_is_26_or_newer() -> bool:
         import platform
 
         ver = platform.mac_ver()[0]
-        return int(ver.split(".", 1)[0]) >= 26
+        major = int(ver.split(".", 1)[0])
+        # Same pre-26-SDK compatibility view as apple_speech_supported():
+        # macOS 26 may be reported as 16.x (python/cpython#135675).
+        return major == 16 or major >= 26
     except Exception:
         return False
 

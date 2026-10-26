@@ -346,7 +346,12 @@ def apple_speech_supported(
         return False
     version = platform.mac_ver()[0] if mac_version is None else mac_version
     try:
-        return int(version.split(".", 1)[0]) >= 26
+        major = int(version.split(".", 1)[0])
+        # macOS 26 can report 16.x to Python built with a pre-26 SDK.
+        # Apple skipped public macOS 16; keep this exact compat major alongside
+        # 26+, rather than treating every 16..25 value as a supported host.
+        # https://github.com/python/cpython/issues/135675
+        return major == 16 or major >= 26
     except (TypeError, ValueError):
         return False
 
