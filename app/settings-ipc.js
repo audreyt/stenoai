@@ -27,6 +27,7 @@ function registerSettingsIpc({
   ipcMain,
   runPythonScript,
   sendDebugLog,
+  beforeLanguageChange = null,
   onLanguageChanged = null,
 }) {
   ipcMain.handle('get-keep-recordings', async () => {
@@ -187,6 +188,10 @@ function registerSettingsIpc({
 
   ipcMain.handle('set-language', async (event, languageCode) => {
     try {
+      if (typeof beforeLanguageChange === 'function') {
+        const refused = await beforeLanguageChange(languageCode);
+        if (refused) return { success: false, error: refused };
+      }
       sendDebugLog(`Setting language to: ${languageCode}`);
       const result = await runPythonScript('simple_recorder.py', ['set-language', languageCode]);
       const jsonMatch = result.match(/\{.*\}/s);

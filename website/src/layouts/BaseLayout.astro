@@ -1,5 +1,7 @@
 ---
 import '../index.css'
+import '../enterprise.css'
+import '../responsive.css'
 
 const {
   title,
@@ -15,10 +17,10 @@ const isHome = Astro.url.pathname === '/'
 const softwareApplicationJsonLd = {
   '@context': 'https://schema.org',
   '@type': 'SoftwareApplication',
-  name: 'Steno',
+  name: 'StenoAI',
   url: 'https://stenoai.co/',
   description:
-    'Steno is the privacy-first AI notepad and meeting assistant. It records, transcribes, and summarizes meetings entirely on your device — a free, open-source AI notetaker with no cloud, no bots joining calls, and no usage limits.',
+    'Private AI meeting notes for government, defence and confidential work. Records, transcribes and summarises on your device in local mode.',
   applicationCategory: 'BusinessApplication',
   operatingSystem: 'macOS, Windows',
   offers: {
@@ -28,7 +30,14 @@ const softwareApplicationJsonLd = {
   },
 }
 
-const allStructuredData = isHome ? [softwareApplicationJsonLd, ...structuredData] : structuredData
+const websiteJsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'WebSite',
+  name: 'StenoAI',
+  url: 'https://stenoai.co/',
+}
+
+const allStructuredData = isHome ? [websiteJsonLd, softwareApplicationJsonLd, ...structuredData] : structuredData
 ---
 
 <!doctype html>
@@ -45,6 +54,7 @@ const allStructuredData = isHome ? [softwareApplicationJsonLd, ...structuredData
 
     <!-- Open Graph -->
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="StenoAI" />
     {canonical && <meta property="og:url" content={canonical} />}
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
@@ -89,7 +99,8 @@ const allStructuredData = isHome ? [softwareApplicationJsonLd, ...structuredData
     <!-- No-flash dark mode: apply class before first paint -->
     <script is:inline>
       (function() {
-        var stored = localStorage.getItem('theme');
+        var stored;
+        try { stored = localStorage.getItem('theme'); } catch (_) {}
         var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         if (stored === 'dark' || (!stored && prefersDark)) {
           document.documentElement.classList.add('dark');
@@ -98,6 +109,7 @@ const allStructuredData = isHome ? [softwareApplicationJsonLd, ...structuredData
     </script>
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     <slot />
 
     <script>

@@ -27,6 +27,7 @@ function harness(overrides = {}) {
       return overrides.pyResult ?? '{"success": true}';
     },
     sendDebugLog: (msg) => { calls.debug.push(msg); },
+    beforeLanguageChange: overrides.beforeLanguageChange,
     onLanguageChanged: overrides.onLanguageChanged,
   };
   registerSettingsIpc(deps);
@@ -228,6 +229,16 @@ test('set-language does not call onLanguageChanged when backend throws or return
   const resFail = await hFail.handlers['set-language']({}, 'invalid');
   assert.deepStrictEqual(resFail, { success: false, error: 'unsupported language code' });
   assert.strictEqual(hookCalls.length, 0, 'onLanguageChanged must not be called when backend returns success: false');
+});
+
+test('active Apple live session refuses an unprepared language before persistence', async () => {
+  const h = harness({
+    beforeLanguageChange: async (lang) => lang === 'ja' ? 'Prepare Apple speech first' : null,
+    onLanguageChanged: () => { throw new Error('must not restart'); },
+  });
+  assert.deepStrictEqual(await h.handlers['set-language']({}, 'ja'),
+    { success: false, error: 'Prepare Apple speech first' });
+  assert.deepStrictEqual(h.calls.py, []);
 });
 
 test('set-language logs onLanguageChanged callback errors without failing the preference save', async () => {

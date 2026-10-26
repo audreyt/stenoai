@@ -1,3 +1,4 @@
+import { t } from '@/i18n';
 import * as React from 'react';
 // Serialises the report markdown to an HTML string for the branded PDF, using
 // the same react-markdown renderer the detail view renders on screen.
@@ -14,17 +15,19 @@ import {
   Download,
   FileDown,
   FileText,
+  PackageOpen,
   Folder as FolderIcon,
   Globe,
   MoreHorizontal,
   Mic,
   PencilLine,
   RefreshCw,
+  Share,
   Trash2,
   Users,
 } from 'lucide-react';
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { MeetingsShell } from '@/components/MeetingsShell';
 import { SpeakerReviewPanel } from '@/components/SpeakerReviewPanel';
@@ -43,6 +46,7 @@ import {
   useGenerateReport,
   useSetActiveReport,
   useDeleteReport,
+  useUpdateMeeting,
   useUpdateUserNotes,
   meetingsKeys,
 } from '@/hooks/useMeetings';
@@ -53,6 +57,14 @@ import {
   useOrgBackupState,
   useUnshareFromOrgBySummary,
 } from '@/hooks/useOrg';
+import { UI_LOCALE, SYSTEM_HOUR12 } from '@/lib/locale';
+import {
+  keepNoteGenerationCause,
+  noteGenerationErrorFromResult,
+  noteGenerationErrorMessage,
+  isRetranscribeError,
+  type NoteGenerationErrorCode,
+} from '@/lib/noteGenerationError';
 import {
   Dialog,
   DialogContent,
@@ -72,20 +84,53 @@ import {
   useCreateFolder,
 } from '@/hooks/useFolders';
 import { useActiveMeeting } from '@/lib/askBarContext';
-import { ipc, type Meeting, type Report, type Template } from '@/lib/ipc';
+import { ipc, type Meeting, type Report, type Template, type UpdateMeetingPatch } from '@/lib/ipc';
 import { buildTranscriptBundle, defaultExportFilename } from '@/lib/transcriptBundle';
 import { buildNotesCopyText, type StructuredNoteSections } from '@/lib/notesCopy';
+import { buildNotesMarkdown } from '@/lib/notesMarkdown';
 import { buildNotesHtml, hasNotesContent } from '@/lib/notesPdf';
 import { unwrap } from '@/lib/result';
 import { cn } from '@/lib/utils';
-import { navigate } from '@/lib/router';
-import { stripReasoning } from '@/lib/markdown';
+import { navigate, setNavigationGuard } from '@/lib/router';
+import { ReportProperties, splitFrontmatter, stripReasoning } from '@/lib/markdown';
+import {
+  PROPERTIES_OPEN_KEY,
+  PROPERTIES_PANEL_ID,
+  PropertiesToggle,
+  useStoredFlag,
+} from '@/components/ReportPropertiesDisclosure';
+import { asStringArray } from '@/lib/completionNotification';
 import { pendingTitleRegens, streamCache, type StreamPhase } from '@/lib/meetingDetailState';
 import { useReprocessBridge } from '@/hooks/reprocessBridgeStore';
 import { useRecording } from '@/hooks/useRecording';
 import { useAutoSummarizeSetting } from '@/hooks/useSettings';
+import { NoteEditor, hasUserNotesSectionBoundary, type NoteDraft } from './NoteEditor';
+
+import { MEETING_TRANSFER_COPY, useExportMeetingPackage } from '@/hooks/useMeetingTransfer';
 
 const LAST_OPENED_KEY = 'steno-last-opened-meeting';
+
+// The `…` popover's entry markup, lifted to a constant so the Share menu is
+// visually the same control rather than a near-copy that drifts from it. Both
+// popovers are plain `Popover` + buttons (no roving focus); giving them
+// keyboard navigation is an improvement to that shared pattern, not part of the
+// Share menu.
+const MENU_ENTRY_CLASS =
+  'flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50';
+
+// Group separator inside the Share menu. aria-hidden with role="none": it is
+// pure visual grouping, and a `separator` role in a popover that is not a real
+// menu would announce structure the keyboard cannot navigate.
+function MenuDivider() {
+  return (
+    <div
+      role="none"
+      aria-hidden="true"
+      className="mx-2 my-1 h-px"
+      style={{ background: 'var(--border-subtle)' }}
+    />
+  );
+}
 
 // Cross-process sentinel: the export-transcript handler returns this exact error
 // when the user dismisses the save dialog, which we treat as a silent no-op
@@ -94,6 +139,49 @@ const LAST_OPENED_KEY = 'steno-last-opened-meeting';
 // separately and can't require that CJS module, so the contract doc is the source
 // of truth that keeps them aligned.
 const EXPORT_CANCELED_ERROR = 'canceled';
+
+// The note-snapshot sidecar records which sections were edited by their storage
+// keys (`action_items`). A confirm dialog has to name them the way the note
+// editor does, in the order the note lays them out, so the user recognises what
+// is about to be replaced.
+const SECTION_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ['summary', 'Summary'],
+  ['discussion_areas', 'Key topics'],
+  ['key_points', 'Key points'],
+  ['action_items', 'Action items'],
+  ['participants', 'Participants'],
+];
+
+/** `action_items` -> `Action items`, for a key this version has no label for.
+ *  A newer app version can record a section this one doesn't know about; naming
+ *  it readably is better than printing a raw key, and far better than declining
+ *  to warn at all. */
+function humaniseFieldKey(field: string): string {
+  const words = field.replace(/_/g, ' ').trim();
+  return words ? words[0].toUpperCase() + words.slice(1) : field;
+}
+
+/** The human names of the note sections the user has edited, in the order the
+ *  note shows them (not the order the sidecar accumulated them). Empty for
+ *  every "nothing was edited" shape (absent, null, empty, or not an array),
+ *  because a confirm on a note with no edits to lose is worse than none. */
+export function describeEditedSections(editedFields: string[] | undefined | null): string[] {
+  if (!Array.isArray(editedFields) || editedFields.length === 0) return [];
+  const known = SECTION_LABELS.filter(([key]) => editedFields.includes(key)).map(
+    ([, label]) => label
+  );
+  const knownKeys = new Set(SECTION_LABELS.map(([key]) => key));
+  const unknown = editedFields
+    .filter((f) => typeof f === 'string' && !knownKeys.has(f))
+    .map(humaniseFieldKey);
+  return [...known, ...[...new Set(unknown)]];
+}
+
+/** "Summary", "Summary and Action items", "Summary, Key points and Action items". */
+function formatSectionList(labels: string[]): string {
+  if (labels.length <= 1) return labels[0] ?? '';
+  return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+}
 
 interface MeetingDetailProps {
   summaryFile: string;
@@ -113,26 +201,26 @@ export function MeetingDetail({ summaryFile }: MeetingDetailProps) {
     <MeetingsShell activeSummaryFile={summaryFile}>
       {meeting.isLoading || (meeting.isFetching && !meeting.data) ? (
         <div className="flex min-h-[40vh] items-center justify-center text-[color:var(--fg-2)]">
-          Loading meeting…
+          {t('meeting.loading')}
         </div>
       ) : meeting.isError ? (
         <div className="space-y-4 text-center">
-          <h1 className="mv-title">Couldn't load note.</h1>
+          <h1 className="mv-title">{t('meeting.loadError.title')}</h1>
           <p className="text-[17px] leading-[1.55]" style={{ color: 'var(--fg-2)' }}>
-            {(meeting.error as Error)?.message ?? 'An error occurred loading this note.'}
+            {(meeting.error as Error)?.message ?? t('meeting.loadError.fallback')}
           </p>
           <button type="button" className="mv-chip" onClick={() => navigate('/meetings')}>
-            Back to meetings
+            {t('meeting.backToMeetings')}
           </button>
         </div>
       ) : !meeting.data ? (
         <div className="space-y-4 text-center">
-          <h1 className="mv-title">Note not found.</h1>
+          <h1 className="mv-title">{t('meeting.notFound.title')}</h1>
           <p className="text-[17px] leading-[1.55]" style={{ color: 'var(--fg-2)' }}>
-            This recording may have been deleted. Pick another from the sidebar.
+            {t('meeting.notFound.detail')}
           </p>
           <button type="button" className="mv-chip" onClick={() => navigate('/meetings')}>
-            Back to meetings
+            {t('meeting.backToMeetings')}
           </button>
         </div>
       ) : (
@@ -198,7 +286,7 @@ function DetailContent({
 
   const onShareToOrg = async () => {
     setShareError(null);
-    const title = meeting.session_info.name || 'Untitled note';
+    const title = meeting.session_info.name || t('meeting.untitledNote');
     // Body = structured summary markdown (same as local detail page).
     // Transcript ships as a separate S3 artifact so the org viewer can
     // toggle it via the side panel rather than rendering it inline below
@@ -279,8 +367,36 @@ function DetailContent({
   const [chunkProgress, setChunkProgress] = React.useState<{ step: number; total: number } | null>(
     null
   );
-  const [reprocessFailed, setReprocessFailed] = React.useState(false);
+  const [reprocessError, setReprocessError] = React.useState<NoteGenerationErrorCode | null>(null);
+  const reprocessFailed = reprocessError !== null;
+  // Error-code fallback for the message lookup below. Hoisted out of JSX so the
+  // i18n gate does not read the code as user-facing copy.
+  const reprocessErrorCode: NoteGenerationErrorCode = reprocessError ?? 'generation_failed';
   const qc = useQueryClient();
+
+  // Note editing (D9): the generated note is a document until the user asks to
+  // edit it. Declared up here because the streaming listeners below have to see
+  // it; they're registered once per meeting, so they read it through a ref
+  // rather than re-subscribing on every keystroke's re-render.
+  const [editing, setEditing] = React.useState(false);
+  // Lifted out of the editor so the navigation guard can ask whether there is
+  // anything to lose. A ref, not state: the guard reads it at the moment of
+  // navigation, so a route change right after a keystroke is still caught.
+  const noteDirtyRef = React.useRef(false);
+  const handleNoteDirtyChange = React.useCallback((dirty: boolean) => {
+    noteDirtyRef.current = dirty;
+  }, []);
+  // Where the user tried to go while the editor held unsaved changes. Non-null
+  // opens the discard confirmation; confirming continues to this route.
+  const [pendingRoute, setPendingRoute] = React.useState<string | null>(null);
+  const updateMeeting = useUpdateMeeting();
+  const editingRef = React.useRef(editing);
+  // Layout effect, not a render-time assignment: it still lands before the
+  // renderer yields to the next task, so no IPC chunk can observe a stale
+  // value, and it keeps the ref out of the render path.
+  React.useLayoutEffect(() => {
+    editingRef.current = editing;
+  }, [editing]);
 
   // Report switch: null = the structured Standard summary, otherwise the id of
   // a generated report in meeting.reports. Seeded from the meeting's persisted
@@ -313,6 +429,11 @@ function DetailContent({
     const sessionName = info.name;
     const offChunk = ipc().on.summaryChunk((e) => {
       if (e.summaryFile !== summaryFile) return;
+      // A regenerate that finishes while the user is editing must not swap the
+      // note out from under them. Holding the stream is the conservative choice:
+      // the regenerated note is still on disk and appears as soon as they leave
+      // edit mode.
+      if (editingRef.current) return;
       // Promote from idle too (not just analyzing): an instant-stop note's
       // first-ever summary streams in with no prior reprocess to seed
       // 'analyzing', so without idle→generating the StreamingView (gated on
@@ -335,11 +456,14 @@ function DetailContent({
           setStreamText('');
           streamCache.delete(summaryFile);
         } else {
-          setReprocessFailed(true);
+          setStreamText('');
+          streamCache.delete(summaryFile);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, e.error_code));
         }
         return;
       }
       setStreamPhase('done');
+      if (!e.report) setReprocessError(null);
       // Report generation reuses the summary stream. On success, refetch this
       // meeting so reports[]/active_report refresh, then land on the new report
       // (the backend marks it active) once the fresh detail payload arrives.
@@ -379,7 +503,9 @@ function DetailContent({
           setStreamText('');
           streamCache.delete(summaryFile);
         } else {
-          setReprocessFailed(true);
+          setStreamText('');
+          streamCache.delete(summaryFile);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, e.error_code));
         }
         return;
       }
@@ -418,7 +544,7 @@ function DetailContent({
     setStreamText('');
     setStreamPhase('analyzing');
     setChunkProgress(null);
-    setReprocessFailed(false);
+    setReprocessError(null);
     generatingReportRef.current = true;
     streamCache.set(summaryFile, { text: '', phase: 'analyzing' });
     generateReport.mutate(
@@ -438,27 +564,56 @@ function DetailContent({
     );
   };
 
-  const startReprocess = () => {
-    // Synchronous re-entrancy guard (#313 review): the floating dock button's
-    // disabled state arrives one commit late (published via effect to the
-    // reprocess bridge), so a fast double-click there could fire two
-    // overlapping `reprocess` jobs for the same file — main.js deliberately
-    // allows concurrent jobs across files and has no same-file dedupe.
-    // streamCache is a module-level Map written synchronously below, so it
-    // can't lag the way state/props can.
+  // Which sections of this note the user has edited since it was generated, as
+  // main read them from the `_original.json` sidecar. Every path that rebuilds
+  // the note replaces these, so each one asks first. Empty whenever there is
+  // nothing to lose (no sidecar, an unreadable one, or an unedited note), which
+  // is what keeps the confirm off notes it would only teach people to dismiss.
+  const editedSections = React.useMemo(
+    () => describeEditedSections(meeting.edited_fields),
+    [meeting.edited_fields]
+  );
+  const hasNoteEdits = editedSections.length > 0;
+  const editedSectionsText = formatSectionList(editedSections);
+  const [confirmRegenerate, setConfirmRegenerate] = React.useState(false);
+
+  // Synchronous re-entrancy guard (#313 review): the floating dock button's
+  // disabled state arrives one commit late (published via effect to the
+  // reprocess bridge), so a fast double-click there could fire two
+  // overlapping `reprocess` jobs for the same file - main.js deliberately
+  // allows concurrent jobs across files and has no same-file dedupe.
+  // streamCache is a module-level Map written synchronously by the starters
+  // below, so it can't lag the way state/props can.
+  //
+  // `editing` belongs here rather than on each click handler because the two
+  // rebuild paths that are NOT this component's own buttons (the floating
+  // GenerateNotesBar, which calls the published `start`, and the re-transcribe
+  // menu item) would otherwise slip through. With an open editor the stream is
+  // suppressed (editingRef), so a rebuild started here is invisible: Python
+  // rewrites the note, and the next Save patches the FRESH note with the
+  // PRE-regeneration draft, silently replacing content the user never saw. The
+  // #249 standard-backup does not rescue that - it holds the note as it was
+  // BEFORE the regenerate, not the generated text that was just overwritten.
+  const rebuildInFlight = () => {
     const cached = streamCache.get(summaryFile);
-    if (
+    return (
+      editing ||
       reprocess.isPending ||
       streamPhase !== 'idle' ||
       cached?.phase === 'analyzing' ||
       cached?.phase === 'generating'
-    ) {
-      return;
-    }
+    );
+  };
+
+  const runReprocess = () => {
+    // Re-checked here and not only at the entry points: the confirm dialog puts
+    // an arbitrary amount of user time between the click and this call, and a
+    // background job for this note can start in that window.
+    if (rebuildInFlight()) return;
     setStreamText('');
     setStreamPhase('analyzing');
     setChunkProgress(null);
-    setReprocessFailed(false);
+    setReprocessError(null);
     streamCache.set(summaryFile, { text: '', phase: 'analyzing' });
     reprocess.mutate(
       { summaryFile, regenTitle: false, name: info.name },
@@ -468,15 +623,28 @@ function DetailContent({
         // could fire to roll the UI back — without this the analyzing/streaming
         // state would be stuck forever with no way to retry (mirrors
         // onGenerateReport's onError below).
-        onError: () => {
+        onError: (error) => {
           setStreamPhase('idle');
           setStreamText('');
           setChunkProgress(null);
           streamCache.delete(summaryFile);
-          setReprocessFailed(true);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, noteGenerationErrorFromResult(error)));
         },
       }
     );
+  };
+
+  // The single entry point for "rebuild this note from the transcript". The
+  // header icon, the retry banner and the floating GenerateNotesBar all come
+  // through here, so the guard lives here rather than on each click handler:
+  // one of those three is not even in this component's tree.
+  const startReprocess = () => {
+    if (rebuildInFlight()) return;
+    if (hasNoteEdits) {
+      setConfirmRegenerate(true);
+      return;
+    }
+    runReprocess();
   };
 
   // Re-transcribe (#266): re-run ASR on the source recording with the current
@@ -485,21 +653,15 @@ function DetailContent({
   // swap which mutation fires. Transcription is silent (no CHUNK), so the view
   // stays in "analyzing" until summarisation streams, matching reprocess's
   // pre-first-chunk state. Mirrors startReprocess's re-entrancy guard + onError.
+  // It rewrites the note too, so it discards edits exactly like a reprocess:
+  // its existing confirm below carries the warning instead of stacking a second
+  // dialog on top of it.
   const startRetranscribe = () => {
-    const cached = streamCache.get(summaryFile);
-    if (
-      retranscribe.isPending ||
-      reprocess.isPending ||
-      streamPhase !== 'idle' ||
-      cached?.phase === 'analyzing' ||
-      cached?.phase === 'generating'
-    ) {
-      return;
-    }
+    if (retranscribe.isPending || rebuildInFlight()) return;
     setStreamText('');
     setStreamPhase('analyzing');
     setChunkProgress(null);
-    setReprocessFailed(false);
+    setReprocessError(null);
     streamCache.set(summaryFile, { text: '', phase: 'analyzing' });
     retranscribe.mutate(
       { summaryFile, name: info.name },
@@ -507,12 +669,12 @@ function DetailContent({
         // A rejection means the IPC/backend failed (e.g. RETRANSCRIBE_NO_AUDIO,
         // or ASR crashed) BEFORE a summary-complete could roll the UI back —
         // surface the shared reprocess failure affordance. Same as startReprocess.
-        onError: () => {
+        onError: (error) => {
           setStreamPhase('idle');
           setStreamText('');
           setChunkProgress(null);
           streamCache.delete(summaryFile);
-          setReprocessFailed(true);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, noteGenerationErrorFromResult(error)));
         },
       }
     );
@@ -540,15 +702,19 @@ function DetailContent({
   // rejected clipboard (permission denied, no focus) must not show a false
   // success. The transcript bundle is large and the only thing a user pastes
   // into an LLM, so a silent miscopy is worse here than for the small notes copy.
+  // Returns whether the copy actually landed, so the Share menu only
+  // self-closes on success and a failure keeps the error line in view.
   const copyTranscriptForAi = async () => {
-    if (!transcriptBundle) return;
+    if (!transcriptBundle) return false;
     setExportError(null);
     try {
       await navigator.clipboard.writeText(transcriptBundle);
       setCopiedTranscript(true);
       setTimeout(() => setCopiedTranscript(false), 1500);
+      return true;
     } catch (error) {
-      setExportError(`Couldn't copy transcript: ${getErrorMessage(error)}`);
+      setExportError(t('meeting.copyTranscriptFailed', { error: getErrorMessage(error) }));
+      return false;
     }
   };
 
@@ -564,10 +730,12 @@ function DetailContent({
         transcriptBundle
       );
       if (!res.success && res.error !== EXPORT_CANCELED_ERROR) {
-        setExportError(`Couldn't save transcript: ${res.error || 'unknown error'}`);
+        setExportError(
+          t('meeting.saveTranscriptFailed', { error: res.error || t('meeting.unknownError') })
+        );
       }
     } catch (error) {
-      setExportError(`Couldn't save transcript: ${getErrorMessage(error)}`);
+      setExportError(t('meeting.saveTranscriptFailed', { error: getErrorMessage(error) }));
     }
   };
 
@@ -595,42 +763,72 @@ function DetailContent({
   // built lazily on click in saveNotesPdf, not on every render. An open report
   // counts on its own: a transcript-only note (auto-summarise off) has no
   // structured sections but can still have a generated report on screen.
+  // A report can OPEN with YAML frontmatter (a template that asks for it).
+  // Markdown has no concept of it, so react-markdown renders the delimiters as
+  // a rule and a heading underline (see splitFrontmatter). Split once here,
+  // and both the view and the PDF render the same two halves.
+  const reportParts = React.useMemo(
+    () => splitFrontmatter(activeReport ? stripReasoning(activeReport.content) : ''),
+    [activeReport],
+  );
+  // On screen the properties fold away behind a disclosure (see
+  // ReportPropertiesDisclosure); the PDF always has them.
+  const [propertiesOpen, toggleProperties] = useStoredFlag(PROPERTIES_OPEN_KEY);
+
   const canExportNotesPdf = activeReport
-    ? Boolean(stripReasoning(activeReport.content).trim())
+    ? Boolean(reportParts.body.trim() || reportParts.properties.length)
     : hasNotesContent(noteSections);
 
-  // Branded-PDF export of whichever note is on screen — the open template
-  // report when one is selected, otherwise the Standard structured note. The
-  // report's markdown is serialised with the SAME renderer the view above uses
+  // Branded PDF of whichever note is on screen — the open template report when
+  // one is selected, otherwise the Standard structured note. The report's
+  // markdown is serialised with the SAME renderer the view above uses
   // (react-markdown), so the PDF can't drift from what the user is looking at.
-  // Hands finished HTML to the export-note-pdf IPC, which rasterises + writes it.
-  const saveNotesPdf = async () => {
-    if (!canExportNotesPdf) return;
-    setExportError(null);
-    try {
-      const reportForPdf = activeReport
+  //
+  // Both PDF surfaces go through here — "Save notes as PDF" below and "Share
+  // notes as PDF" in the share menu. They are two adjacent actions on the same
+  // document, and #426 exists because one of them was left exporting the
+  // Standard note while a report was open; a single builder is what keeps them
+  // from disagreeing again. Called on click, never on render: the branded shell
+  // is ~45KB with its base64 font.
+  const buildNotesPdfHtml = () =>
+    buildNotesHtml(
+      noteSections,
+      activeReport
         ? {
             templateName: activeReport.template_name,
             contentHtml: renderToStaticMarkup(
-              <ReactMarkdown>{stripReasoning(activeReport.content)}</ReactMarkdown>,
+              <>
+                <ReportProperties properties={reportParts.properties} />
+                <ReactMarkdown>{reportParts.body}</ReactMarkdown>
+              </>,
             ),
           }
-        : null;
+        : null
+    );
+
+  // Hands finished HTML to the export-note-pdf IPC, which rasterises + writes it.
+  const saveNotesPdf = async () => {
+    if (editing || !canExportNotesPdf) return;
+    setExportError(null);
+    try {
       const res = await ipc().meetings.exportNotePdf(
         defaultExportFilename(meeting, 'pdf'),
-        buildNotesHtml(noteSections, reportForPdf)
+        buildNotesPdfHtml()
       );
       if (!res.success && res.error !== EXPORT_CANCELED_ERROR) {
-        setExportError(`Couldn't save notes: ${res.error || 'unknown error'}`);
+        setExportError(
+          t('meeting.saveNotesFailed', { error: res.error || t('meeting.unknownError') })
+        );
       }
     } catch (error) {
-      setExportError(`Couldn't save notes: ${getErrorMessage(error)}`);
+      setExportError(t('meeting.saveNotesFailed', { error: getErrorMessage(error) }));
     }
   };
 
   // Copies whichever note is on screen: the open template report when one is
   // selected, otherwise the Standard structured note.
   const copyNotes = () => {
+    if (editing || streamPhase !== 'idle') return;
     const text = buildNotesCopyText(
       noteSections,
       activeReport ? { content: stripReasoning(activeReport.content) } : null
@@ -640,7 +838,159 @@ function DetailContent({
     setTimeout(() => setCopied(false), 2000);
   };
 
+  // The active report, reasoning stripped, in the shape the note builders take.
+  // Same selection as copyNotes: whichever note is on screen is what leaves.
+  const reportForExport = activeReport
+    ? { content: stripReasoning(activeReport.content) }
+    : null;
+
+  // Notes exports are off while a summary/report stream is on screen, for the
+  // same reason Copy notes is: otherwise the pre-stream note is written out
+  // while its replacement is still arriving. The same holds while the editor is
+  // open: the exports read the saved note, not the draft on screen.
+  const notesExportBlocked = editing || streamPhase !== 'idle';
+
+  // Notes and transcript must not suggest the same filename. Both are .md, and
+  // on the share path they land in ONE directory where the second write would
+  // silently replace the first - including under an already-open mail draft,
+  // whose attachment would then quietly become the other document.
+  const notesMarkdownFilename = () =>
+    defaultExportFilename(meeting, 'md').replace(/\.md$/, '-notes.md');
+
+  // Markdown export of the note. Needs no main-process code of its own:
+  // export-transcript already takes an arbitrary string and filters to .md.
+  const saveNotesMarkdown = async () => {
+    if (!canExportNotesPdf || notesExportBlocked) return;
+    setExportError(null);
+    try {
+      const res = await ipc().meetings.exportTranscript(
+        notesMarkdownFilename(),
+        buildNotesMarkdown(noteSections, reportForExport)
+      );
+      if (!res.success && res.error !== EXPORT_CANCELED_ERROR) {
+        setExportError(`Couldn't save notes: ${res.error || 'unknown error'}`);
+      }
+    } catch (error) {
+      setExportError(`Couldn't save notes: ${getErrorMessage(error)}`);
+    }
+  };
+
+  // The Share menu is controlled so a copy can leave its "Copied" label on
+  // screen for a beat before dismissing itself. Inside a menu the old checkmark
+  // feedback would vanish with the popover before it registered.
+  const [shareOpen, setShareOpen] = React.useState(false);
+  const shareCloseTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Identifies the current menu instance. An auto-close belongs to the instance
+  // the copy happened in, and cancelling on open/close is not enough on its own:
+  // the transcript copy awaits the clipboard first, so a menu closed and
+  // reopened during that await has no timer yet to cancel, and the resolving
+  // promise would then schedule one against the new instance. Both the
+  // scheduling and the firing therefore check the epoch.
+  const shareEpoch = React.useRef(0);
+  const cancelShareClose = () => {
+    if (shareCloseTimer.current) {
+      clearTimeout(shareCloseTimer.current);
+      shareCloseTimer.current = null;
+    }
+  };
+  const closeShareAfterCopy = (epoch: number) => {
+    if (shareEpoch.current !== epoch) return;
+    cancelShareClose();
+    shareCloseTimer.current = setTimeout(() => {
+      if (shareEpoch.current === epoch) setShareOpen(false);
+    }, 800);
+  };
+  const onShareOpenChange = (open: boolean) => {
+    cancelShareClose();
+    shareEpoch.current += 1;
+    setShareOpen(open);
+  };
+  React.useEffect(() => cancelShareClose, []);
+
+  // Is there a native share sheet here at all. A capability answered by the main
+  // process, NOT the renderer's isMac: that is a navigator.platform constant
+  // frozen at import, so it can neither be flipped at runtime nor exercised in
+  // both directions by a test - and the absent branch is the one that keeps
+  // Windows from reaching a ShareMenu that does not exist there.
+  // `=== true` means an unresolved query counts as false, so the group never
+  // flashes in before it is known to exist. Cached across notes: the answer
+  // cannot change while the app runs.
+  const shareCapability = useQuery({
+    queryKey: ['share', 'canShare'],
+    queryFn: () => ipc().share.canShare(),
+    staleTime: Infinity,
+  });
+  const canShareToSheet = shareCapability.data === true;
+
+  // Which share is in flight, or null. Unlike the save actions there is no
+  // dialog to react to a click: up to 15 seconds pass before the sheet appears,
+  // and in that gap everyone clicks a second time. So the clicked entry says so,
+  // and only one share may be in flight across all three.
+  type ShareEntry = 'notes-pdf' | 'notes-md' | 'transcript';
+  const [sharing, setSharing] = React.useState<ShareEntry | null>(null);
+
+  const runShare = async (
+    entry: ShareEntry,
+    kind: 'pdf' | 'text',
+    what: 'notes' | 'transcript',
+    filename: string,
+    payload: string,
+    trigger: HTMLElement,
+  ) => {
+    // The disabled attribute already blocks the second click; this is what
+    // actually holds if a re-render lands between the click and the state
+    // update.
+    if (sharing) return;
+    // Read the anchor BEFORE the await: the entry re-renders as "Preparing…"
+    // and the menu can reflow, so a rectangle read afterwards would point at
+    // something else. The sheet is anchored under the clicked entry.
+    const rect = trigger.getBoundingClientRect();
+    const anchor = { x: Math.round(rect.left), y: Math.round(rect.bottom) };
+    setSharing(entry);
+    setExportError(null);
+    try {
+      const res = await ipc().share.shareFile(kind, filename, payload, anchor);
+      if (!res.success) {
+        setExportError(`Couldn't share ${what}: ${res.error || 'unknown error'}`);
+      }
+    } catch (error) {
+      setExportError(`Couldn't share ${what}: ${getErrorMessage(error)}`);
+    } finally {
+      setSharing(null);
+    }
+  };
+
   const summary = meeting.summary?.trim();
+  // Seeded from what the read-only note actually shows, reasoning stripped.
+  // Editing the summary must not resurrect a <think> block the UI hides.
+  const noteDraft: NoteDraft = {
+    summary: summary ? stripReasoning(summary) : '',
+    keyPoints: meeting.key_points ?? [],
+    actionItems: asStringArray(meeting.action_items),
+    discussionAreas: asDiscussionAreas(meeting.discussion_areas),
+  };
+  const closeEditor = () => {
+    setEditing(false);
+    handleNoteDirtyChange(false);
+  };
+  // A rejected mutation (main refuses a forged heading, or the write fails)
+  // propagates to the editor, which keeps edit mode and the typing.
+  const saveNoteEdits = async (patch: UpdateMeetingPatch) => {
+    await updateMeeting.mutateAsync({ summaryFile, patch });
+    closeEditor();
+  };
+  // Every way out of this view (back button, sidebar, command palette, a deep
+  // link to another note) goes through navigate(), so while the editor holds
+  // unsaved changes one router guard stops all of them and asks first (#447).
+  React.useEffect(() => {
+    if (!editing) return undefined;
+    return setNavigationGuard((target) => {
+      if (!noteDirtyRef.current) return true;
+      setPendingRoute(target);
+      return false;
+    });
+  }, [editing]);
+  const leaveDetail = () => navigate('/');
   const participants = asStringArray(meeting.participants);
   const keyPoints = meeting.key_points ?? [];
   const actionItems = asStringArray(meeting.action_items);
@@ -664,11 +1014,19 @@ function DetailContent({
   // which collides for two default-"Note" notes); a recording on a *different*
   // note leaves this note's CTA untouched.
   const recording = useRecording();
+  const exportMeeting = useExportMeetingPackage();
   const isRecordingThisNote =
     recording.status !== 'idle' &&
     recording.status !== 'processing' &&
     recording.recordingSummaryFile != null &&
     recording.recordingSummaryFile === info.summary_file;
+
+  // Empty Standard notes remain editable, but an active recording or a
+  // processing placeholder still has a background writer that would replace it.
+  const canEditNote =
+    summaryFile.endsWith('_summary.md') && !activeReport &&
+    streamPhase === 'idle' && !reprocess.isPending &&
+    !isProcessing && !isRecordingThisNote;
 
   // Publish this note's reprocess trigger + streaming state so the floating
   // GenerateNotesBar (mounted at App level, above the Ask bar) drives THIS
@@ -716,7 +1074,7 @@ function DetailContent({
         streaming: reprocessStreaming,
         // Always "Generate notes" — no separate Regenerate wording. Every
         // record/continue → stop leaves this one CTA.
-        label: 'Generate notes',
+        label: t('meeting.generateNotes'),
         start: stableStartReprocess,
       });
     } else {
@@ -737,8 +1095,18 @@ function DetailContent({
   // My notes tab: an always-available editable notes layer, independent of
   // the summary. Persists to the `## User Notes` section (autosave). Local
   // state resets per meeting because DetailContent is keyed by summaryFile.
-  const [tab, setTab] = React.useState<'summary' | 'notes'>('summary');
   const hasUserNotes = Boolean((meeting.user_notes ?? '').trim());
+  const [tab, setTab] = React.useState<'summary' | 'notes'>(() =>
+    meeting.steno_transfer && !summary && hasUserNotes ? 'notes' : 'summary'
+  );
+
+  // Only a generated report that opens with frontmatter has properties.
+  const showProperties =
+    tab === 'summary' &&
+    !!activeReport &&
+    !editing &&
+    streamPhase === 'idle' &&
+    reportParts.properties.length > 0;
 
   return (
     <article data-testid="meeting-detail" className="space-y-9">
@@ -749,48 +1117,32 @@ function DetailContent({
         <div className="flex items-center justify-between gap-3">
           <button
             type="button"
-            onClick={() => navigate('/')}
-            aria-label="Back to home"
+            onClick={leaveDetail}
+            aria-label={t('meeting.backHomeAria')}
             className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[12.5px] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
             style={{ color: 'var(--fg-2)' }}
           >
             <ChevronLeft className="size-[15px]" />
-            Home
+            {t('meeting.home')}
           </button>
           <div className="flex items-center gap-1">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                {/* Disabled while a summary/report stream is on screen — the
-                    clipboard would otherwise get the old note while the body
-                    shows the in-flux streamed text. */}
-                <ActionIconButton
-                  label={copied ? 'Copied' : 'Copy notes'}
-                  onClick={copyNotes}
-                  disabled={streamPhase !== 'idle'}
-                >
-                  {copied ? <Check className="size-[13px]" /> : <Copy className="size-[13px]" />}
-                </ActionIconButton>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">{copied ? 'Copied!' : 'Copy notes'}</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <ActionIconButton
-                  label={copiedTranscript ? 'Copied' : 'Copy transcript'}
-                  onClick={() => void copyTranscriptForAi()}
-                  disabled={!transcriptBundle}
-                >
-                  {copiedTranscript ? (
-                    <Check className="size-[13px]" />
-                  ) : (
-                    <FileText className="size-[13px]" />
-                  )}
-                </ActionIconButton>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">
-                {copiedTranscript ? 'Copied!' : 'Copy transcript'}
-              </TooltipContent>
-            </Tooltip>
+            {/* Edit the generated note (D9). Only for the Standard structured
+                note (a template report is generated output with no section
+                grammar to patch) and only while nothing else is rewriting it. */}
+            {tab === 'summary' && !editing && summaryFile.endsWith('_summary.md') && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <ActionIconButton
+                    label={t('noteEditor.edit')}
+                    onClick={() => setEditing(true)}
+                    disabled={!canEditNote}
+                  >
+                    <PencilLine className="size-[13px]" />
+                  </ActionIconButton>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{t('noteEditor.edit')}</TooltipContent>
+              </Tooltip>
+            )}
             {/* Re-runs summarisation on the existing transcript. A
                 transcription-failure note has no transcript, so reprocess
                 would exit non-zero and strand the UI on a spinner — hide it
@@ -799,12 +1151,19 @@ function DetailContent({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <ActionIconButton
-                    label="Generate notes"
+                    label={t('meeting.generateNotes')}
                     onClick={startReprocess}
                     // Disable while a recording is live on THIS note — same
                     // reason the floating CTA hides: don't summarise a
                     // still-growing transcript out from under the recording.
-                    disabled={reprocess.isPending || streamPhase !== 'idle' || isRecordingThisNote}
+                    // Also off while the note editor is open: a regenerate
+                    // would discard the edit being typed.
+                    disabled={
+                      reprocess.isPending ||
+                      streamPhase !== 'idle' ||
+                      isRecordingThisNote ||
+                      editing
+                    }
                   >
                     <RefreshCw
                       className={cn(
@@ -817,15 +1176,168 @@ function DetailContent({
                     />
                   </ActionIconButton>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Generate notes</TooltipContent>
+                <TooltipContent side="bottom">{t('meeting.generateNotes')}</TooltipContent>
               </Tooltip>
             )}
+            {/* Everything that carries this note OUT of the app, in one place:
+                the two clipboard actions, the file saves, and (macOS only) the
+                native share sheet. The org share deliberately stays in the `…`
+                menu next to Delete: it uploads to a server and has an inverse
+                action, where every entry here is a one-off local act. */}
+            <Popover open={shareOpen} onOpenChange={onShareOpenChange}>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={t('noteShare.menuLabel')}
+                  title={t('noteShare.menuLabel')}
+                  className="inline-flex size-7 items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
+                  style={{ color: 'var(--fg-2)' }}
+                >
+                  <Share className="size-[14px]" />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-60 p-1" data-testid="note-share-menu">
+                {/* Disabled while a summary/report stream is on screen - the
+                    clipboard would otherwise get the old note while the body
+                    shows the in-flux streamed text. */}
+                <button
+                  type="button"
+                  className={MENU_ENTRY_CLASS}
+                  style={{ color: 'var(--fg-1)' }}
+                  onClick={() => {
+                    copyNotes();
+                    closeShareAfterCopy(shareEpoch.current);
+                  }}
+                  disabled={notesExportBlocked}
+                >
+                  <Copy className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                  {copied ? t('meeting.copied') : t('meeting.copyNotes')}
+                </button>
+                <button
+                  type="button"
+                  className={MENU_ENTRY_CLASS}
+                  style={{ color: 'var(--fg-1)' }}
+                  onClick={() => {
+                    // Captured BEFORE the await: if the menu is dismissed and
+                    // reopened while the clipboard write is in flight, this copy
+                    // no longer owns the menu that is on screen.
+                    const epoch = shareEpoch.current;
+                    void copyTranscriptForAi().then((ok) => {
+                      if (ok) closeShareAfterCopy(epoch);
+                    });
+                  }}
+                  disabled={!transcriptBundle}
+                >
+                  <FileText className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                  {copiedTranscript ? t('meeting.copied') : t('meeting.copyTranscript')}
+                </button>
+                <MenuDivider />
+                <button
+                  type="button"
+                  className={MENU_ENTRY_CLASS}
+                  style={{ color: 'var(--fg-1)' }}
+                  onClick={() => void saveNotesPdf()}
+                  disabled={!canExportNotesPdf || notesExportBlocked}
+                >
+                  <FileDown className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                  {t('meeting.saveNotesAs')}
+                </button>
+                <button
+                  type="button"
+                  className={MENU_ENTRY_CLASS}
+                  style={{ color: 'var(--fg-1)' }}
+                  onClick={() => void saveNotesMarkdown()}
+                  disabled={!canExportNotesPdf || notesExportBlocked}
+                >
+                  <Download className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                  {t('noteShare.saveNotesMarkdown')}
+                </button>
+                <button
+                  type="button"
+                  className={MENU_ENTRY_CLASS}
+                  style={{ color: 'var(--fg-1)' }}
+                  onClick={() => void saveTranscript()}
+                  disabled={!transcriptBundle}
+                >
+                  <Download className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                  {t('meeting.saveTranscriptAs')}
+                </button>
+                {/* Native share sheet (AirDrop, Mail, Messages, Notes). macOS
+                    only, and rendered only when the main process says a sheet
+                    exists. Share transcript stands as its own entry rather than
+                    riding along inside a combined action: it puts the full
+                    verbatim transcript into an outbound channel, and that
+                    deserves a deliberate click. */}
+                {canShareToSheet && (
+                  <>
+                    <MenuDivider />
+                    <button
+                      type="button"
+                      className={MENU_ENTRY_CLASS}
+                      style={{ color: 'var(--fg-1)' }}
+                      onClick={(e) =>
+                        void runShare(
+                          'notes-pdf',
+                          'pdf',
+                          'notes',
+                          defaultExportFilename(meeting, 'pdf'),
+                          buildNotesPdfHtml(),
+                          e.currentTarget
+                        )
+                      }
+                      disabled={!canExportNotesPdf || notesExportBlocked || sharing !== null}
+                    >
+                      <FileDown className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                      {sharing === 'notes-pdf' ? t('noteShare.preparing') : t('noteShare.notesPdf')}
+                    </button>
+                    <button
+                      type="button"
+                      className={MENU_ENTRY_CLASS}
+                      style={{ color: 'var(--fg-1)' }}
+                      onClick={(e) =>
+                        void runShare(
+                          'notes-md',
+                          'text',
+                          'notes',
+                          notesMarkdownFilename(),
+                          buildNotesMarkdown(noteSections, reportForExport),
+                          e.currentTarget
+                        )
+                      }
+                      disabled={!canExportNotesPdf || notesExportBlocked || sharing !== null}
+                    >
+                      <Share className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                      {sharing === 'notes-md' ? t('noteShare.preparing') : t('noteShare.notesMarkdown')}
+                    </button>
+                    <button
+                      type="button"
+                      className={MENU_ENTRY_CLASS}
+                      style={{ color: 'var(--fg-1)' }}
+                      onClick={(e) =>
+                        void runShare(
+                          'transcript',
+                          'text',
+                          'transcript',
+                          defaultExportFilename(meeting),
+                          transcriptBundle ?? '',
+                          e.currentTarget
+                        )
+                      }
+                      disabled={!transcriptBundle || sharing !== null}
+                    >
+                      <FileText className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
+                      {sharing === 'transcript' ? t('noteShare.preparing') : t('noteShare.transcript')}
+                    </button>
+                  </>
+                )}
+              </PopoverContent>
+            </Popover>
             <Popover>
               <PopoverTrigger asChild>
                 <button
                   type="button"
-                  aria-label="More options"
-                  title="More options"
+                  aria-label={t('meeting.moreOptions')}
+                  title={t('meeting.moreOptions')}
                   className="inline-flex size-7 items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
                   style={{ color: 'var(--fg-2)' }}
                 >
@@ -843,28 +1355,33 @@ function DetailContent({
                   }}
                 >
                   <FolderIcon className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                  View containing folder
+                  {t('meeting.viewContainingFolder')}
                 </button>
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
-                  style={{ color: 'var(--fg-1)' }}
-                  onClick={() => void saveTranscript()}
-                  disabled={!transcriptBundle}
-                >
-                  <Download className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                  Save transcript as .md…
-                </button>
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
-                  style={{ color: 'var(--fg-1)' }}
-                  onClick={() => void saveNotesPdf()}
-                  disabled={!canExportNotesPdf}
-                >
-                  <FileDown className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                  Save notes as PDF…
-                </button>
+                {ipc().app.platform === 'darwin' && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
+                    style={{ color: 'var(--fg-1)' }}
+                    onClick={() => exportMeeting.mutate(info.summary_file)}
+                    disabled={
+                      editing ||
+                      exportMeeting.isPending ||
+                      recording.isLoading ||
+                      recording.reprocessingSummaryFiles.size > 0 ||
+                      recording.status === 'recording' ||
+                      recording.status === 'paused' ||
+                      recording.status === 'processing' ||
+                      isProcessing ||
+                      streamPhase !== 'idle'
+                    }
+                  >
+                    <PackageOpen
+                      className="size-[13px] shrink-0"
+                      style={{ color: 'var(--fg-2)' }}
+                    />
+                    {MEETING_TRANSFER_COPY.exportAction}
+                  </button>
+                )}
                 {/* Re-transcribe (#266): only when the source recording still
                     exists (keep-recordings was on). Disabled while a stream is on
                     screen or a recording is live on this note. */}
@@ -879,11 +1396,18 @@ function DetailContent({
                       reprocess.isPending ||
                       retranscribe.isPending ||
                       streamPhase !== 'idle' ||
-                      isRecordingThisNote
+                      isRecordingThisNote ||
+                      // A re-transcribe rewrites the note exactly like a
+                      // regenerate, so it gets the same editing lock as the two
+                      // Generate-notes CTAs (startRetranscribe's own
+                      // rebuildInFlight check is the authority; this only stops
+                      // the confirm dialog from opening over an editor it can
+                      // no longer act on).
+                      editing
                     }
                   >
                     <Mic className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                    Re-transcribe recording
+                    {t('meeting.retranscribeAction')}
                   </button>
                 )}
                 {orgSession.data?.signedIn &&
@@ -894,10 +1418,10 @@ function DetailContent({
                       style={{ color: 'var(--fg-1)' }}
                       onClick={() => setUnshareOpen(true)}
                       disabled={isUnsharing}
-                      title={`Unshare from ${orgSession.data.orgId}`}
+                      title={t('meeting.unshareFrom', { org: orgSession.data.orgId })}
                     >
                       <Globe className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                      {`Unshare from ${orgSession.data.orgId}`}
+                      {t('meeting.unshareFrom', { org: orgSession.data.orgId })}
                     </button>
                   ) : (
                     <button
@@ -910,14 +1434,14 @@ function DetailContent({
                       // mount would treat the note as "not shared" and
                       // upload a duplicate against an already-shared note.
                       disabled={isSharing || backupState.isLoading}
-                      title={`Share with ${orgSession.data.orgId}`}
+                      title={t('meeting.shareWith', { org: orgSession.data.orgId })}
                     >
                       <Globe className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
                       {isSharing
-                        ? 'Sharing…'
+                        ? t('meeting.sharing')
                         : shareError
-                          ? `Share failed: ${shareError}`
-                          : `Share with ${orgSession.data.orgId}`}
+                          ? t('meeting.shareFailed', { error: shareError })
+                          : t('meeting.shareWith', { org: orgSession.data.orgId })}
                     </button>
                   ))}
                 {/* Deletes straight away, no confirm step: the delete is a
@@ -928,22 +1452,28 @@ function DetailContent({
                   type="button"
                   className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
                   style={{ color: 'var(--danger)' }}
-                  disabled={deleteMeeting.isPending}
+                  // Not while editing: delete is immediate, and the open
+                  // draft would either be lost or left on a deleted note.
+                  disabled={deleteMeeting.isPending || editing}
                   onClick={async () => {
                     setDeleteError(null);
                     try {
                       await deleteMeeting.mutateAsync(meeting);
                     } catch (err) {
                       setDeleteError(
-                        `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
+                        t('meeting.deleteFailed', {
+                          error: err instanceof Error ? err.message : String(err),
+                        }),
                       );
                       return;
                     }
-                    navigate('/');
+                    // The note is gone; leaving is the only sensible next step,
+                    // so it must not wait on the unsaved-edit guard.
+                    navigate('/', { force: true });
                   }}
                 >
                   <Trash2 className="size-[13px] shrink-0" />
-                  Delete note
+                  {t('meeting.deleteNote')}
                 </button>
               </PopoverContent>
             </Popover>
@@ -993,8 +1523,8 @@ function DetailContent({
             disabled={
               titleRegening || reprocess.isPending || streamPhase !== 'idle' || isEditingTitle
             }
-            aria-label="Regenerate title"
-            title="Regenerate title"
+            aria-label={t('meeting.regenerateTitleAria')}
+            title={t('meeting.regenerateTitleAria')}
             className={cn(
               'inline-flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100 disabled:pointer-events-none',
               titleRegening && 'opacity-100'
@@ -1053,7 +1583,9 @@ function DetailContent({
           />
           {participants.length > 0 && (
             <ChipV2 icon={<Users className="size-[11px]" />}>
-              {participants.length} {participants.length === 1 ? 'person' : 'people'}
+              {participants.length === 1
+                ? t('meeting.participantCount.one', { count: participants.length })
+                : t('meeting.participantCount.other', { count: participants.length })}
             </ChipV2>
           )}
           {/* Quiet, non-alarming backup status for org users — a calm
@@ -1065,11 +1597,11 @@ function DetailContent({
               onClick={() => void onShareToOrg()}
               title={
                 backupError
-                  ? `Last backup failed: ${backupError}. Click to retry.`
-                  : 'This note has not been backed up. Click to retry.'
+                  ? t('meeting.backup.failedTooltip', { error: backupError })
+                  : t('meeting.backup.notBackedUpTooltip')
               }
             >
-              {isSharing ? 'Backing up…' : 'Not backed up'}
+              {isSharing ? t('meeting.backingUp') : t('meeting.notBackedUp')}
             </ChipV2>
           )}
         </div>
@@ -1081,18 +1613,35 @@ function DetailContent({
         )}
       </header>
 
-      <NoteViewToggle
-        tab={tab}
-        onTab={setTab}
-        hasNotes={hasUserNotes}
-        activeReportId={activeReportId}
-        reports={reports}
-        templates={reportTemplates}
-        onSelectReport={onSelectReport}
-        onDeleteReport={onDeleteReport}
-        onGenerate={onGenerateReport}
-        generating={generateReport.isPending}
-      />
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-3">
+          <NoteViewToggle
+            tab={tab}
+            onTab={setTab}
+            hasNotes={hasUserNotes}
+            activeReportId={activeReportId}
+            reports={reports}
+            templates={reportTemplates}
+            onSelectReport={onSelectReport}
+            onDeleteReport={onDeleteReport}
+            onGenerate={onGenerateReport}
+            generating={generateReport.isPending}
+            disabled={editing}
+          />
+          {showProperties && (
+            <PropertiesToggle
+              count={reportParts.properties.length}
+              open={propertiesOpen}
+              onToggle={toggleProperties}
+            />
+          )}
+        </div>
+        {/* Outside the report's 72ch column, so the box is as wide as the row
+            its toggle sits in. */}
+        {showProperties && propertiesOpen && (
+          <ReportProperties id={PROPERTIES_PANEL_ID} properties={reportParts.properties} />
+        )}
+      </div>
 
       {tab === 'summary' && (
         <>
@@ -1104,27 +1653,41 @@ function DetailContent({
                 border: '1px solid var(--border-subtle, var(--surface-raised))',
               }}
               data-testid="reprocess-retry"
+              role="alert"
             >
               <div className="text-[15px] font-medium" style={{ color: 'var(--fg-1)' }}>
-                Notes weren’t generated
+                {isRetranscribeError(reprocessErrorCode)
+                  ? t('meeting.noteNotRetranscribed')
+                  : t('meeting.notesNotGenerated')}
               </div>
               <p
                 className="text-[14px] leading-[1.6]"
                 style={{ color: 'var(--fg-2)', maxWidth: '64ch' }}
               >
-                That didn’t work this time — give it another go. If it keeps failing on a long
-                meeting, switch to a smaller model in Settings.
+                {noteGenerationErrorMessage(reprocessErrorCode)}
               </p>
-              <Button
-                className="mt-1"
-                onClick={startReprocess}
-                disabled={reprocess.isPending || streamPhase !== 'idle'}
-              >
-                Generate notes
-              </Button>
+              {!isRetranscribeError(reprocessErrorCode) && (
+                <Button
+                  className="mt-1"
+                  onClick={startReprocess}
+                  // This banner renders above the editor rather than being
+                  // replaced by it, so it needs the same editing lock as the
+                  // header's Generate-notes button.
+                  disabled={reprocess.isPending || streamPhase !== 'idle' || editing}
+                >
+                  {t('meeting.generateNotes')}
+                </Button>
+              )}
             </section>
           )}
-          {streamPhase !== 'idle' ? (
+          {editing ? (
+            <NoteEditor
+              value={noteDraft}
+              onSave={saveNoteEdits}
+              onCancel={closeEditor}
+              onDirtyChange={handleNoteDirtyChange}
+            />
+          ) : streamPhase !== 'idle' ? (
             <StreamingView text={streamText} phase={streamPhase} chunkProgress={chunkProgress} />
           ) : activeReport ? (
             <section
@@ -1132,7 +1695,7 @@ function DetailContent({
               data-testid="report-content"
               style={{ color: 'var(--fg-1)', maxWidth: '72ch' }}
             >
-              <ReactMarkdown>{stripReasoning(activeReport.content)}</ReactMarkdown>
+              <ReactMarkdown>{reportParts.body}</ReactMarkdown>
             </section>
           ) : (
             <div className="flex flex-col gap-9">
@@ -1146,21 +1709,20 @@ function DetailContent({
                   data-testid="transcription-failed-notice"
                 >
                   <div className="text-[15px] font-medium" style={{ color: 'var(--fg-1)' }}>
-                    Transcription failed
+                    {t('meeting.transcriptionFailed')}
                   </div>
                   <p
                     className="text-[14px] leading-[1.6]"
                     style={{ color: 'var(--fg-2)', maxWidth: '64ch' }}
                   >
-                    No notes could be generated for this recording. Your audio was preserved (not
-                    deleted), so nothing was lost.
+                    {t('meeting.transcriptionFailedDetail')}
                   </p>
                   {transcriptionError && (
                     <p
                       className="text-[12.5px] leading-[1.5]"
                       style={{ color: 'var(--fg-2)', opacity: 0.8 }}
                     >
-                      Details: {transcriptionError}
+                      {t('meeting.errorDetails', { error: transcriptionError })}
                     </p>
                   )}
                 </section>
@@ -1177,7 +1739,7 @@ function DetailContent({
                     className="flex items-center gap-1.5 text-[15px] font-medium"
                     style={{ color: 'var(--fg-1)' }}
                   >
-                    Finishing up
+                    {t('meeting.finishingUp')}
                     <span className="thinking-dot" />
                     <span className="thinking-dot" />
                     <span className="thinking-dot" />
@@ -1188,20 +1750,19 @@ function DetailContent({
                   >
                     {willGenerateNotes ? (
                       <>
-                        Finishing your transcript in the background, then generating notes. You can
-                        read and edit <strong>My notes</strong> now.
+                        {t('meeting.transcriptFinishing.withNotes.beforeStrong')}{' '}<strong>{t('meeting.myNotes')}</strong>{' '}{t('meeting.transcriptFinishing.withNotes.afterStrong')}
                       </>
                     ) : (
                       <>
-                        Finishing your transcript in the background. You can read and edit{' '}
-                        <strong>My notes</strong> now, and generate notes when it's done.
+                        {t('meeting.transcriptFinishing.readNotes.beforeStrong')}{' '}
+                        <strong>{t('meeting.myNotes')}</strong>{' '}{t('meeting.transcriptFinishing.readNotes.afterStrong')}
                       </>
                     )}
                   </p>
                 </section>
               ) : summary ? (
                 <section className="flex flex-col gap-3">
-                  <SectionTitle>Summary</SectionTitle>
+                  <SectionTitle>{t('meeting.summary')}</SectionTitle>
                   <div data-testid="tab-summary-content">
                     {stripReasoning(summary)
                       .split(/\n{2,}/)
@@ -1226,26 +1787,24 @@ function DetailContent({
                   data-testid="no-notes-yet"
                 >
                   <div className="text-[15px] font-medium" style={{ color: 'var(--fg-1)' }}>
-                    No notes yet
+                    {t('meeting.noNotesYet')}
                   </div>
                   <p
                     className="text-[14px] leading-[1.6]"
                     style={{ color: 'var(--fg-2)', maxWidth: '64ch' }}
                   >
-                    This recording was transcribed but notes were not generated automatically. Use
-                    the <strong>Generate notes</strong> button below to create them, or copy or save
-                    the transcript from the actions above.
+                    {t('meeting.noNotesAuto.beforeAction')}{' '}<strong>{t('meeting.noNotesAuto.actionName')}</strong>{' '}{t('meeting.noNotesAuto.afterAction')}
                   </p>
                 </section>
               ) : (
                 <p className="py-2 text-sm" style={{ color: 'var(--fg-2)' }}>
-                  No summary available for this meeting.
+                  {t('meeting.noSummary')}
                 </p>
               )}
 
               {discussionAreas.length > 0 && (
                 <section className="flex flex-col gap-3">
-                  <SectionTitle>Key topics</SectionTitle>
+                  <SectionTitle>{t('meeting.keyTopics')}</SectionTitle>
                   <div className="mv-topics">
                     {discussionAreas.map((area, i) => (
                       <div key={i} className="flex flex-col gap-1">
@@ -1259,7 +1818,7 @@ function DetailContent({
 
               {keyPoints.length > 0 && (
                 <section className="flex flex-col gap-3">
-                  <SectionTitle>Key points</SectionTitle>
+                  <SectionTitle>{t('meeting.keyPoints')}</SectionTitle>
                   <ul className="mv-bullets">
                     {keyPoints.map((p, i) => (
                       <li key={i}>{p}</li>
@@ -1270,7 +1829,7 @@ function DetailContent({
 
               {actionItems.length > 0 && (
                 <section className="flex flex-col gap-3">
-                  <SectionTitle>Action items</SectionTitle>
+                  <SectionTitle>{t('meeting.actionItems')}</SectionTitle>
                   <ul className="mv-bullets">
                     {actionItems.map((a, i) => (
                       <li key={i}>{a}</li>
@@ -1281,7 +1840,7 @@ function DetailContent({
 
               {participants.length > 0 && (
                 <section className="flex flex-col gap-3">
-                  <SectionTitle>Participants</SectionTitle>
+                  <SectionTitle>{t('meeting.participantsTitle')}</SectionTitle>
                   <div className="flex flex-wrap gap-1.5">
                     {participants.map((p, i) => (
                       <ChipV2 key={i}>{p}</ChipV2>
@@ -1308,11 +1867,14 @@ function DetailContent({
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>
-              Unshare from {orgSession.data?.signedIn ? orgSession.data.orgId : 'your org'}?
+              {t('meeting.unshareConfirm.title', {
+                org: orgSession.data?.signedIn
+                  ? orgSession.data.orgId
+                  : t('meeting.unshareConfirm.yourOrg'),
+              })}
             </DialogTitle>
             <DialogDescription>
-              The shared copy will be removed from your organisation. Your local note stays on this
-              device. You can re-share at any time.
+              {t('meeting.unshareConfirm.description')}
             </DialogDescription>
           </DialogHeader>
           {shareError && (
@@ -1322,14 +1884,14 @@ function DetailContent({
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="ghost">Cancel</Button>
+              <Button variant="ghost">{t('meeting.cancel')}</Button>
             </DialogClose>
             <Button
               variant="destructive"
               disabled={isUnsharing}
               onClick={() => void onUnshareFromOrg()}
             >
-              {isUnsharing ? 'Unsharing…' : 'Unshare'}
+              {isUnsharing ? t('meeting.unsharing') : t('meeting.unshare')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1338,13 +1900,72 @@ function DetailContent({
       <ConfirmDialog
         open={retranscribeOpen}
         onOpenChange={setRetranscribeOpen}
-        title="Re-transcribe this recording?"
-        description="This re-runs transcription with your current transcription settings, replacing the transcript and regenerating the summary."
-        confirmLabel="Re-transcribe"
+        title={t('meeting.retranscribeConfirm.title')}
+        description={
+          t('meeting.retranscribeConfirm.description') +
+          // #249: reprocess (which --retranscribe runs through) snapshots the
+          // current note as a switchable report before overwriting it, so the
+          // edited version is one click away in the menu next to Summary
+          // rather than gone. Say so plainly - not "replaced, but kept" in
+          // the same breath - and name where it lands by what's on screen
+          // (the Summary switcher), not the data-testid.
+          (hasNoteEdits
+            ? ' ' + t('noteEditor.editedPrefix', { sections: editedSectionsText }).trimEnd() +
+              t('noteEditor.savedStandard')
+            : '')
+        }
+        confirmLabel={t('meeting.retranscribeConfirm.action')}
+        destructive={hasNoteEdits}
         isPending={retranscribe.isPending}
         onConfirm={() => {
           setRetranscribeOpen(false);
           startRetranscribe();
+        }}
+      />
+
+      {/* Every rebuild path funnels through startReprocess, so this one dialog
+          covers the header CTA, the retry banner and the floating bar. */}
+      <ConfirmDialog
+        open={confirmRegenerate}
+        onOpenChange={setConfirmRegenerate}
+        title={t('noteEditor.regenerateTitle')}
+        // #249: reprocess snapshots the current note as a switchable report
+        // before overwriting it, so the edited version is one click away in
+        // the menu next to Summary rather than gone. Say so plainly - not
+        // "replaced, but kept" in the same breath - and name where it lands
+        // by what's on screen (the Summary/report switcher), not the
+        // data-testid.
+        description={
+          (hasNoteEdits ? t('noteEditor.editedPrefix', { sections: editedSectionsText }) : '') +
+          t('noteEditor.rewriteExplanation') +
+          (hasNoteEdits
+            ? t('noteEditor.savedStandard')
+            : '')
+        }
+        confirmLabel={t('noteEditor.regenerateAction')}
+        cancelLabel={t('noteEditor.keepEdits')}
+        destructive
+        onConfirm={() => {
+          setConfirmRegenerate(false);
+          runReprocess();
+        }}
+      />
+
+      <ConfirmDialog
+        open={pendingRoute !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingRoute(null);
+        }}
+        title={t('noteEditor.discardTitle')}
+        description={t('noteEditor.discardDescription')}
+        confirmLabel={t('noteEditor.discardAction')}
+        cancelLabel={t('noteEditor.keepEditing')}
+        destructive
+        onConfirm={() => {
+          const target = pendingRoute ?? '/';
+          setPendingRoute(null);
+          closeEditor();
+          navigate(target, { force: true });
         }}
       />
     </article>
@@ -1378,6 +1999,7 @@ function NoteViewToggle({
   onDeleteReport,
   onGenerate,
   generating,
+  disabled = false,
 }: {
   tab: 'summary' | 'notes';
   onTab: (t: 'summary' | 'notes') => void;
@@ -1389,6 +2011,9 @@ function NoteViewToggle({
   onDeleteReport: (reportId: string) => void;
   onGenerate: (templateId: string) => void;
   generating: boolean;
+  /** Locked while the note editor is open: every path out of this control
+   *  (switching view, generating a report) would drop unsaved edits. */
+  disabled?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [deleteTarget, setDeleteTarget] = React.useState<Report | null>(null);
@@ -1396,8 +2021,8 @@ function NoteViewToggle({
   const summaryActive = tab === 'summary';
   const activeLabel =
     activeReportId === null
-      ? 'Summary'
-      : (reports.find((r) => r.id === activeReportId)?.template_name ?? 'Summary');
+      ? t('meeting.summary')
+      : (reports.find((r) => r.id === activeReportId)?.template_name ?? t('meeting.summary'));
 
   const selectView = (id: string | null) => {
     setMenuOpen(false);
@@ -1414,9 +2039,9 @@ function NoteViewToggle({
     <div className="flex items-center" data-testid="note-view-toggle">
       <div
         role="tablist"
-        aria-label="Note view"
+        aria-label={t('meeting.noteViewAria')}
         className="inline-flex items-stretch overflow-hidden rounded-full"
-        style={{ border: '1px solid var(--border-subtle)' }}
+        style={{ border: '1px solid var(--border-subtle)', opacity: disabled ? 0.5 : 1 }}
       >
         {/* Left — My notes */}
         <button
@@ -1425,6 +2050,7 @@ function NoteViewToggle({
           aria-selected={notesActive}
           data-testid="tab-notes"
           onClick={() => onTab('notes')}
+          disabled={disabled}
           className="inline-flex items-center gap-1.5 px-3 py-1 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           style={{
             background: notesActive ? 'var(--surface-active)' : 'transparent',
@@ -1432,7 +2058,7 @@ function NoteViewToggle({
           }}
         >
           <PencilLine className="size-[13px]" />
-          My notes
+          {t('meeting.myNotes')}
           {hasNotes && !notesActive && (
             <span
               aria-hidden="true"
@@ -1459,16 +2085,18 @@ function NoteViewToggle({
                 aria-selected={summaryActive}
                 data-testid="tab-summary"
                 onClick={() => onTab('summary')}
+                disabled={disabled}
                 className="inline-flex items-center py-1 pl-3 pr-1.5 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                 style={{ color: summaryActive ? 'var(--fg-1)' : 'var(--fg-2)' }}
               >
-                {generating ? 'Generating…' : activeLabel}
+                {generating ? t('meeting.generatingEllipsis') : activeLabel}
               </button>
               <PopoverTrigger asChild>
                 <button
                   type="button"
-                  aria-label="Choose view or template"
+                  aria-label={t('meeting.chooseViewAria')}
                   data-testid="note-view-menu-trigger"
+                  disabled={disabled}
                   className="inline-flex items-center py-1 pl-0.5 pr-2.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring hover:text-[color:var(--fg-1)]"
                   style={{ color: 'var(--fg-2)' }}
                 >
@@ -1482,7 +2110,7 @@ function NoteViewToggle({
               selected={summaryActive && activeReportId === null}
               onClick={() => selectView(null)}
             >
-              Summary
+              {t('meeting.summary')}
             </ViewMenuItem>
             {reports.map((r) => {
               const meta = [r.model, formatReportDate(r.created_at)].filter(Boolean).join(' · ');
@@ -1507,7 +2135,7 @@ function NoteViewToggle({
                   </button>
                   <button
                     type="button"
-                    aria-label={`Delete report ${r.template_name}`}
+                    aria-label={t('meeting.deleteReportAria', { name: r.template_name })}
                     onClick={(e) => {
                       e.stopPropagation();
                       setDeleteTarget(r);
@@ -1527,7 +2155,7 @@ function NoteViewToggle({
                   className="px-3 pb-1 pt-1.5 text-[11px] font-medium"
                   style={{ color: 'var(--fg-muted)' }}
                 >
-                  Generate from template
+                  {t('meeting.generateFromTemplate')}
                 </div>
                 {templates.map((t) => (
                   <button
@@ -1552,9 +2180,9 @@ function NoteViewToggle({
       <ConfirmDialog
         open={!!deleteTarget}
         onOpenChange={(o) => !o && setDeleteTarget(null)}
-        title={deleteTarget ? `Delete report "${deleteTarget.template_name}"?` : ''}
-        description="This permanently deletes this generated report. The transcript and other reports are not affected."
-        confirmLabel="Delete"
+        title={deleteTarget ? t('meeting.deleteReportConfirm.title', { name: deleteTarget.template_name }) : ''}
+        description={t('meeting.deleteReportConfirm.description')}
+        confirmLabel={t('meeting.delete')}
         destructive
         onConfirm={() => {
           if (!deleteTarget) return;
@@ -1603,30 +2231,62 @@ function MyNotesEditor({
   initialNotes: string;
 }) {
   const [value, setValue] = React.useState(initialNotes);
-  const save = useUpdateUserNotes();
+  const [saveFailed, setSaveFailed] = React.useState(false);
+  // mutateAsync is stable; the mutation wrapper changes on every render.
+  const { mutateAsync: save } = useUpdateUserNotes();
   const timerRef = React.useRef<number | null>(null);
   const savedRef = React.useRef(initialNotes);
-  const valueRef = React.useRef(value);
-  valueRef.current = value;
+  const valueRef = React.useRef(initialNotes);
+  const pendingRef = React.useRef(false);
+  const mountedRef = React.useRef(true);
+  const errorId = React.useId();
+  const invalidHeading = summaryFile.endsWith('.md') && hasUserNotesSectionBoundary(value);
 
-  const flush = React.useCallback(() => {
+  const flush = React.useCallback(function flush() {
     if (timerRef.current !== null) {
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-    if (valueRef.current === savedRef.current) return;
-    savedRef.current = valueRef.current;
-    save.mutate({ summaryFile, userNotes: valueRef.current });
+    const next = valueRef.current;
+    if (pendingRef.current || next === savedRef.current) return;
+    if (summaryFile.endsWith('.md') && hasUserNotesSectionBoundary(next)) return;
+    pendingRef.current = true;
+    void (async () => {
+      try {
+        await save({ summaryFile, userNotes: next });
+        savedRef.current = next;
+        if (mountedRef.current && valueRef.current === next) setSaveFailed(false);
+      } catch {
+        if (mountedRef.current && valueRef.current === next) setSaveFailed(true);
+      } finally {
+        pendingRef.current = false;
+        // A later draft must follow the in-flight write, even when it returns
+        // to the previously saved value. Never retry the same failed value
+        // automatically; blur or the explicit retry action can try it again.
+        if (valueRef.current !== next) flush();
+      }
+    })();
   }, [save, summaryFile]);
 
   // Flush any pending edit on unmount (tab switch / navigation).
-  React.useEffect(() => flush, [flush]);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      flush();
+    };
+  }, [flush]);
 
   const onChange = (next: string) => {
+    valueRef.current = next;
     setValue(next);
+    setSaveFailed(false);
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     timerRef.current = window.setTimeout(flush, 800);
   };
+  const error = invalidHeading
+    ? t('myNotes.headingError')
+    : saveFailed ? t('myNotes.saveError') : null;
 
   return (
     <section className="flex flex-col gap-2" data-testid="my-notes">
@@ -1634,7 +2294,9 @@ function MyNotesEditor({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onBlur={flush}
-        placeholder="Write notes…"
+        aria-invalid={invalidHeading || undefined}
+        aria-describedby={error ? errorId : undefined}
+        placeholder={t('meeting.writeNotesPlaceholder')}
         spellCheck
         data-testid="my-notes-input"
         className="block w-full resize-none border-0 bg-transparent text-[15.5px] outline-none"
@@ -1646,6 +2308,16 @@ function MyNotesEditor({
           maxWidth: '64ch',
         }}
       />
+      {error && (
+        <div className="flex flex-col items-start gap-2">
+          <p id={errorId} role="alert" className="text-sm" style={{ color: 'var(--danger)' }}>
+            {error}
+          </p>
+          {saveFailed && !invalidHeading && (
+            <Button variant="outline" size="sm" onClick={flush}>{t('myNotes.retry')}</Button>
+          )}
+        </div>
+      )}
     </section>
   );
 }
@@ -1863,10 +2535,10 @@ function StreamingView({
   );
 
   const indicatorLabel = chunkProgress
-    ? `Summarising part ${chunkProgress.step}/${chunkProgress.total}`
+    ? t('meeting.streamProgress.partial', { step: chunkProgress.step, total: chunkProgress.total })
     : phase === 'analyzing'
-      ? 'Analysing transcript'
-      : 'Generating notes';
+      ? t('meeting.streamProgress.analysing')
+      : t('meeting.streamProgress.generating');
 
   return (
     <div className="relative">
@@ -2036,7 +2708,7 @@ function FolderPicker({
               }
             }}
             onBlur={() => void submitNewFolder()}
-            placeholder="Folder name..."
+            placeholder={t('meeting.folderNamePlaceholder')}
             className="w-28 bg-transparent outline-none placeholder:text-muted-foreground"
           />
         </div>
@@ -2045,7 +2717,7 @@ function FolderPicker({
     );
   }
 
-  const currentFolderLabel = currentFolder?.name ?? 'Add to folder';
+  const currentFolderLabel = currentFolder?.name ?? t('meeting.addToFolder');
 
   return (
     <div className="space-y-1">
@@ -2056,7 +2728,7 @@ function FolderPicker({
           </button>
         </SelectPrimitive.Trigger>
         <SelectContent align="start">
-          <SelectItem value={FOLDER_NONE}>No folder</SelectItem>
+          <SelectItem value={FOLDER_NONE}>{t('meeting.noFolder')}</SelectItem>
           <SelectSeparator />
           {allFolders.map((f) => (
             <SelectItem key={f.id} value={f.id}>
@@ -2064,7 +2736,7 @@ function FolderPicker({
             </SelectItem>
           ))}
           <SelectSeparator />
-          <SelectItem value={FOLDER_NEW}>New folder...</SelectItem>
+          <SelectItem value={FOLDER_NEW}>{t('meeting.newFolder')}</SelectItem>
         </SelectContent>
       </Select>
       {folderError && <p className="text-xs text-destructive">{folderError}</p>}
@@ -2084,13 +2756,17 @@ function formatDetailDate(info: {
   if (!raw) return undefined;
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return undefined;
-  return d.toLocaleString(undefined, {
+  // The only formatter that mixes words with a clock: English weekday/month
+  // names, but the host's 12-vs-24-hour habit — see lib/locale.ts for why those
+  // two are separated.
+  return d.toLocaleString(UI_LOCALE, {
     weekday: 'short',
     month: 'short',
     day: 'numeric',
     year: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
+    hour12: SYSTEM_HOUR12,
   });
 }
 
@@ -2100,7 +2776,7 @@ function formatReportDate(raw?: string): string | undefined {
   if (!raw) return undefined;
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return undefined;
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString(UI_LOCALE, { month: 'short', day: 'numeric' });
 }
 
 function formatDuration(seconds?: number): string | undefined {
@@ -2108,26 +2784,9 @@ function formatDuration(seconds?: number): string | undefined {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m`;
-  return `${s}s`;
-}
-
-function asStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((v) => {
-      if (typeof v === 'string') return v;
-      if (typeof v !== 'object' || v === null) return '';
-      const obj = v as Record<string, unknown>;
-      const desc = typeof obj.description === 'string' ? obj.description : '';
-      const owner = typeof obj.owner === 'string' ? obj.owner : '';
-      if (desc) return owner ? `${owner}: ${desc}` : desc;
-      if (typeof obj.text === 'string') return obj.text;
-      if (typeof obj.name === 'string') return obj.name;
-      return '';
-    })
-    .filter(Boolean);
+  if (h > 0) return t('meeting.duration.hoursMinutes', { hours: h, minutes: m });
+  if (m > 0) return t('meeting.duration.minutes', { minutes: m });
+  return t('meeting.duration.seconds', { seconds: s });
 }
 
 interface DiscussionArea {
@@ -2145,7 +2804,7 @@ function asDiscussionAreas(value: unknown): DiscussionArea[] {
       const title = typeof obj.title === 'string' ? obj.title : '';
       const analysis = typeof obj.analysis === 'string' ? obj.analysis : undefined;
       if (!title && !analysis) return null;
-      return { title: title || 'Discussion topic', analysis };
+      return { title: title || t('meeting.discussionTopicFallback'), analysis };
     })
     .filter((v): v is DiscussionArea => v !== null);
 }
@@ -2153,7 +2812,7 @@ function asDiscussionAreas(value: unknown): DiscussionArea[] {
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === 'string' && error.trim()) return error;
-  return 'Something went wrong.';
+  return t('meeting.errorFallback');
 }
 
 /** Pick which transcript flavour to ship to org. Diarised text (with

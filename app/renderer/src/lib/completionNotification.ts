@@ -56,6 +56,40 @@ export function meetingAlreadyHasNotes(
   return meetingData.session_info?.notes_generated !== false;
 }
 
+const LEADING_MARKUP = /^(?:(?:[-*\u2022]|\d+\.)\s*)?(?:\[[ xX]?\]\s*)?[*_\s]*/;
+const TRAILING_MARKUP = /[\s.!*_]+$/;
+const NO_ACTION_ITEMS =
+  /^(?:none(?:\s+(?:identified|mentioned|discussed|noted|at this time))?|n\/a|tbd|nothing to report|(?:there\s+(?:was|were|are)\s+)?no\s+(?:(?:clear|specific|explicit)\s+)?action\s+items?(?:\s+[a-z]+){0,5})$/i;
+
+function isPlaceholder(text: string): boolean {
+  return NO_ACTION_ITEMS.test(text.replace(LEADING_MARKUP, '').replace(TRAILING_MARKUP, ''));
+}
+
+export function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((v) => {
+      if (typeof v === 'string') return v;
+      if (typeof v !== 'object' || v === null) return '';
+      const obj = v as Record<string, unknown>;
+      const desc = typeof obj.description === 'string' ? obj.description : '';
+      const owner = typeof obj.owner === 'string' ? obj.owner : '';
+      if (desc) return owner ? `${owner}: ${desc}` : desc;
+      if (typeof obj.text === 'string') return obj.text;
+      if (typeof obj.name === 'string') return obj.name;
+      return '';
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Number of real action items in a parsed meeting entry, counted the way the
+ * detail view lists them, minus "nothing here" placeholders the model emitted.
+ */
+export function countActionItems(items: unknown): number {
+  return asStringArray(items).filter((t) => t.trim() !== '' && !isPlaceholder(t)).length;
+}
+
 /**
  * On job completion, decide two INDEPENDENT things: whether to NAVIGATE off the
  * transient /processing screen, and whether to NOTIFY. They're independent

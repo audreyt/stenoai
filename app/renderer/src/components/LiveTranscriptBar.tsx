@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { t } from '@/i18n';
 import {
   Check,
   ChevronDown,
@@ -481,11 +482,12 @@ function LanguageSelector() {
   const setLanguage = useSetLanguage();
   const engine = useTranscriptionEngine();
   const [popoverOpen, setPopoverOpen] = React.useState(false);
-  const options = engine.data === 'parakeet' ? PARAKEET_LANGUAGES : APPLE_LANGUAGES;
+  const options = engine.data === 'parakeet' ? PARAKEET_LANGUAGES :
+    engine.data === 'apple' ? APPLE_LANGUAGES : [];
 
   const current = language.data ?? 'auto';
   const selected = options.find((option) => option.code === current);
-  const autoLabel = engine.data === 'parakeet' ? 'Multi' : 'System';
+  const autoLabel = engine.data === 'apple' ? t('settings.ai.apple.system') : 'Multi';
   const display = current === 'auto' ? autoLabel : (selected?.label ?? current.toUpperCase());
 
   const pick = (code: string) => {

@@ -156,7 +156,7 @@ test("switching language during Apple recording restarts live transcribe sidecar
   const setLangRes = await page.evaluate(() =>
     (window as StenoWindow).stenoai.settings.setLanguage("zh-Hant"),
   );
-  expect(setLangRes.success).not.toBe(false);
+  expect(setLangRes.success).toBe(true);
 
   await expect
     .poll(

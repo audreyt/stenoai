@@ -33,59 +33,67 @@ assert_binary() {
 # Conservative floors: the real binaries are tens of MB, while an HTML error page
 # or a truncated transfer is orders of magnitude below these.
 MIN_FFMPEG_BYTES=5000000
+# The audio-only mac build is ~2 MB; a failed link or empty file is far below this.
+MIN_MAC_FFMPEG_BYTES=1000000
 MIN_OLLAMA_BYTES=1000000
 
 # --- Download ffmpeg ---
 echo "=== Downloading ffmpeg ==="
 case "$(uname -s)" in
     Darwin)
-        # ffmpeg must match the BUILD architecture, not just the OS. evermeet.cx
-        # (the old URL) ships x86_64-only mac builds, so it bundled an Intel ffmpeg
-        # into the arm64 release — which crashes on Apple Silicon without Rosetta
-        # (#209). The mac build is Apple-Silicon only (arm64) since v0.4.0, so use
-        # osxexperts' arm64 static build (same 7.1.1 as before) and refuse any
-        # other arch rather than silently shipping a mismatch.
-        if [ "$(uname -m)" != "arm64" ]; then
-            echo "macOS build is arm64-only; unsupported arch: $(uname -m)" >&2
-            exit 1
-        fi
-        FFMPEG_URL="https://www.osxexperts.net/ffmpeg711arm.zip"
+        # Built from ffmpeg.org source as an audio-only binary (~2 MB vs the ~48 MB
+        # full static build we used to download) -- see build-ffmpeg-minimal.sh.
+        # The mac build is Apple-Silicon only (arm64) since v0.4.0; the build
+        # script refuses any other arch rather than shipping a mismatch (#209).
         mkdir -p "$BIN_DIR"
-        curl --fail --retry 3 --retry-delay 2 --retry-all-errors -L "$FFMPEG_URL" -o "$BIN_DIR/ffmpeg.zip"
+        "$SCRIPT_DIR/build-ffmpeg-minimal.sh" "$BIN_DIR/ffmpeg"
         cd "$BIN_DIR"
-        # Extract only the binary; skip the __MACOSX resource-fork junk in the zip.
-        unzip -o ffmpeg.zip ffmpeg
-        rm ffmpeg.zip
-        chmod +x ffmpeg
-        assert_binary ffmpeg "$MIN_FFMPEG_BYTES"
+        assert_binary ffmpeg "$MIN_MAC_FFMPEG_BYTES"
         # Validate the binary before bundling it. Two distinct failure modes:
         #  1. Wrong architecture. An x86_64 ffmpeg runs fine HERE under Rosetta and
         #     would sail through the -version check, then crash on a Rosetta-less
         #     user machine (#209). Assert the Mach-O is arm64 so the script
         #     self-enforces the arch rather than leaning only on the external CI
         #     `file ... arm64` guard.
-        #  2. Truncated/corrupt download or wrong-format extract. Run -version and
-        #     pin the major; pipefail (scoped to a subshell) makes a non-zero
-        #     ffmpeg exit fail loudly instead of being masked by grep's exit.
+        #  2. A broken build. Run -version and pin the major; pipefail (scoped to
+        #     a subshell) makes a non-zero ffmpeg exit fail loudly instead of
+        #     being masked by grep's exit.
         # set -e turns either non-zero exit into a loud build failure.
         if ! file ./ffmpeg | grep -q "arm64"; then
-            echo "Downloaded ffmpeg is not an arm64 binary: $(file ./ffmpeg)" >&2
+            echo "Built ffmpeg is not an arm64 binary: $(file ./ffmpeg)" >&2
             exit 1
         fi
         if ! ( set -o pipefail; ./ffmpeg -version | grep -q "ffmpeg version 7.1" ); then
-            echo "Downloaded ffmpeg failed -version or is not 7.1.x" >&2
+            echo "Built ffmpeg failed -version or is not 7.1.x" >&2
             exit 1
         fi
-        echo "ffmpeg 7.1.1 (arm64) downloaded"
+        echo "ffmpeg 7.1.1 (arm64, audio-only) built"
         cd - > /dev/null
         ;;
     Linux)
         # Use static build for Linux
         FFMPEG_URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
         mkdir -p "$BIN_DIR"
-        curl --fail --retry 3 --retry-delay 2 --retry-all-errors -L "$FFMPEG_URL" -o "$BIN_DIR/ffmpeg.tar.xz"
+        # Some upstream/proxy failures return HTTP 200 with an error page,
+        # which curl's HTTP retries cannot detect. Retry invalid archives too.
+        archive_ready=false
+        for attempt in 1 2 3; do
+            if curl --fail --retry 3 --retry-delay 2 --retry-all-errors -L "$FFMPEG_URL" -o "$BIN_DIR/ffmpeg.tar.xz" \
+                && tar -tJf "$BIN_DIR/ffmpeg.tar.xz" > "$BIN_DIR/ffmpeg-archive-contents.txt" 2>/dev/null \
+                && archive_member=$(grep -m 1 -E '^[^/]+/ffmpeg$' "$BIN_DIR/ffmpeg-archive-contents.txt"); then
+                archive_ready=true
+                break
+            fi
+            echo "Linux ffmpeg download attempt $attempt/3 failed or returned an invalid archive" >&2
+            if [ "$attempt" -lt 3 ]; then sleep 2; fi
+        done
+        rm -f "$BIN_DIR/ffmpeg-archive-contents.txt"
+        if [ "$archive_ready" != true ]; then
+            echo "Could not download a valid Linux ffmpeg archive after 3 attempts" >&2
+            exit 1
+        fi
         cd "$BIN_DIR"
-        tar -xf ffmpeg.tar.xz --strip-components=1 --wildcards '*/ffmpeg'
+        tar -xf ffmpeg.tar.xz --strip-components=1 "$archive_member"
         rm ffmpeg.tar.xz
         chmod +x ffmpeg
         assert_binary ffmpeg "$MIN_FFMPEG_BYTES"
@@ -122,7 +130,9 @@ case "$(uname -s)" in
         OLLAMA_FILE="ollama-darwin.tgz"
         ;;
     Linux)
-        OLLAMA_FILE="ollama-linux-amd64.tgz"
+        # Ollama dropped the .tgz asset; releases now ship .tar.zst (and a
+        # separate -rocm variant we don't want).
+        OLLAMA_FILE="ollama-linux-amd64.tar.zst"
         ;;
     MINGW*|MSYS*|CYGWIN*)
         OLLAMA_FILE="ollama-windows-amd64.zip"
@@ -155,11 +165,24 @@ find . -maxdepth 3 -type f \( -name ollama -o -name ollama.exe \) -exec mv {} {}
 # Extract based on file type
 if [[ "$OLLAMA_FILE" == *.zip ]]; then
     unzip -o "$OLLAMA_FILE"
+elif [[ "$OLLAMA_FILE" == *.zst ]]; then
+    tar --zstd -xf "$OLLAMA_FILE"
 else
     tar -xzf "$OLLAMA_FILE"
 fi
 
 rm "$OLLAMA_FILE"
+
+# The new .tar.zst Linux release nests the binary under bin/ (with lib/ as a
+# sibling of that bin/, not of the binary itself) — unlike every other archive
+# here, which puts the binary and lib/ directly at the archive root as
+# siblings. src.ollama_manager.get_bundled_ollama_dir() and stenoai.spec both
+# assume that flat sibling layout (already relied on by the Windows zip), so
+# flatten bin/* up one level to match it exactly.
+if [ -d bin ] && [ -f bin/ollama ]; then
+    mv bin/* .
+    rmdir bin
+fi
 
 # The Ollama archives differ in layout between platforms (some nest the binary under
 # bin/), so locate it rather than assuming a path, and fail if the extract produced

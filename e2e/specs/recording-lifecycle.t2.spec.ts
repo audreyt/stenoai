@@ -50,7 +50,7 @@ test('recording state machine: start -> pause -> resume -> stop is reflected in 
   const realDirBefore = fileSig(realUserDataDir());
   enableDeterministicRecording(userDataDir);
 
-  const { page } = await launchApp();
+  const { app, page } = await launchApp();
 
   // The deterministic capture path drives real getUserMedia/getDisplayMedia, so
   // it needs OS loopback support (macOS >= 14.4 / Windows >= 10) to exercise the
@@ -109,6 +109,20 @@ test('recording state machine: start -> pause -> resume -> stop is reflected in 
   );
   expect(resumed.success).toBe(true);
   await expect.poll(async () => (await queue(page)).isPaused).toBe(false);
+
+  // Pause again, then resume the way the tray's "Resume Recording" item and the
+  // "Recording paused" toast do: main sends auto-resume-requested and the
+  // renderer resumes (#412). The native tray itself is skipped under E2E.
+  await page.evaluate(() => (window as StenoWindow).stenoai.recording.pause());
+  await expect.poll(async () => (await queue(page)).isPaused).toBe(true);
+  await app.evaluate(({ BrowserWindow }) => {
+    const main = BrowserWindow.getAllWindows().find(
+      (w) => !w.webContents.getURL().includes('#/notification'),
+    );
+    main?.webContents.send('auto-resume-requested');
+  });
+  await expect.poll(async () => (await queue(page)).isPaused).toBe(false);
+  expect((await queue(page)).hasRecording).toBe(true);
 
   // Stop -> idle.
   const stopped = await page.evaluate(() =>

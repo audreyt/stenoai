@@ -3,6 +3,7 @@ import type { Meeting } from '@/lib/ipc';
 import { navigate } from '@/lib/router';
 import { useMeetingsList } from '@/lib/meetingsListContext';
 import { stripReasoning } from '@/lib/markdown';
+import { isLiveRowFile } from '@/lib/liveMeetingRow';
 
 interface PreviousRowProps {
   meeting: Meeting;
@@ -115,7 +116,9 @@ export function PreviousRow({ meeting, folderName }: PreviousRowProps) {
         className="flex flex-col items-end gap-1.5 pl-4 text-[12.5px] tabular-nums"
         style={{ color: 'var(--fg-2)' }}
       >
-        <span>{isSynthetic ? 'Now' : (when ?? '')}</span>
+        {/* "Now" only for the synthetic live row. A note being reprocessed is
+            flagged is_processing too, but it was recorded when it was. */}
+        <span>{isLiveRowFile(info.summary_file) ? 'Now' : (when ?? '')}</span>
         {/* Original audio still on disk. Shown only when present, never as a
             crossed-out "missing" marker: keep_recordings defaults off, so
             absence is the normal case and flagging it on most rows would be

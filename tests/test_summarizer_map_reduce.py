@@ -325,6 +325,11 @@ class ReducePromptTests(unittest.TestCase):
         self.assertIn("## Key Points", prompt)
         self.assertIn("## Action Items", prompt)
 
+    def test_prompts_ask_for_an_empty_action_items_section(self):
+        s = _make_summarizer()
+        for prompt in (s._create_reduce_prompt(["result"]), s._create_markdown_prompt("transcript")):
+            self.assertIn("If there are no action items, leave that section empty with no bullets.", prompt)
+
     def test_reduce_prompt_includes_notes_when_provided(self):
         s = _make_summarizer()
         prompt = s._create_reduce_prompt(["result"], notes="bring coffee")

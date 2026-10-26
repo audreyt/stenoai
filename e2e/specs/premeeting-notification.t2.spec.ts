@@ -19,7 +19,7 @@ type StenoWindow = Window & {
     settings: {
       setPremeetingNotifications: (v: boolean) => Promise<unknown>;
       showPremeetingNotification: (payload: {
-        event: { id: string; title?: string };
+        event: { id: string; title?: string; color?: string };
       }) => Promise<ShowResult>;
     };
     recording: {
@@ -33,7 +33,7 @@ const EVT = { id: 'evt-standup', title: 'Daily standup' };
 
 const showPremeeting = (
   page: import('@playwright/test').Page,
-  event: { id: string; title?: string },
+  event: { id: string; title?: string; color?: string },
 ) =>
   page.evaluate(
     (e) => (window as StenoWindow).stenoai.settings.showPremeetingNotification({ event: e }),
@@ -92,4 +92,24 @@ test('pre-meeting notification is suppressed for the meeting being recorded (nam
   await expect.poll(async () => (await showPremeeting(page, EVT)).shown).not.toBe(false);
 
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+});
+
+test("the pre-meeting toast's accent bar carries the calendar event's colour (#412)", async ({
+  launchApp,
+}) => {
+  const { app, page } = await launchApp();
+
+  expect((await showPremeeting(page, { ...EVT, color: '#33b679' })).shown).not.toBe(false);
+
+  // The toast is its own window; find it and read the real rendered bar.
+  let toast: import('@playwright/test').Page | undefined;
+  await expect
+    .poll(() => {
+      toast = app.windows().find((w) => w.url().includes('#/notification'));
+      return Boolean(toast);
+    })
+    .toBe(true);
+  const bar = toast!.getByTestId('toast-accent-bar');
+  await expect(bar).toBeVisible();
+  expect(await bar.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe('rgb(51, 182, 121)');
 });

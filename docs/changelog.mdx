@@ -3,6 +3,79 @@ title: "Changelog"
 description: "What's new in Steno -- recent releases and notable changes."
 ---
 
+<Update label="v0.8.0" description="October 3, 2026">
+**New**
+- **Agents sidebar**: install the Steno skill in Claude Code or Codex using copyable prompts and the new [setup guide](/features/agents).
+- **Charts in Chat**: ask for bar or line charts based on numbers in your notes, with a data table to inspect the values.
+- **Chat during recording**: ask questions while recording and keep the conversation with the saved note. Parakeet supplies live transcript context; Whisper supplies transcript context after recording stops.
+- **Meeting packages on macOS**: import and export `.stenomeeting` packages with notes, transcripts, and optional audio. Audio is excluded unless you select it.
+- **Optional cloud transcription**: use an OpenAI-compatible endpoint after confirming that audio will be sent to the provider. Credentials are encrypted and tied to the configured endpoint.
+- **What's new panel**: release highlights appear after an update when the app is idle. Reopen them from Settings → About.
+
+**Improved**
+- The macOS app download is smaller after removing unused libraries and reducing bundled audio and model runtimes.
+- Speaker-separation models on macOS are now optional during setup and can be downloaded later in Settings → AI. Their download is smaller and shows progress.
+- Parakeet downloads show byte totals and percentages when available, with a separate preparation stage.
+- Supported audio in macOS meeting exports uses native AAC compression; original recordings stay unchanged.
+- Linux packages retain Ollama's CUDA and Vulkan backends for supported GPUs and drivers.
+- The installed app is named StenoAI; the website uses StenographAI. Existing data locations and download links remain compatible.
+
+**Fixed**
+- Numbered chat responses preserve their numbering across paragraphs and nested lists.
+- Chat's rotating prompt examples no longer overlap.
+- Note-generation failures show guidance for connection, model, authentication, timeout, memory, and configuration problems. Existing notes remain available for retry.
+
+**Known Issues**
+- Meeting package transfer and acoustic speaker separation are macOS-only. Windows and Linux retain You / Others channel labels.
+- Windows and Linux installers remain unsigned. Linux updates are manual, and GPU support depends on the host hardware and drivers.
+</Update>
+
+<Update label="v0.7.1" description="September 5, 2026">
+**New**
+- **Linux alpha**: Debian/Ubuntu packages and an AppImage support microphone and PipeWire system-audio recording. Without PipeWire, recording uses the microphone only.
+
+**Improved**
+- Parakeet model downloads show actual progress and distinguish downloading from model preparation.
+- Weekday and month names match the English interface. Times keep the system's 12/24-hour clock preference.
+- The website and README use the StenoAI name, and the Government & Defence pages have been expanded.
+
+**Fixed**
+- Repeated folder-creation clicks no longer create duplicate sidebar folders, and failures are shown when a folder cannot be created.
+- A recording that fails to start no longer leaves a stuck "Recording" entry in the meetings list.
+- On Windows and Linux, the available live transcript replaces an ONNX batch transcript that successfully read less than half the recording.
+
+**Known Issues**
+- Linux packages are unsigned and require manual updates. AppImage users must install `libportaudio2` separately.
+- Bundled summaries are CPU-only on Linux, as in the Windows alpha. For GPU-accelerated summaries, run a separately installed Ollama with a supported GPU and driver, select **Settings → AI → Private Server**, enter `http://127.0.0.1:11434`, and choose a model installed on that server.
+- Acoustic multi-speaker identification remains macOS-only. Linux uses the existing `[You]` / `[Others]` channel labels.
+</Update>
+
+<Update label="v0.7.0" description="August 31, 2026">
+**New**
+- **Individual speaker labels (macOS)** — Steno now separates the voices that share one side of a call. A meeting with several remote participants reads as `Speaker 2`, `Speaker 3`, and so on, instead of collapsing everyone into a single `[Others]`. This runs on-device after the recording stops, and works whether the people are around one microphone or joining remotely.
+- **Speaker identification** — Name a speaker once and Steno suggests that person in later meetings. This is off by default: turn it on under Settings → AI → Speaker identification. It creates a numerical voice profile, so enable it only if you have told the people you record and are authorised to do so. Anonymous per-meeting splitting keeps working with it off.
+- **People management** — Settings → People lists everyone you have named, plays back the voice sample behind each profile, and deletes a person and their profile permanently. Recordings and transcripts are stored separately and are not deleted with a profile.
+- **Review who is who** — When Steno is unsure, a review panel in the note offers excerpts you can play, lets you confirm or rename a speaker, mark a cluster as more than one person, or keep the generic label. It also says what a delete would cost before you confirm it.
+- **FaceTime and Phone calls are detected** — Calls through FaceTime and Phone.app now trigger the meeting prompt like any other call.
+- **Readable transcript export** — Exported transcripts now open with a clean conversation view that merges each speaker's consecutive lines into paragraphs, with the original timestamped transcript kept below it. Falls back to the raw transcript when timestamps aren't usable.
+- **Russian** — Russian can now be selected in Settings → Transcribe, so summaries, titles and chat come back in Russian instead of defaulting to English. Available on both engines, and covered by auto-detect.
+
+**Improved**
+- Diarization is roughly 6.65x faster, using Sortformer's offline chunk preset.
+- Processing shows live per-stage progress while speakers are being worked out, rather than one long opaque step.
+- The Overview now marks which notes still have their original audio, so you can see what can be re-transcribed.
+- Interrupted Parakeet model downloads resume instead of starting over.
+
+**Fixed**
+- macOS no longer shows an unexplained local-network prompt on first launch; Steno now declares why it needs local network access.
+- An interrupted batch transcription now keeps what it managed to transcribe instead of discarding the whole run.
+
+**Known Issues**
+- Speaker separation is macOS-only. Windows keeps the existing `[You]` / `[Others]` channel labels.
+- Speaker accuracy depends on recording quality; overlapping speech and shared microphones are the hardest cases.
+- Selecting Russian pins the language of the summary, title and chat. Transcription accuracy for Russian on the default Parakeet engine has not been measured; switch to Whisper in Settings → AI if the transcript itself is poor.
+</Update>
+
 <Update label="v0.6.7" description="August 4, 2026">
 **Added**
 - **Sync to Obsidian** — mirror your notes into an Obsidian vault folder as Markdown, one file per note with Obsidian-friendly properties, organised into subfolders that mirror your Steno folders. Turn it on in Settings → Integrations and choose a vault folder. One-way (Steno → vault); notes you edit in Obsidian are never overwritten, and renames/deletes are kept in sync.

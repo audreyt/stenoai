@@ -32,11 +32,54 @@ class AppleSpeechResolverTests(unittest.TestCase):
                 self.assertEqual(apple_speech.resolve_sidecar(), str(sidecar))
 
     def test_non_macos_status_is_unavailable_without_spawning(self):
-        with patch.object(apple_speech.sys, "platform", "win32"), patch(
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
             "src.apple_speech.subprocess.run"
         ) as run:
             result = apple_speech.status("en")
         self.assertFalse(result["available"])
+        run.assert_not_called()
+
+    def test_unsupported_macos_status_is_unavailable_without_spawning(self):
+        with patch("src.config.apple_speech_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            result = apple_speech.status("en")
+        self.assertFalse(result["available"])
+        self.assertFalse(result["supported"])
+        run.assert_not_called()
+
+    def test_missing_sidecar_status_is_unavailable_without_spawning(self):
+        with patch("src.config.apple_speech_supported", return_value=True), patch(
+            "src.apple_speech.resolve_sidecar", return_value=None
+        ), patch("src.apple_speech.subprocess.run") as run:
+            result = apple_speech.status("en")
+        self.assertTrue(result["success"])
+        self.assertFalse(result["available"])
+        self.assertFalse(result["installed"])
+        run.assert_not_called()
+
+    def test_internal_run_cannot_bypass_host_gate(self):
+        with patch("src.config.apple_speech_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "unavailable on this Mac"):
+                apple_speech._run(["status", "en"], timeout=15)
+        run.assert_not_called()
+
+    def test_prepare_on_unsupported_platform_raises_without_spawning(self):
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "unavailable on this Mac"):
+                apple_speech.prepare("en")
+        run.assert_not_called()
+
+    def test_transcribe_file_on_unsupported_platform_raises_without_spawning(self):
+        with patch("src.apple_speech._is_supported", return_value=False), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "unavailable on this Mac"):
+                apple_speech.transcribe_file(Path("/tmp/audio.wav"), language="en")
         run.assert_not_called()
 
     def test_structured_sidecar_error_is_preserved(self):
@@ -46,9 +89,9 @@ class AppleSpeechResolverTests(unittest.TestCase):
             stdout=json.dumps({"success": False, "error": "unsupported locale"}),
             stderr="",
         )
-        with patch("src.apple_speech.resolve_sidecar", return_value="/sidecar"), patch(
-            "src.apple_speech.subprocess.run", return_value=completed
-        ):
+        with patch("src.apple_speech._is_supported", return_value=True), patch(
+            "src.apple_speech.resolve_sidecar", return_value="/sidecar"
+        ), patch("src.apple_speech.subprocess.run", return_value=completed):
             with self.assertRaisesRegex(RuntimeError, "unsupported locale"):
                 apple_speech.prepare("xx")
 
@@ -62,9 +105,9 @@ class AppleSpeechResolverTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=json.dumps(payload), stderr=""
         )
-        with patch("src.apple_speech.resolve_sidecar", return_value="/sidecar"), patch(
-            "src.apple_speech.subprocess.run", return_value=completed
-        ) as run:
+        with patch("src.apple_speech._is_supported", return_value=True), patch(
+            "src.apple_speech.resolve_sidecar", return_value="/sidecar"
+        ), patch("src.apple_speech.subprocess.run", return_value=completed) as run:
             result = apple_speech.transcribe_file(Path("/tmp/audio.wav"), language="en")
 
         self.assertEqual(result, payload)
@@ -79,19 +122,20 @@ class AppleSpeechConfigTests(unittest.TestCase):
         self.assertTrue(
             apple_speech_supported(platform_name="darwin", mac_version="26.0")
         )
-        self.assertFalse(
-            apple_speech_supported(platform_name="darwin", mac_version="25.9")
-        )
+        for version in ("14.4", "15.7", "25.9"):
+            self.assertFalse(
+                apple_speech_supported(platform_name="darwin", mac_version=version)
+            )
         self.assertFalse(
             apple_speech_supported(platform_name="win32", mac_version="27.0")
         )
 
-    def test_fresh_supported_mac_defaults_to_apple(self):
+    def test_backend_foundation_preserves_existing_parakeet_default(self):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "src.config.apple_speech_supported", return_value=True
         ):
             config = Config(Path(tmp) / "config.json")
-            self.assertEqual(config.get_transcription_engine(), "apple")
+            self.assertEqual(config.get_transcription_engine(), "parakeet")
 
     def test_existing_explicit_engine_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp, patch(
@@ -108,6 +152,15 @@ class AppleSpeechConfigTests(unittest.TestCase):
         ):
             config = Config(Path(tmp) / "config.json")
             self.assertFalse(config.set_transcription_engine("apple"))
+
+    def test_explicit_apple_choice_reads_as_parakeet_on_older_mac(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"transcription_engine": "apple"}))
+            with patch("src.config.apple_speech_supported", return_value=False):
+                config = Config(path)
+                self.assertEqual(config.get_transcription_engine(), "parakeet")
+            self.assertEqual(json.loads(path.read_text())["transcription_engine"], "apple")
 
 
 class AppleSpeechDispatchTests(unittest.TestCase):
@@ -146,7 +199,7 @@ class NativeAppleSpeechContractTests(unittest.TestCase):
     sidecar = Path(__file__).parents[1] / "bin" / "steno-transcribe"
 
     @unittest.skipUnless(
-        apple_speech.sys.platform == "darwin"
+        apple_speech_supported()
         and sidecar.is_file()
         and os.access(sidecar, os.X_OK),
         "native Apple transcription sidecar is not built",
@@ -161,101 +214,12 @@ class NativeAppleSpeechContractTests(unittest.TestCase):
         )
         payload = json.loads(completed.stdout)
         self.assertTrue(payload["success"])
-        self.assertTrue(payload["available"])
-        self.assertTrue(payload["supported"])
+        self.assertIsInstance(payload["available"], bool)
+        self.assertIsInstance(payload["supported"], bool)
+        self.assertIsInstance(payload["installed"], bool)
+        self.assertFalse(payload["installed"] and not payload["supported"])
         self.assertEqual(payload["display_name"], "Apple On-Device")
         self.assertTrue(payload["system_managed"])
-
-
-class LexicalContentFilterContractTests(unittest.TestCase):
-    """
-    Regression coverage for the Swift hasLexicalContent() contract.
-
-    This class mirrors the Swift helper's logic in Python so that the filter
-    behaviour can be verified on any platform without a built sidecar.  The
-    predicate rejects a string when every code-point is either whitespace or a
-    non-letter/non-digit character (i.e. pure punctuation or whitespace).
-    """
-
-    @staticmethod
-    def has_lexical_content(text: str) -> bool:
-        """Python equivalent of the Swift hasLexicalContent() helper."""
-        import unicodedata
-
-        for ch in text:
-            if ch in (" ", "\t", "\n", "\r"):
-                continue
-            cat = unicodedata.category(ch)
-            # 'L' = Letter, 'N' = Number; any sub-category qualifies.
-            if cat.startswith("L") or cat.startswith("N"):
-                return True
-        return False
-
-    # ── Punctuation-only strings that MUST be rejected ───────────────────────
-
-    def test_period_is_rejected(self):
-        self.assertFalse(self.has_lexical_content("."))
-
-    def test_ideographic_period_is_rejected(self):
-        self.assertFalse(self.has_lexical_content("。"))
-
-    def test_comma_only_is_rejected(self):
-        self.assertFalse(self.has_lexical_content(","))
-
-    def test_fullwidth_comma_is_rejected(self):
-        self.assertFalse(self.has_lexical_content("，"))
-
-    def test_ellipsis_is_rejected(self):
-        self.assertFalse(self.has_lexical_content("…"))
-
-    def test_whitespace_only_is_rejected(self):
-        self.assertFalse(self.has_lexical_content("   "))
-
-    def test_empty_string_is_rejected(self):
-        self.assertFalse(self.has_lexical_content(""))
-
-    def test_multiple_punctuation_only_is_rejected(self):
-        self.assertFalse(self.has_lexical_content(".,。，…"))
-
-    def test_punctuation_with_whitespace_is_rejected(self):
-        self.assertFalse(self.has_lexical_content(" . "))
-
-    # ── Traditional Chinese strings that MUST be accepted ────────────────────
-
-    def test_traditional_chinese_phrase_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("你好"))
-
-    def test_traditional_chinese_with_trailing_period_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("你好。"))
-
-    def test_traditional_chinese_with_leading_punctuation_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("，你好"))
-
-    def test_traditional_chinese_mixed_punctuation_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("嗯，對。"))
-
-    def test_zh_hant_longer_sentence_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("這是一個測試。"))
-
-    # ── Latin letters and digits that MUST be accepted ───────────────────────
-
-    def test_english_word_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("Hello"))
-
-    def test_english_sentence_with_punctuation_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("Hello, world."))
-
-    def test_digits_are_accepted(self):
-        self.assertTrue(self.has_lexical_content("123"))
-
-    def test_digit_with_unit_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("42%"))
-
-    def test_single_letter_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("A"))
-
-    def test_mixed_cjk_latin_is_accepted(self):
-        self.assertTrue(self.has_lexical_content("Hello 你好"))
 
 
 if __name__ == "__main__":

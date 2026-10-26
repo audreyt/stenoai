@@ -1,3 +1,14 @@
+import {
+  parakeetProgressLabel,
+  parakeetProgressPercent,
+  speakerModelsProgressLabel,
+  speakerModelsProgressPercent,
+} from '@/lib/parakeetProgress';
+import type { ParakeetPullProgressEvent, SpeakerModelsProgressEvent } from '@/lib/ipc';
+import { DownloadProgressBar } from '@/components/DownloadProgressBar';
+import { speakerModelsStatusKey, useSpeakerModelsStatus } from '@/hooks/useSpeakerModels';
+import { useQueryClient } from '@tanstack/react-query';
+import { t } from '@/i18n';
 import * as React from 'react';
 import { AudioLines, Check, Cloud, HardDrive, Mic, MessageSquare, Zap, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -53,41 +64,18 @@ interface Step {
  *  begins - the status label carries the current phase so the bar never reads
  *  as a single misleading aggregate. */
 function OllamaProgressBar({ status, pct }: { status: string; pct: number }) {
-  const clamped = Math.max(0, Math.min(100, Math.round(pct)));
   return (
-    <div className="mt-2" data-setup-ollama-progress>
-      <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
-        <span className="truncate">{status || 'Downloading model...'}</span>
-        <span className="tabular-nums">{clamped}%</span>
-      </div>
-      <div
-        className="h-1.5 overflow-hidden rounded-full"
-        style={{ background: 'var(--surface-sunken)' }}
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={clamped}
-        aria-label="Summarization model download progress"
-      >
-        <div
-          className="h-full rounded-full transition-[width] duration-300"
-          style={{ width: `${clamped}%`, background: 'var(--fg-1)' }}
-        />
-      </div>
-    </div>
+    <DownloadProgressBar
+      data-setup-ollama-progress
+      label={status || 'Downloading model...'}
+      percent={pct}
+      aria-label={t('downloads.ollama.ariaLabel')}
+    />
   );
 }
 
-/** Indeterminate bar for the transcription-model download. Parakeet only
- *  exposes coarse stages (no byte counts), so we signal activity without
- *  fabricating a percentage. */
-function IndeterminateBar({
-  label,
-  kind = 'transcription',
-}: {
-  label: string;
-  kind?: 'transcription' | 'speakers';
-}) {
+/** Activity indicator with measured details in the label; no estimated percentage. */
+function IndeterminateBar({ label, kind = 'transcription' }: { label: string; kind?: 'transcription' | 'speakers' }) {
   return (
     <div
       className="mt-2"
@@ -123,9 +111,7 @@ function Badge({ status }: { status: StepStatus }) {
           ? 'bg-destructive text-destructive-foreground'
           : 'bg-transparent text-muted-foreground border border-border';
   return (
-    <span
-      className={`inline-flex items-center rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${cls}`}
-    >
+    <span className={`inline-flex items-center rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${cls}`}>
       {label}
     </span>
   );
@@ -140,13 +126,7 @@ function StepCard({ step }: { step: Step }) {
       data-setup-status={step.status}
     >
       <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-muted text-foreground">
-        {step.status === 'done' ? (
-          <Check className="size-5" />
-        ) : step.status === 'failed' ? (
-          <X className="size-5" />
-        ) : (
-          <Icon className="size-5" />
-        )}
+        {step.status === 'done' ? <Check className="size-5" /> : step.status === 'failed' ? <X className="size-5" /> : <Icon className="size-5" />}
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
@@ -179,12 +159,26 @@ export function Setup() {
   const [debugOpen, setDebugOpen] = React.useState(false);
   const [logs, setLogs] = React.useState<string[]>([]);
   // Live download progress surfaced on the step cards. Parakeet only exposes a
-  // coarse stage (indeterminate bar); Ollama streams byte-level percent.
-  const [parakeetStage, setParakeetStage] = React.useState<string | null>(null);
+  // measured file progress (indeterminate bar); Ollama streams byte-level percent.
+  const [parakeetStage, setParakeetStage] = React.useState<ParakeetPullProgressEvent | null>(null);
   const [ollamaProgress, setOllamaProgress] = React.useState<{
     status: string;
     pct: number;
   } | null>(null);
+  const [speakerProgress, setSpeakerProgress] = React.useState<SpeakerModelsProgressEvent | null>(null);
+  // Speaker separation is opt-in: its models are an extra ~250 MB most people
+  // can skip, and Settings -> AI offers the same download later.
+  const [includeSpeakers, setIncludeSpeakers] = React.useState(false);
+  // Models already on disk (e.g. downloaded from Settings): show it on --
+  // unless the user has already flipped the switch themselves, since the
+  // status check can take a few seconds to answer.
+  const speakerStatus = useSpeakerModelsStatus();
+  const speakersInstalled = isMac && speakerStatus.data?.success === true && speakerStatus.data.ready;
+  const speakerSwitchTouched = React.useRef(false);
+  React.useEffect(() => {
+    if (speakersInstalled && !speakerSwitchTouched.current) setIncludeSpeakers(true);
+  }, [speakersInstalled]);
+  const queryClient = useQueryClient();
 
   React.useEffect(() => {
     if (typeof window === 'undefined' || !window.stenoai) return;
@@ -201,28 +195,36 @@ export function Setup() {
   // events) emitted by main.js 'setup-parakeet' / 'setup-ollama-and-model'.
   React.useEffect(() => {
     if (typeof window === 'undefined' || !window.stenoai) return;
-    const offParakeet = ipc().on.parakeetPullProgress(({ model, stage }) => {
+    const offParakeet = ipc().on.parakeetPullProgress((progress) => {
+      const { model } = progress;
       // Both the setup-parakeet flow and the Settings model-management pull
       // emit on the shared 'parakeet-pull-progress' channel. Settings pulls
       // carry a `model` id; the setup handler emits only { stage }. Ignore
       // model-bearing events so the wizard bar can't reflect an unrelated
       // Settings pull.
       if (model != null) return;
-      setParakeetStage(stage);
+      setParakeetStage(progress);
     });
     const offOllama = ipc().on.setupOllamaProgress(({ status, pct }) => {
       setOllamaProgress({ status, pct });
     });
+    const offSpeakers = ipc().on.speakerModelsProgress((progress) => {
+      setSpeakerProgress(progress);
+    });
     return () => {
       offParakeet();
       offOllama();
+      offSpeakers();
     };
   }, []);
 
   const checkMic = useCheckMicPermission();
   const requestMic = useRequestMicPermission();
-  // Non-Apple fallback setup still uses the existing Parakeet/Whisper hooks.
-  // Fresh macOS 26+ installs take the system-managed Apple path in runSetup.
+  // Step 2 installs Parakeet TDT v3 by default — the active engine for fresh
+  // installs. Size differs by backend (MLX ~2.5 GB on mac, ONNX int8 ~670 MB
+  // on Windows/Linux). Existing Whisper users get skipped past this step in
+  // runSetup() once we see their model is already on disk; see the
+  // parakeet-status + list-whisper-models precheck below.
   const parakeetStep = useSetupStep('parakeet');
   const speakerModelsStep = useSetupStep('speakerModels');
   const ollamaStep = useSetupStep('ollamaAndModel');
@@ -325,6 +327,7 @@ export function Setup() {
     // starts from a clean bar rather than resuming a stale one.
     setParakeetStage(null);
     setOllamaProgress(null);
+    setSpeakerProgress(null);
     // Capture the snapshot so we can branch on what's already done. Skipping
     // completed steps keeps retries fast (no re-prompting for mic permission,
     // no re-initialising Whisper) when the user is just fixing a bad API key.
@@ -345,7 +348,7 @@ export function Setup() {
               'failed',
               isMac
                 ? 'Permission denied. Grant it in System Settings.'
-                : 'Permission denied. Grant it in Settings > Privacy & security > Microphone.'
+                : 'Permission denied. Grant it in Settings > Privacy & security > Microphone.',
             );
             setRunning(false);
             return;
@@ -355,71 +358,60 @@ export function Setup() {
 
       if (snapshot.transcription !== 'done') {
         setStatus('transcription', 'running', 'Checking transcription model...');
-        const engineResponse = await ipc().transcriptionEngine.get();
-        const selectedEngine =
-          engineResponse.success && engineResponse.engine
-            ? engineResponse.engine
-            : isMac
-              ? 'apple'
-              : 'parakeet';
-
-        if (selectedEngine === 'apple' && isMac) {
-          const languageResponse = await ipc().settings.getLanguage();
-          const language =
-            languageResponse.success && languageResponse.language
-              ? languageResponse.language
-              : 'auto';
-          const appleStatus = await ipc().appleSpeech.status(language);
-          if (!appleStatus.success) throw new Error(appleStatus.error);
-          if (!appleStatus.available || !appleStatus.supported) {
-            throw new Error('Apple on-device transcription is unavailable for this language.');
+        const selected = await ipc().transcriptionEngine.get();
+        const engine = selected.success ? selected.engine : 'parakeet';
+        if (engine === 'apple') {
+          const status = await ipc().appleSpeech.status();
+          if (!status.success || !status.available || !status.supported) {
+            throw new Error(t('settings.ai.apple.unavailable'));
           }
-          if (!appleStatus.installed) {
-            setStatus('transcription', 'running', 'Preparing Apple on-device transcription...');
-            const prepared = await ipc().appleSpeech.prepare(language);
-            if (!prepared.success) throw new Error(prepared.error);
+          if (!status.installed) {
+            setStatus('transcription', 'running', t('settings.ai.apple.preparing'));
+            const prepared = await ipc().appleSpeech.prepare();
+            if (!prepared.success || !prepared.installed) {
+              throw new Error(prepared.success ? t('settings.ai.apple.notReady') : prepared.error);
+            }
           }
-          setStatus('transcription', 'done', 'Apple on-device transcription ready');
+          setStatus('transcription', 'done', 'Transcription model ready');
+        } else if (engine === 'openai-asr') {
+          setStatus('transcription', 'done', 'Transcription model ready');
+        } else if (engine === 'whisper') {
+          const whisperList = await ipc().whisperModels.list();
+          const installed = whisperList.success && Object.values(whisperList.supported_models ?? {}).some(
+            (m) => (m as { installed?: boolean }).installed === true,
+          );
+          if (!installed) throw new Error(t('settings.ai.apple.whisperMissing'));
+          setStatus('transcription', 'done', 'Transcription model ready');
         } else {
-          // Existing explicit Parakeet/Whisper choices remain supported.
-          const [parakeetStatus, whisperList] = await Promise.all([
-            ipc().parakeetModels.status(),
-            ipc().whisperModels.list(),
-          ]);
-          const parakeetInstalled = parakeetStatus.success && parakeetStatus.installed === true;
-          const anyWhisperInstalled =
-            whisperList.success &&
-            Object.values(whisperList.supported_models ?? {}).some(
-              (model) => model.installed === true
-            );
-          if (parakeetInstalled || anyWhisperInstalled) {
-            setStatus('transcription', 'done', 'Transcription model ready');
-          } else {
-            setStatus(
-              'transcription',
-              'running',
-              `Downloading Parakeet TDT v3 (${isMac ? '~572 MB' : '~670 MB'})...`
-            );
+          const parakeetStatus = await ipc().parakeetModels.status();
+          if (!parakeetStatus.success || !parakeetStatus.installed) {
+            setStatus('transcription', 'running', `Downloading Parakeet TDT v3 (${isMac ? '~2.5 GB' : '~670 MB'})...`);
+            setParakeetStage({ stage: 'preparing' });
             await parakeetStep.mutateAsync();
             setParakeetStage(null);
-            setStatus('transcription', 'done', 'Transcription model ready');
           }
+          setStatus('transcription', 'done', 'Transcription model ready');
         }
       }
 
-      if (isMac && snapshot.speakers !== 'done') {
-        setStatus('speakers', 'running', 'Checking speaker diarization models...');
+      if (isMac && includeSpeakers && snapshot.speakers !== 'done') {
+        setStatus('speakers', 'running', 'Checking speaker models...');
         try {
           const status = await ipc().setup.speakerModelsStatus();
           if (!status.success) throw new Error(status.error);
           if (status.ready) {
-            setStatus('speakers', 'done', 'Speaker diarization models ready');
+            setStatus('speakers', 'done', 'Speaker models ready');
           } else {
-            setStatus('speakers', 'running', 'Downloading speaker diarization models...');
+            setStatus('speakers', 'running', 'Downloading speaker models...');
             await speakerModelsStep.mutateAsync();
-            setStatus('speakers', 'done', 'Speaker diarization models ready');
+            setSpeakerProgress(null);
+            // Settings reads the same cached status; don't let it show
+            // Download for models that are now installed.
+            void queryClient.invalidateQueries({ queryKey: speakerModelsStatusKey });
+            setStatus('speakers', 'done', 'Speaker models ready');
           }
         } catch {
+          setSpeakerProgress(null);
           setStatus('speakers', 'failed', 'Optional setup failed. You can retry later.');
         }
       }
@@ -484,6 +476,7 @@ export function Setup() {
       // error detail, not a frozen progress bar.
       setParakeetStage(null);
       setOllamaProgress(null);
+      setSpeakerProgress(null);
       setStatuses((prev) => {
         const failId = (Object.keys(prev) as Step['id'][]).find((k) => prev[k] === 'running');
         if (!failId) return prev;
@@ -513,7 +506,16 @@ export function Setup() {
       detail: details.transcription,
       progressNode:
         statuses.transcription === 'running' && parakeetStage !== null ? (
-          <IndeterminateBar label="Downloading and preparing model..." />
+          parakeetProgressPercent(parakeetStage) !== null ? (
+            <DownloadProgressBar
+              data-setup-transcription-progress
+              label={parakeetProgressLabel(parakeetStage)}
+              percent={parakeetProgressPercent(parakeetStage)!}
+              aria-label={t('downloads.parakeet.ariaLabel')}
+            />
+          ) : (
+            <IndeterminateBar label={parakeetProgressLabel(parakeetStage)} />
+          )
         ) : undefined,
     },
     {
@@ -533,16 +535,23 @@ export function Setup() {
     },
   ];
 
-  if (isMac) {
+  if (isMac && includeSpeakers) {
     steps.splice(2, 0, {
       id: 'speakers',
-      title: 'Speaker Diarization',
-      description: 'Separates individual speakers locally',
+      title: t('settings.ai.speakers.label'),
+      description: 'Separates the voices on each side of a call',
       icon: AudioLines,
       status: statuses.speakers,
       detail: details.speakers,
       progressNode:
-        statuses.speakers === 'running' && details.speakers?.startsWith('Downloading') ? (
+        statuses.speakers === 'running' && speakerProgress !== null ? (
+          <DownloadProgressBar
+            data-setup-speaker-progress
+            label={speakerModelsProgressLabel(speakerProgress)}
+            percent={speakerModelsProgressPercent(speakerProgress)}
+            aria-label={t('downloads.speakers.ariaLabel')}
+          />
+        ) : statuses.speakers === 'running' && details.speakers?.startsWith('Downloading') ? (
           <IndeterminateBar label="Downloading and preparing models..." kind="speakers" />
         ) : undefined,
     });
@@ -600,7 +609,10 @@ export function Setup() {
         </div>
 
         {showSummaryChooser && (
-          <div className="mt-3 rounded-md border border-border p-4" data-setup-summary-chooser>
+          <div
+            className="mt-3 rounded-md border border-border p-4"
+            data-setup-summary-chooser
+          >
             <div className="mb-3 text-sm font-medium text-foreground">
               How should Steno summarize meetings?
             </div>
@@ -612,7 +624,7 @@ export function Setup() {
                   'flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors',
                   summaryMode === 'local'
                     ? 'border-foreground bg-muted/40'
-                    : 'border-border hover:bg-muted/20'
+                    : 'border-border hover:bg-muted/20',
                 )}
                 aria-pressed={summaryMode === 'local'}
               >
@@ -623,7 +635,9 @@ export function Setup() {
                   </div>
                   {summaryMode === 'local' && <Check className="size-4 text-foreground" />}
                 </div>
-                <Muted className="text-[12px]">Private. Free. ~2 GB download.</Muted>
+                <Muted className="text-[12px]">
+                  Private. Free. ~2 GB download.
+                </Muted>
               </button>
               <button
                 type="button"
@@ -632,7 +646,7 @@ export function Setup() {
                   'flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors',
                   summaryMode === 'cloud'
                     ? 'border-foreground bg-muted/40'
-                    : 'border-border hover:bg-muted/20'
+                    : 'border-border hover:bg-muted/20',
                 )}
                 aria-pressed={summaryMode === 'cloud'}
               >
@@ -643,7 +657,9 @@ export function Setup() {
                   </div>
                   {summaryMode === 'cloud' && <Check className="size-4 text-foreground" />}
                 </div>
-                <Muted className="text-[12px]">Fast. Higher quality. Bring your own API key.</Muted>
+                <Muted className="text-[12px]">
+                  Fast. Higher quality. Bring your own API key.
+                </Muted>
               </button>
             </div>
 
@@ -742,12 +758,36 @@ export function Setup() {
                     spellCheck={false}
                   />
                   <Muted className="mt-1 text-[11px]">
-                    Stored locally on this device. Never synced or sent anywhere except the provider
-                    you select.
+                    Stored locally on this device. Never synced or sent
+                    anywhere except the provider you select.
                   </Muted>
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {isMac && (
+          <div
+            className="mt-3 flex items-start gap-4 rounded-md border border-border p-4"
+            data-setup-speakers-opt-in
+          >
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-foreground">
+                {t('setup.speakers.optInTitle')}
+              </div>
+              <Muted className="mt-0.5">{t('setup.speakers.optInDescription')}</Muted>
+            </div>
+            <Switch
+              checked={includeSpeakers}
+              onCheckedChange={(on) => {
+                speakerSwitchTouched.current = true;
+                setIncludeSpeakers(on);
+              }}
+              // Fixed once setup has run: Settings -> AI handles it from there.
+              disabled={running || done || statuses.speakers === 'done'}
+              aria-label={t('setup.speakers.optInTitle')}
+            />
           </div>
         )}
 
@@ -756,10 +796,12 @@ export function Setup() {
           data-setup-telemetry
         >
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-foreground">Anonymous usage analytics</div>
+            <div className="text-sm font-medium text-foreground">
+              Anonymous usage analytics
+            </div>
             <Muted className="mt-0.5">
-              Help improve Steno — meeting content is never sent. You can change this any time in
-              Settings → Advanced.
+              Help improve Steno — meeting content is never sent. You can
+              change this any time in Settings → Advanced.
             </Muted>
           </div>
           <Switch
@@ -775,10 +817,12 @@ export function Setup() {
           data-setup-launch
         >
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-foreground">Launch on login</div>
+            <div className="text-sm font-medium text-foreground">
+              Launch on login
+            </div>
             <Muted className="mt-0.5">
-              Start Steno automatically when you log in (hidden in the menu bar). You can change
-              this any time in Settings.
+              Start Steno automatically when you log in (hidden in the menu
+              bar). You can change this any time in Settings.
             </Muted>
           </div>
           <Switch
@@ -799,13 +843,19 @@ export function Setup() {
               size="lg"
               onClick={runSetup}
               disabled={running || !canBegin}
-              title={!canBegin ? 'Enter your cloud API key first' : undefined}
+              title={
+                !canBegin
+                  ? 'Enter your cloud API key first'
+                  : undefined
+              }
             >
               {running ? 'Setting up...' : 'Begin setup'}
             </Button>
           )}
           {!done && !running && !canBegin && (
-            <Muted className="text-[12px]">Enter your API key to continue.</Muted>
+            <Muted className="text-[12px]">
+              Enter your API key to continue.
+            </Muted>
           )}
         </div>
 
@@ -820,9 +870,7 @@ export function Setup() {
           </button>
           {debugOpen && (
             <pre className="mt-3 h-64 overflow-auto rounded border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed text-foreground">
-              {logs.length === 0
-                ? 'Steno Setup\nCommands and output will appear here...\n'
-                : logs.join('\n')}
+              {logs.length === 0 ? 'Steno Setup\nCommands and output will appear here...\n' : logs.join('\n')}
             </pre>
           )}
         </div>

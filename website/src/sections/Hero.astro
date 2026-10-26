@@ -1,121 +1,137 @@
 ---
-import { ShieldCheck, Lock, HandCoins, BotOff } from "lucide-react";
-import ProviderCluster from "../components/ProviderCluster.astro";
-import { AppWindowDemo } from "../components/AppWindowDemo";
-import AppleIcon from "../components/icons/AppleIcon.astro";
-import WindowsIcon from "../components/icons/WindowsIcon.astro";
-import { WINDOWS_EXE_URL } from "../lib/downloads";
+import { ArrowUpRight, ArrowDown, Plus } from "lucide-react";
+import { CTA_BRIEFING } from "../content/industries.data";
+
+// Radar layer over the film: light pulses travelling along the 88px grid lines.
+// d = axis, n = line index, t = seconds per pass, del = start offset, a = amber.
+const PULSES = [
+  { d: "x", n: 2, t: 9, del: -2 },
+  { d: "x", n: 5, t: 12, del: -7, a: true },
+  { d: "x", n: 8, t: 10, del: -4 },
+  { d: "y", n: 1, t: 8, del: -1 },
+  { d: "y", n: 3, t: 10, del: -5 },
+  { d: "y", n: 9, t: 11, del: -6 },
+  { d: "y", n: 14, t: 9.5, del: -3, a: true },
+];
 ---
 
-<section class="pt-[40px] pb-[56px] md:pt-[56px] md:pb-[80px]">
-  <div class="container-site text-center">
-
-    <div class="mb-5 flex justify-center">
-      <ProviderCluster />
+<section class="mission-hero" aria-labelledby="hero-heading">
+  <!-- The app film: the StenoAI window locked in place while real rooms change around it. Landscape on desktop,
+       portrait on phones (the window at the top, the copy below). No sound track. -->
+  <video class="mission-hero-image" muted loop playsinline autoplay preload="auto" poster="/images/enterprise/hero-film.webp" disablepictureinpicture disableremoteplayback aria-hidden="true" tabindex="-1" data-hero-film>
+    <source src="/video/hero-film-m.mp4" type="video/mp4" media="(max-width: 767px)" />
+    <source src="/video/hero-film.mp4" type="video/mp4" />
+  </video>
+  <script is:inline>
+    (function () { var v = document.querySelector('[data-hero-film]'); if (v && window.matchMedia('(max-width: 767px)').matches) v.poster = '/images/enterprise/hero-film-m.webp'; })();
+  </script>
+  <div class="mission-hero-shade" aria-hidden="true"></div>
+  <div class="hero-radar-grid" aria-hidden="true"></div>
+  <div class="hero-radar" aria-hidden="true">
+    <div class="hero-radar-pulses">
+      {PULSES.map((p) => <i class:list={["hero-pulse", `hero-pulse-${p.d}`, { "hero-pulse-amber": p.a }]} style={`--n:${p.n};--dur:${p.t}s;--del:${p.del}s`}></i>)}
     </div>
-
-    <h1
-      style={{
-        fontFamily: "var(--font-serif)",
-        fontWeight: 400,
-        fontSize: "clamp(40px, 5.6vw, 68px)",
-        lineHeight: 1.02,
-        letterSpacing: "-0.025em",
-        color: "var(--fg-1)",
-        maxWidth: "36ch",
-        margin: "0 auto",
-      }}
-    >
-      Protect your sensitive conversations.
-    </h1>
-
-    <p
-      class="text-fg-2 text-lg leading-[1.55] mt-6 mb-8 mx-auto"
-      style="max-width: 64ch"
-    >
-      Steno is the privacy-first AI notetaker for all your confidential conversations.
-      No cloud, no usage limits and your private data never leaves your premises.
-    </p>
-
-    <div class="flex gap-[10px] flex-wrap justify-center" id="hero-cta">
-      <a
-        href="/download/?src=hero"
-        data-os-cta="mac"
-        class="btn-base btn-primary inline-flex items-center gap-2 no-underline hover:no-underline"
-      >
-        <AppleIcon size={15} />
-        <span data-os-cta-label="mac">Download for macOS</span>
-      </a>
-      <a
-        href={WINDOWS_EXE_URL}
-        data-track="download"
-        data-location="hero"
-        data-arch="win-x64"
-        data-os-cta="windows"
-        class="btn-base btn-ghost inline-flex items-center gap-2 no-underline hover:no-underline"
-        style="display: none"
-      >
-        <WindowsIcon size={15} />
-        <span data-os-cta-label="windows">Download for Windows (alpha)</span>
-      </a>
+    <div class="hero-radar-scan"></div>
+  </div>
+  <div class="mission-hero-grid" aria-hidden="true"><Plus className="hero-cross hero-cross-one" size={20} /><Plus className="hero-cross hero-cross-two" size={20} /></div>
+  <div class="mission-wrap mission-hero-content">
+    <p class="mission-eyebrow"><span class="mission-status-dot"></span> Government, defence & law enforcement</p>
+    <h1 id="hero-heading">The record stays<br /><span>in the room.</span></h1>
+    <p class="mission-hero-description">AI meeting notes for conversations that can’t be handed to a vendor. Run it on the device, or on infrastructure you control. No meeting bot. Open source.</p>
+    <div class="mission-actions">
+      <a href={CTA_BRIEFING} class="mission-button mission-button-light" data-track="demo_request" data-location="hero">Request a briefing <ArrowUpRight size={17} aria-hidden="true" /></a>
+      <a href="#how" class="mission-text-link">Explore the platform <ArrowDown size={16} aria-hidden="true" /></a>
     </div>
-    <noscript>
-      <style>#hero-cta [data-os-cta="windows"] { display: inline-flex !important; }</style>
-    </noscript>
-
-    <div class="flex gap-5 flex-wrap justify-center mt-6 mb-12">
-      <span class="inline-flex items-center gap-1.5 text-fg-2 text-[13px]">
-        <ShieldCheck size={13} aria-hidden="true" /> Open source
-      </span>
-      <span class="inline-flex items-center gap-1.5 text-fg-2 text-[13px]">
-        <Lock size={13} aria-hidden="true" /> Data never leaves your premises
-      </span>
-      <span class="inline-flex items-center gap-1.5 text-fg-2 text-[13px]">
-        <BotOff size={13} aria-hidden="true" /> No meeting bots
-      </span>
-      <span class="inline-flex items-center gap-1.5 text-fg-2 text-[13px]">
-        <HandCoins size={13} aria-hidden="true" /> No usage limits
-      </span>
-    </div>
-
-    <div class="mx-auto" style="max-width: 960px">
-      <AppWindowDemo client:visible />
-    </div>
-
+  </div>
+  <div class="mission-hero-caption" aria-hidden="true"><span>Illustrative footage · Local mode</span></div>
+  <div class="mission-hero-bottom mission-wrap">
+    <span><span class="mission-small-index">01</span> On your device</span>
+    <span><span class="mission-small-index">02</span> On your infrastructure</span>
+    <span><span class="mission-small-index">03</span> Open & inspectable</span>
+    <a href="#how" aria-label="Explore how StenoAI works"><ArrowDown size={20} aria-hidden="true" /></a>
   </div>
 </section>
 
-<script>
-  // Best-effort client OS detection, ported from Hero.jsx's detectOS(). The
-  // primary CTA follows the visitor's OS; on ambiguous UAs both are shown.
-  function detectOS() {
-    if (typeof navigator === "undefined") return "mac";
-    const hint = navigator.userAgentData?.platform || navigator.platform || "";
-    const ua = navigator.userAgent || "";
-    const isIOS =
-      /iphone|ipad|ipod/i.test(ua) ||
-      (/mac/i.test(hint) && navigator.maxTouchPoints > 1);
-    if (isIOS || /android/i.test(ua)) return "other";
-    if (/win/i.test(hint) || /windows/i.test(ua)) return "windows";
-    if (/mac/i.test(hint) || /mac os/i.test(ua)) return "mac";
-    return "other";
+<style>
+  /* Radar layer: a hairline grid blended into the film, light pulses running along its lines and a slow amber
+     sweep with faint scan lines. All of it sits over the film and under the copy. */
+  .hero-radar { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
+  .hero-radar-pulses, .hero-radar-scan { position: absolute; inset: 0; }
+  /* The grid is its own layer beside the film (not inside .hero-radar, whose z-index makes a separate stacking
+     context), so its overlay blend mixes with the film and the lines stay as quiet as in the original design. */
+  .hero-radar-grid {
+    position: absolute; inset: 0; z-index: -1; pointer-events: none;
+    background-image:
+      linear-gradient(to right, rgba(236, 234, 227, .32) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(236, 234, 227, .32) 1px, transparent 1px);
+    background-size: 88px 88px;
+    mix-blend-mode: overlay;
+    mask-image: radial-gradient(ellipse 80% 70% at 50% 42%, #000 30%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 70% at 50% 42%, #000 30%, transparent 80%);
+  }
+  .hero-radar-pulses {
+    overflow: hidden;
+    mask-image: radial-gradient(ellipse 80% 70% at 50% 42%, #000 30%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 70% at 50% 42%, #000 30%, transparent 80%);
+  }
+  .hero-pulse { position: absolute; display: block; --c: 127, 214, 192; }
+  .hero-pulse-amber { --c: 240, 160, 75; }
+  .hero-pulse-x { left: 0; top: calc(var(--n) * 88px); width: 110px; height: 1px; background: linear-gradient(90deg, rgba(var(--c), 0), rgba(var(--c), .95)); box-shadow: 0 0 8px 1px rgba(var(--c), .45); animation: hero-pulse-x var(--dur) linear var(--del) infinite; }
+  .hero-pulse-y { top: 0; left: calc(var(--n) * 88px); width: 1px; height: 110px; background: linear-gradient(180deg, rgba(var(--c), 0), rgba(var(--c), .95)); box-shadow: 0 0 8px 1px rgba(var(--c), .45); animation: hero-pulse-y var(--dur) linear var(--del) infinite; }
+  @keyframes hero-pulse-x { from { transform: translateX(-140px); } to { transform: translateX(calc(100vw + 140px)); } }
+  @keyframes hero-pulse-y { from { transform: translateY(-140px); } to { transform: translateY(1000px); } }
+  .hero-radar-scan { overflow: hidden; background: repeating-linear-gradient(180deg, rgba(255, 255, 255, .018) 0 1px, transparent 1px 3px); }
+  .hero-radar-scan::after {
+    content: ''; position: absolute; left: 0; right: 0; height: 30%; top: -30%;
+    background: linear-gradient(180deg, transparent, rgba(240, 160, 75, .05) 70%, rgba(240, 160, 75, .14) 99%, transparent);
+    animation: hero-sweep 9s cubic-bezier(.65, 0, .35, 1) 1.2s infinite;
+  }
+  @keyframes hero-sweep { 0% { transform: translateY(0); } 60%, 100% { transform: translateY(470%); } }
+  @media (prefers-reduced-motion: reduce) { .hero-radar-pulses { display: none; } .hero-radar-scan::after { animation: none; display: none; } }
+
+  /* Landscape tablets and small laptops: the film sits further right so the copy stays clear of the laptop. */
+  @media (min-width: 768px) and (max-width: 1199px) and (min-aspect-ratio: 1/1) {
+    .mission-hero-image { object-position: 35% 50%; }
   }
 
-  const wrap = document.getElementById("hero-cta");
-  if (wrap) {
-    const os = detectOS();
-    const mac = wrap.querySelector('[data-os-cta="mac"]');
-    const win = wrap.querySelector('[data-os-cta="windows"]');
-    if (os === "windows" && mac && win) {
-      // Windows: lead with the Windows CTA, keep Mac as secondary.
-      wrap.insertBefore(win, mac);
-      win.style.display = "";
-      win.className = "btn-base btn-primary inline-flex items-center gap-2 no-underline hover:no-underline";
-      mac.className = "btn-base btn-ghost inline-flex items-center gap-2 no-underline hover:no-underline";
-    } else if (os === "other" && win) {
-      // Unknown OS: show both options.
-      win.style.display = "";
+  /* Portrait tablets: the landscape film runs full width across the top and the copy follows below it (laid over the
+     film, the copy sat on the app window). */
+  @media (min-width: 768px) and (max-width: 1099px) and (max-aspect-ratio: 1/1) {
+    .mission-hero { height: auto; min-height: 0; }
+    .mission-hero-image { bottom: auto; height: auto; aspect-ratio: 16 / 9; object-position: 50% 50%; }
+    .mission-hero-shade { background: linear-gradient(180deg, rgba(12, 10, 8, .2) 0, rgba(12, 10, 8, 0) 14vw, rgba(12, 10, 8, .1) 36vw, rgba(12, 10, 8, .88) 52vw, #14110d 57vw); }
+    .mission-hero-content { padding-top: calc(56.25vw + 12px); }
+    .hero-radar-grid, .hero-radar-pulses {
+      mask-image: linear-gradient(180deg, #000 0, #000 40vw, transparent 55vw);
+      -webkit-mask-image: linear-gradient(180deg, #000 0, #000 40vw, transparent 55vw);
     }
-    // os === "mac" (default): only the Mac CTA shows, matching the markup as-authored.
+  }
+
+  /* Phones: the portrait film sits at the top with the app window in view, the copy follows below it. */
+  @media (max-width: 767px) {
+    .mission-hero-image { bottom: auto; height: auto; aspect-ratio: 9 / 16; object-position: 50% 0; }
+    .mission-hero-shade { background: linear-gradient(180deg, rgba(12, 10, 8, .18) 0, rgba(12, 10, 8, 0) 24vw, rgba(12, 10, 8, .1) 62vw, rgba(12, 10, 8, .86) 86vw, #14110d 104vw); }
+    .mission-hero-content { padding-top: calc(86vw + 8px); }
+    .hero-radar-grid, .hero-radar-pulses {
+      mask-image: linear-gradient(180deg, #000 0, #000 60vw, transparent 84vw);
+      -webkit-mask-image: linear-gradient(180deg, #000 0, #000 60vw, transparent 84vw);
+    }
+  }
+</style>
+
+<script>
+  // Illustrative film behind the hero. Hold the still poster under reduced
+  // motion, and pause while scrolled out of view.
+  const film = document.querySelector<HTMLVideoElement>('[data-hero-film]');
+  if (film) {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      film.removeAttribute('autoplay');
+      film.pause();
+    } else if ('IntersectionObserver' in window) {
+      new IntersectionObserver(([entry]) => {
+        if (entry.isIntersecting) film.play().catch(() => {});
+        else film.pause();
+      }, { threshold: 0.1 }).observe(film);
+    }
   }
 </script>

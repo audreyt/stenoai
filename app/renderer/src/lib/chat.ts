@@ -1,6 +1,7 @@
 // Shared helpers for the Chat tab + conversation view.
 
 import type { AiProvider, CloudProvider } from '@/lib/ipc';
+import { UI_LOCALE } from './locale';
 
 /** The AI-provider config fields the active-model label reads. */
 type ActiveModelFields = {
@@ -118,7 +119,7 @@ export function toBucketLabel(key: string): string {
   if (key === 'this-month') return 'This month';
   if (key.startsWith('month-')) {
     const m = parseInt(key.slice(6), 10);
-    return new Date(2000, m, 1).toLocaleString(undefined, { month: 'long' });
+    return new Date(2000, m, 1).toLocaleString(UI_LOCALE, { month: 'long' });
   }
   if (key.startsWith('year-')) return key.slice(5);
   return key;
@@ -139,4 +140,12 @@ export function relativeTime(ts: number): string {
   const months = Math.floor(days / 30);
   if (months < 12) return `${months}mo`;
   return `${Math.floor(months / 12)}y`;
+}
+
+/** Keep follow-up history within the backend contract and the selected scope. */
+export function boundedChatHistory(messages: Array<{ role: 'user' | 'assistant'; content: string; context?: string }>, context: string, legacyContext: string) {
+  const turns = messages.filter((m) => (m.context ?? legacyContext) === context)
+    .slice(-6).map(({ role, content }) => ({ role, content: content.slice(-4000) }));
+  while (turns.reduce((n, t) => n + t.content.length, 0) > 12000) turns.shift();
+  return turns;
 }

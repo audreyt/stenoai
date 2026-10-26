@@ -39,6 +39,7 @@ const showNote = (page: import('@playwright/test').Page) =>
     (window as StenoWindow).stenoai.settings.showNoteReadyNotification({
       title: 'E2E note',
       summaryFile: 'e2e-note.json',
+      actionItemCount: 3,
     }),
   );
 const showMicOnly = (page: import('@playwright/test').Page) =>
@@ -89,4 +90,17 @@ test('notifications toggle persists and gates the note-ready / silence / mic-onl
 
   // Keystone: the real user-data dir is byte-for-byte untouched.
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+});
+
+test('note-ready toast renders the action-item count beside the title', async ({ launchApp }) => {
+  const { app, page } = await launchApp();
+  await page.evaluate(() => (window as StenoWindow).stenoai.settings.setNotifications(true));
+  expect((await showNote(page)).shown).toBe(true);
+
+  const toastText = async () => {
+    const toast = app.windows().find((w) => w.url().includes('#/notification'));
+    return toast ? toast.locator('body').innerText().catch(() => '') : '';
+  };
+  await expect.poll(toastText).toContain('Note ready · 3 action items');
+  expect(await toastText()).toContain('E2E note');
 });

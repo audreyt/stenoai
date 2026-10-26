@@ -67,7 +67,7 @@ const MINIMAL_WAV_BASE64 = buildSilentWavBase64(SILENT_WAV_SECONDS, SILENT_WAV_S
 const SEED_MEETING = {
   session_info: {
     name: 'Epsilon Planning',
-    summary_file: 'epsilon_summary.json',
+    summary_file: process.env.STENOAI_E2E_EDIT_MARKDOWN === '1' ? 'epsilon_summary.md' : 'epsilon_summary.json',
     processed_at: '2026-06-19T12:00:00Z',
     duration_seconds: 1500,
     transcription_failed: false,
@@ -103,6 +103,27 @@ const PENDING_MEETING = {
   },
   transcript: '[00:03] [You] we ship Friday.\n[00:06] [Others] I will prep the release notes.',
   is_diarised: true,
+  summary: '',
+  key_points: [],
+  action_items: [],
+  discussion_areas: [],
+  participants: [],
+};
+
+// A note imported from a .stenomeeting package. Swift-authored notes carry
+// their body as user_notes and have no generated summary, so the detail view
+// should open directly on My notes. Opt-in to keep every existing T1 seed
+// unchanged.
+const TRANSFER_MEETING = {
+  steno_transfer: { sourceMeetingID: '11111111-2222-4333-8444-555555555555' },
+  session_info: {
+    name: 'Imported Swift note',
+    summary_file: 'imported-swift-note_summary.md',
+    processed_at: '2026-09-12T04:00:00Z',
+    duration_seconds: 0,
+  },
+  transcript: '',
+  user_notes: 'Notes written on iPhone and transferred to this Mac.',
   summary: '',
   key_points: [],
   action_items: [],
@@ -170,14 +191,44 @@ const SEED_REPORT = {
   created_at: '2026-06-19T13:00:00Z',
 };
 
+// A report whose template asks for YAML frontmatter, attached instead when
+// STENOAI_E2E_SEED_REPORT=frontmatter (report-properties T1). The title is
+// not the note's on purpose: title and date are left out of the properties by
+// key, whatever their value.
+const SEED_FRONTMATTER_REPORT = {
+  id: 'rep_e2e_frontmatter',
+  template_id: 'tpl_e2e_client_call',
+  template_name: 'Client Call',
+  model: 'mock-model',
+  content:
+    '---\ntitle: "Erika Mustermann: Empty Bcc field"\ndate: 2026-06-19\n'
+    + 'client: Erika Mustermann\norganisation: Example Ltd\nissue: Empty Bcc field\n'
+    + 'symptoms:\n  - Bcc stays empty on send\nresolved: true\n---\n\n'
+    + '## Summary\nThe Bcc field stayed empty until the signature was recreated.',
+  created_at: '2026-06-19T13:00:00Z',
+};
+
 // Mutable so the stateful set-active-report mock below persists the pill
 // switch across the invalidate → get-meeting refetch, like the real sidecar.
 let seedActiveReport = null;
 
-const seededMeeting = () =>
-  process.env.STENOAI_E2E_SEED_REPORT === '1'
-    ? { ...SEED_MEETING, reports: [SEED_REPORT], active_report: seedActiveReport }
+const seededMeeting = () => {
+  const meeting = process.env.STENOAI_E2E_SEED_DIARISED_EXPORT === '1'
+    ? {
+        ...SEED_MEETING,
+        transcript: '',
+        is_diarised: true,
+        diarised_text:
+          '[00:00] [You] We should ship Friday.\n[00:02] [You] I will prepare the release.\n[00:06] [Others] Sounds good.',
+      }
     : SEED_MEETING;
+  if (process.env.STENOAI_E2E_SEED_REPORT === 'frontmatter') {
+    return { ...meeting, reports: [SEED_FRONTMATTER_REPORT], active_report: seedActiveReport };
+  }
+  return process.env.STENOAI_E2E_SEED_REPORT === '1'
+    ? { ...meeting, reports: [SEED_REPORT], active_report: seedActiveReport }
+    : meeting;
+};
 
 // A diarised meeting for the speaker-review T1 spec -- seeded only when
 // STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS=1. summary_file's stem
@@ -195,7 +246,11 @@ const SPEAKER_SEED_MEETING = {
   transcript: '',
   is_diarised: true,
   has_speaker_sidecar: true,
-  diarised_text: '[00:05] [Speaker 2] hello there',
+  diarised_text:
+    '[00:05] [Speaker 2] hello there\n\n' +
+    '[00:10] [Speaker 3] another participant\n\n' +
+    '[00:15] [Speaker 4] a third participant\n\n' +
+    '[00:20] [Others] fallback channel speech',
   participants: [],
   summary: 'A test meeting for speaker review.',
   key_points: [],
@@ -274,10 +329,15 @@ const AUDIO_SEED_MEETINGS = [
 ];
 
 function install({ ipcMain }) {
+  // Renderer tests can save and reopen chat turns without a backend or disk.
+  let chatSessions = { sessions: [] };
+  let privacyNoticeSeen = true;
+  let delayPrivacyNotice = process.env.STENOAI_E2E_DELAY_PRIVACY_NOTICE === '1';
   // In-memory stand-in for the org session + provider config that the real
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
   // mocks so a test can assert the UI reacts to its own actions.
   const state = {
+    language: 'auto',
     provider: 'local', // 'local' | 'remote' | 'cloud' | 'adapter'
     orgSession: null, // { adapterUrl, email, name, orgId, exp } when signed in
     everSignedIn: false,
@@ -286,6 +346,17 @@ function install({ ipcMain }) {
     cloudModel: 'gpt-4o',
     remoteUrl: '', // remote Ollama URL (empty = not configured)
     autoInstallWhenIdle: true, // idle auto-install toggle (config default on)
+    transcriptionEngine: process.env.STENOAI_E2E_MOCK_ENGINE || 'parakeet',
+    diarizationEngine: 'sortformer',
+    // STENOAI_E2E_SPEAKER_MODELS_MISSING=1 simulates an upgraded install whose
+    // speaker models predate the current cache layout: every engine reports
+    // its models missing until setup-speaker-models prepares THAT engine.
+    speakerModelsMissing: new Set(
+      process.env.STENOAI_E2E_SPEAKER_MODELS_MISSING === '1' ? ['sortformer', 'nemotron3'] : [],
+    ),
+    openAiAsrUrl: 'https://api.openai.com/v1',
+    openAiAsrModel: 'whisper-1',
+    openAiAsrKeySet: process.env.STENOAI_E2E_OAI_ASR_KEY_SET === '1',
   };
 
   // In-memory recording state machine for the pill-dock T1: start/pause/
@@ -297,12 +368,17 @@ function install({ ipcMain }) {
     active: false,
     paused: false,
     processing: false,
-    sessionName: null,
+    // STENOAI_E2E_STALE_SESSION_NAME seeds the state main.js is left in after a
+    // capture start that failed in the renderer: no recording, but the session
+    // NAME retained. See the get-queue-status handler for why that state is not
+    // otherwise reachable through this mock.
+    sessionName: process.env.STENOAI_E2E_STALE_SESSION_NAME || null,
     // The append/resume target (summary file) of the active recording, mirrored
     // into get-queue-status.recordingSummaryFile so the detail view can match
     // "recording this note" by identity (not display name).
     appendTo: null,
     startedAt: 0,
+    recordingId: null,
     pausedAt: 0,
   };
 
@@ -310,6 +386,20 @@ function install({ ipcMain }) {
   // tab in T1 (summaryFile → { user_notes }). The real handler persists to the
   // note file; the T1 seeds are consts, so we overlay here instead.
   const meetingOverlay = {};
+
+  // Every update-meeting call, verbatim, so a T1 spec can assert the bridge
+  // was invoked exactly once with exactly the fields it expects (note-edit.t1).
+  // Read via ElectronApplication.evaluate (the main process), not through
+  // window.stenoai in the page: contextBridge's exposed API is read-only from
+  // the renderer's world, so monkey-patching window.stenoai.meetings.update in
+  // page.evaluate silently no-ops instead of recording anything.
+  global.__stenoaiE2eUpdateMeetingCalls = [];
+
+  // Every reprocess-meeting call, same recording trick and the same reason. A
+  // spec that has to prove a rebuild did NOT start cannot assert on the UI
+  // (with the editor open the streaming view is suppressed on purpose), so the
+  // only honest evidence is that the IPC was never reached.
+  global.__stenoaiE2eReprocessCalls = [];
 
   // In-flight soft-deletes (#234), id → the deleted meeting. Mirrors main's
   // pendingDelete map just far enough for undo to hand the row back.
@@ -464,6 +554,56 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
+    'get-privacy-notice-seen': async () => {
+      if (delayPrivacyNotice) {
+        delayPrivacyNotice = false;
+        return new Promise(resolve => {
+          // Let the modal-stacking spec resolve the initial query explicitly.
+          global.__resolvePrivacyNotice = seen => {
+            privacyNoticeSeen = seen;
+            resolve({ success: true, privacy_notice_seen: seen });
+          };
+        });
+      }
+      return { success: true, privacy_notice_seen: privacyNoticeSeen };
+    },
+    'set-privacy-notice-seen': async () => {
+      privacyNoticeSeen = true;
+      return { success: true, privacy_notice_seen: true };
+    },
+    'load-chat-sessions': async () => ({ success: true, data: chatSessions }),
+    'save-chat-sessions': async (_event, data) => {
+      chatSessions = data;
+      return { success: true };
+    },
+    // Off by default, so the Re-transcribe entry only shows for specs that
+    // opt in (note-generation-error.t1's re-transcribe refusal).
+    'recording-available': async () => ({
+      success: true,
+      available: process.env.STENOAI_E2E_RECORDING_AVAILABLE === '1',
+    }),
+    // Record every call for the editor guards, including requests held open
+    // so the generation-error specs can inject a failure and retry.
+    'reprocess-meeting': async (_event, summaryFile, regenerateTitle, sessionName, retranscribe) => {
+      global.__stenoaiE2eReprocessCalls.push({ summaryFile, regenerateTitle, sessionName, retranscribe });
+      if (process.env.STENOAI_E2E_REPROCESS_PENDING !== '1') return { success: true };
+      const state = global.__reprocessTest || (global.__reprocessTest = { calls: 0 });
+      state.calls++;
+      return new Promise(resolve => { state.finish = resolve; });
+    },
+    // The permissive default ({success:true}) would leave sampleRate/channels
+    // undefined, making the renderer's bytesPerFrame NaN. Mirror the real
+    // handler's shape (main.js start-linux-loopback) instead.
+    'start-linux-loopback': async () => ({ success: true, sampleRate: 48000, channels: 2 }),
+    // A spec sets global.__holdNextOpenSystemAudioFile (via app.evaluate) to
+    // park a capture start mid-way, then calls global.__releaseOpenSystemAudioFile.
+    'open-system-audio-file': async () => {
+      if (!global.__holdNextOpenSystemAudioFile) return { success: true };
+      global.__holdNextOpenSystemAudioFile = false;
+      return new Promise((resolve) => {
+        global.__releaseOpenSystemAudioFile = () => resolve({ success: true });
+      });
+    },
     'start-recording-ui': async (_event, name, _trigger, appendTo) => {
       rec.active = true;
       rec.paused = false;
@@ -471,6 +611,7 @@ function install({ ipcMain }) {
       rec.sessionName = name && String(name).trim() ? String(name).trim() : 'Note';
       rec.appendTo = appendTo && String(appendTo).trim() ? String(appendTo).trim() : null;
       rec.startedAt = Date.now();
+      rec.recordingId = String(rec.startedAt);
       return { success: true, sessionName: rec.sessionName };
     },
     'stop-recording-ui': async () => {
@@ -516,6 +657,11 @@ function install({ ipcMain }) {
       if (statePath) {
         try {
           const override = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+          if (override.holdForTransferTest && !global.__transferQueueReleased) {
+            await new Promise(resolve => {
+              (global.__pendingTransferQueue ??= []).push(resolve);
+            });
+          }
           return {
             success: true,
             isProcessing: false,
@@ -544,8 +690,23 @@ function install({ ipcMain }) {
         elapsedSeconds: rec.active
           ? Math.floor(((rec.paused ? rec.pausedAt : Date.now()) - rec.startedAt) / 1000)
           : 0,
-        sessionName: rec.active || rec.processing ? rec.sessionName : null,
+        // The real main.js does NOT clear currentRecordingSessionName when the
+        // renderer reports its capture inactive — it deliberately keeps the
+        // name so a brief capture flap can't drop the "which meeting is live"
+        // label, on the assumption that "a stale name while hasRecording is
+        // false is inert" (main.js, system-audio-recording-state handler).
+        // This mock nulls it instead, which is a *more* correct contract than
+        // the app implements — and is why no T1 spec could ever reproduce the
+        // phantom "Recording" row a failed capture start left behind.
+        // STENOAI_E2E_STALE_SESSION_NAME reproduces main's actual behaviour so
+        // that regression stays covered; opt-in, so no existing spec shifts.
+        sessionName:
+          rec.active || rec.processing || process.env.STENOAI_E2E_STALE_SESSION_NAME
+            ? rec.sessionName
+            : null,
         recordingSummaryFile: rec.active ? rec.appendTo : null,
+        recordingId: rec.active ? rec.recordingId : null,
+        chatSummaryFile: rec.active ? rec.appendTo || `/mock/output/live-${rec.recordingId}_summary.md` : null,
       };
     },
 
@@ -567,12 +728,76 @@ function install({ ipcMain }) {
       error: null,
     }),
 
-    // Engine is static per launch; STENOAI_E2E_MOCK_ENGINE lets the pill-dock
-    // T1 drive the Whisper variant (no live transcript, inline pause/resume).
+    'get-language': async () => ({ success: true, language: state.language }),
+    'set-language': async (_event, language) => {
+      state.language = language;
+      return { success: true, language };
+    },
+
     'get-transcription-engine': async () => ({
       success: true,
-      engine: process.env.STENOAI_E2E_MOCK_ENGINE || 'parakeet',
+      engine: state.transcriptionEngine,
     }),
+    'set-transcription-engine': async (_event, engine) => {
+      state.transcriptionEngine = engine;
+      return { success: true, engine };
+    },
+
+    'get-diarization-engine': async () => (
+      process.env.STENOAI_E2E_DIARIZATION_ENGINE_READ_FAILURE === '1'
+        ? { success: false, error: 'synthetic speaker detection setting read failure' }
+        : {
+            success: true,
+            engine: state.diarizationEngine,
+            valid_engines: ['sortformer', 'nemotron3'],
+          }
+    ),
+    'set-diarization-engine': async (_event, engine) => {
+      state.diarizationEngine = engine;
+      return { success: true, engine };
+    },
+
+    // OpenAI-compatible ASR config. Shape-only for first paint; the real
+    // set/get round-trip + key storage is covered by cloud-asr-config.t2.
+    'get-openai-asr-config': async () => {
+      if (global.__cloudAsrConfigRace) global.__cloudAsrConfigRace.reads += 1;
+      return {
+        success: true,
+        api_url: state.openAiAsrUrl,
+        api_key_set: state.openAiAsrKeySet,
+        model: state.openAiAsrModel,
+      };
+    },
+    'set-openai-asr-config': async (_event, cfg) => {
+      const race = global.__cloudAsrConfigRace;
+      if (race) {
+        race.writes += 1;
+        await new Promise((resolve) => race.pending.push(resolve));
+      }
+      if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
+        return { success: false, error: 'mock save rejected' };
+      }
+      if (cfg?.api_url !== undefined) state.openAiAsrUrl = cfg.api_url;
+      if (cfg?.model !== undefined) state.openAiAsrModel = cfg.model;
+      // A visible saved-key hint proves React consumed the subsequent refetch.
+      if (race) state.openAiAsrKeySet = true;
+      return {
+        success: true,
+        api_url: state.openAiAsrUrl,
+        api_key_set: state.openAiAsrKeySet,
+        model: state.openAiAsrModel,
+      };
+    },
+    'set-openai-asr-key': async (_event, key) => {
+      if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
+        return { success: false, error: 'mock save rejected' };
+      }
+      if (process.env.STENOAI_E2E_OAI_ASR_KEY_RACE === '1' && key) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      state.openAiAsrKeySet = Boolean(key);
+      return { success: true, api_key_set: state.openAiAsrKeySet };
+    },
 
     // Default not-installed keeps most T1 specs on their routes; the pill-dock
     // T1 sets STENOAI_E2E_MOCK_PARAKEET_INSTALLED=1 so App.tsx's first-run
@@ -585,8 +810,8 @@ function install({ ipcMain }) {
 
     'apple-speech-status': async () => ({
       success: true,
-      available: true,
-      supported: true,
+      available: process.env.STENOAI_E2E_MOCK_APPLE_SUPPORTED === '1',
+      supported: process.env.STENOAI_E2E_MOCK_APPLE_SUPPORTED === '1',
       installed: process.env.STENOAI_E2E_MOCK_APPLE_INSTALLED === '1',
       locale: 'en_US',
       display_name: 'Apple On-Device',
@@ -643,6 +868,9 @@ function install({ ipcMain }) {
     // lives in MOCKS, which shadows DEFAULTS, so it is the single source for the
     // channel.
     'list-meetings': async () => {
+      if (process.env.STENOAI_E2E_MEETING_TRANSFER === '1') {
+        return { success: true, meetings: [TRANSFER_MEETING] };
+      }
       if (process.env.STENOAI_E2E_SEED_AUDIO_MEETINGS === '1') {
         return { success: true, meetings: AUDIO_SEED_MEETINGS };
       }
@@ -685,6 +913,12 @@ function install({ ipcMain }) {
     // by filtering list-meetings — answer it with the same seeded meeting so the
     // transcript-export detail route resolves and renders the transcript actions.
     'get-meeting': async (_event, summaryFile) => {
+      if (
+        process.env.STENOAI_E2E_MEETING_TRANSFER === '1' &&
+        summaryFile === TRANSFER_MEETING.session_info.summary_file
+      ) {
+        return { success: true, meeting: applyOverlay(TRANSFER_MEETING) };
+      }
       if (process.env.STENOAI_E2E_SEED_PENDING_NOTE === '1') {
         return { success: true, meeting: applyOverlay(PENDING_MEETING) };
       }
@@ -709,6 +943,20 @@ function install({ ipcMain }) {
         ? { success: true, meeting: applyOverlay(m) }
         : { success: false, error: 'meeting not found' };
     },
+
+    'meeting-transfer-ready': async () => ({ success: true }),
+    'import-meeting-package': async (event) => {
+      if (process.env.STENOAI_E2E_MEETING_TRANSFER !== '1') {
+        return { success: true, cancelled: true };
+      }
+      const payload = {
+        summaryFile: TRANSFER_MEETING.session_info.summary_file,
+        duplicate: false,
+      };
+      event.sender.send('meeting-transfer-imported', payload);
+      return { success: true, ...payload };
+    },
+    'export-meeting-package': async () => ({ success: true, cancelled: false }),
 
     // Soft-delete (#234). The permissive unknown-channel default would answer
     // `{success:true}` with no `id`, and useDeleteMeeting skips the Undo toast
@@ -737,13 +985,45 @@ function install({ ipcMain }) {
     // permissive default hand the toast an undefined array to map over.
     'list-pending-deletes': async () => ({ success: true, pending: [] }),
 
-    // My notes autosave: persist the overlay so a follow-up get-meeting sees
-    // the edit (mirrors the real update-meeting body-section upsert).
+    // My notes autosave AND the note editor (D9) share this one handler, like
+    // the real update-meeting IPC. `user_notes` overlays the My notes tab; the
+    // four structural note fields overlay the Standard note AND accumulate
+    // into `edited_fields`, mirroring app/note-snapshot.js's markEdited so the
+    // regenerate guard (which reads meeting.edited_fields) sees the same shape
+    // under mock IPC that it would from the real sidecar.
     'update-meeting': async (_event, summaryFile, patch) => {
+      global.__stenoaiE2eUpdateMeetingCalls.push({ summaryFile, patch });
+      // Hold an actual note write until the T1 releases it. Metadata writes
+      // remain immediate; only the explicit test seam enables this.
+      if (process.env.STENOAI_E2E_DEFER_NOTE_SAVE === '1' && patch &&
+          ['summary', 'key_points', 'action_items', 'discussion_areas', 'user_notes'].some((key) => patch[key] !== undefined)) {
+        const success = await new Promise((resolve) => {
+          global.__stenoaiE2eReleaseNoteSave = resolve;
+        });
+        delete global.__stenoaiE2eReleaseNoteSave;
+        if (!success) return { success: false, error: 'Synthetic note save failure' };
+      }
       if (patch && typeof patch.user_notes === 'string') {
         meetingOverlay[summaryFile] = {
           ...(meetingOverlay[summaryFile] || {}),
           user_notes: patch.user_notes,
+        };
+      }
+      const changed = [];
+      for (const key of ['summary', 'key_points', 'action_items', 'discussion_areas']) {
+        if (patch && patch[key] !== undefined) {
+          meetingOverlay[summaryFile] = {
+            ...(meetingOverlay[summaryFile] || {}),
+            [key]: patch[key],
+          };
+          changed.push(key);
+        }
+      }
+      if (changed.length) {
+        const existing = meetingOverlay[summaryFile]?.edited_fields || [];
+        meetingOverlay[summaryFile] = {
+          ...(meetingOverlay[summaryFile] || {}),
+          edited_fields: [...new Set([...existing, ...changed])],
         };
       }
       return { success: true, message: 'ok' };
@@ -798,6 +1078,48 @@ function install({ ipcMain }) {
       if (!seamPath) return { success: false, error: EXPORT_CANCELED };
       fs.writeFileSync(seamPath, content, 'utf-8');
       return { success: true, path: seamPath };
+    },
+
+    // Share capability. Injectable precisely because the real answer is a
+    // platform fact: gating the renderer on this instead of navigator.platform
+    // is what lets a T1 spec exercise BOTH branches on any OS, including the
+    // absent branch that keeps Windows away from a ShareMenu it does not have.
+    'share-capability': async () => process.env.STENOAI_E2E_SHARE_CAPABLE === '1',
+
+    // Mirror the real share-note-file handler far enough to observe the call.
+    // Appends one JSON line per call to STENOAI_E2E_SHARE_LOG so a spec can
+    // count calls (the pending guard) and read back what was passed. No file is
+    // materialised and no sheet is popped: that is the real handler's job and
+    // the T2 spec's assertion. STENOAI_E2E_SHARE_DELAY_MS holds the call open so
+    // the "Preparing…" state is observable without racing the clock.
+    //
+    // STENOAI_E2E_SHARE_PAYLOAD_PATH writes the payload VERBATIM, the same seam
+    // STENOAI_E2E_EXPORT_PATH gives the save path. The log's 200-char head is
+    // enough to tell a PDF from markdown, but a branded PDF's first 200 chars
+    // are doctype and font CSS — the note itself is thousands of characters in,
+    // so asserting WHICH note was shared needs the whole payload.
+    'share-note-file': async (_event, kind, defaultFilename, payload, anchor) => {
+      const logPath = process.env.STENOAI_E2E_SHARE_LOG;
+      if (logPath) {
+        fs.appendFileSync(
+          logPath,
+          JSON.stringify({
+            kind,
+            defaultFilename,
+            anchor,
+            payloadLength: typeof payload === 'string' ? payload.length : null,
+            payloadHead: typeof payload === 'string' ? payload.slice(0, 200) : null,
+          }) + '\n',
+          'utf-8',
+        );
+      }
+      const payloadPath = process.env.STENOAI_E2E_SHARE_PAYLOAD_PATH;
+      if (payloadPath && typeof payload === 'string') {
+        fs.writeFileSync(payloadPath, payload, 'utf-8');
+      }
+      const delay = Number(process.env.STENOAI_E2E_SHARE_DELAY_MS || 0);
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      return { success: true };
     },
 
     'org-status': async () => {
@@ -862,6 +1184,19 @@ function install({ ipcMain }) {
     // download-progress spec can observe the bar. The app is torn down at test
     // end. Without the flag they resolve success, matching the permissive
     // default so nothing else changes.
+    'create-folder': async () => {
+      if (process.env.STENOAI_E2E_FOLDER_CREATE_PENDING !== '1') return { success: true };
+      const state = global.__folderCreateTest ||= { calls: 0, finish: null };
+      state.calls++;
+      return new Promise(resolve => { state.finish = resolve; });
+    },
+    'pull-parakeet-model': async (event, model) => {
+      if (process.env.STENOAI_E2E_SETUP_PROGRESS !== '1') return { success: true };
+      event.sender.send('parakeet-pull-progress', {
+        model, stage: 'downloading', completed_files: 1, total_files: 2, file_bytes: 120000000,
+      });
+      return new Promise(() => {});
+    },
     'setup-parakeet': async (event) => {
       if (process.env.STENOAI_E2E_FAIL_ON_PARAKEET_SETUP === '1') {
         throw new Error('Parakeet setup must not run for Apple transcription');
@@ -869,41 +1204,62 @@ function install({ ipcMain }) {
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
         if (wc && !wc.isDestroyed()) {
-          // Parakeet exposes only coarse stages (no byte counts).
+          // First event may arrive before any file/byte measurement.
           wc.send('parakeet-pull-progress', { stage: 'downloading' });
         }
         return new Promise(() => {});
       }
       return { success: true, message: 'Parakeet model ready' };
     },
-    'speaker-model-status': async () => (
-      process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1'
-        ? {
-            success: true,
-            ready: false,
-            cache_directory: '/tmp/e2e/models/speaker-diarization',
-            required_models: ['model'],
-            missing_models: ['model'],
-          }
-        : {
-            success: true,
-            ready: true,
-            cache_directory: '/tmp/e2e/models/speaker-diarization',
-            required_models: [],
-            missing_models: [],
-          }
-    ),
-    'setup-speaker-models': async () => (
-      process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1'
-        ? { success: false, error: 'synthetic model setup failure' }
-        : {
-            success: true,
-            ready: true,
-            cache_directory: '/tmp/e2e/models/speaker-diarization',
-            required_models: [],
-            missing_models: [],
-          }
-    ),
+    // Speaker models, per engine (state.speakerModelsMissing). Like the real
+    // CLI, no engine argument means the saved engine.
+    // STENOAI_E2E_SPEAKER_MODEL_FAILURE: the status check and the download
+    // both fail. STENOAI_E2E_SPEAKER_MODELS_MISSING: every engine starts
+    // missing, and a download emits a progress event then waits until the
+    // spec resolves it through global.__speakerModels.finish() (calls counts
+    // downloads, so a spec can assert that onboarding did not start one).
+    'speaker-model-status': async (_event, engine) => {
+      if (process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1') {
+        return { success: false, ready: false, error: 'synthetic model status failure' };
+      }
+      const missing = state.speakerModelsMissing.has(engine || state.diarizationEngine);
+      return {
+        success: true,
+        ready: !missing,
+        cache_directory: '/tmp/e2e/models/speaker-diarization',
+        required_models: missing ? ['model'] : [],
+        missing_models: missing ? ['model'] : [],
+      };
+    },
+    'setup-speaker-models': async (event, engine) => {
+      const downloads = global.__speakerModels ||= { calls: 0, finish: null, inFlight: new Map() };
+      downloads.calls++;
+      if (process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1') {
+        return { success: false, ready: false, error: 'synthetic model setup failure' };
+      }
+      const target = engine || state.diarizationEngine;
+      const ready = {
+        success: true,
+        ready: true,
+        cache_directory: '/tmp/e2e/models/speaker-diarization',
+        required_models: [],
+        missing_models: [],
+      };
+      if (!state.speakerModelsMissing.has(target)) return ready;
+      const wc = event && event.sender;
+      if (wc && !wc.isDestroyed()) wc.send('speaker-models-progress', { percent: 37, phase: 'downloading' });
+      // Like main.js, concurrent callers for one engine share its download.
+      if (!downloads.inFlight.has(target)) {
+        downloads.inFlight.set(target, new Promise((resolve) => {
+          downloads.finish = () => {
+            state.speakerModelsMissing.delete(target);
+            downloads.inFlight.delete(target);
+            resolve(ready);
+          };
+        }));
+      }
+      return downloads.inFlight.get(target);
+    },
     'setup-ollama-and-model': async (event) => {
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
@@ -1254,7 +1610,15 @@ function install({ ipcMain }) {
   let slowUpdateStatusCallsLeft = process.env.STENOAI_E2E_SLOW_UPDATE_STATUS === '1' ? 1 : 0;
 
   const DEFAULTS = {
-    'get-app-version': { success: true, version: '0.0.0-e2e', name: 'Steno' },
+    // STENOAI_E2E_PINNED_MIC_ID seeds a pinned microphone (Settings >
+    // Microphone) so a spec can drive useSystemAudioCapture's pinned-device
+    // fallback. Unset, it is "system default", as the permissive default was.
+    'get-microphone': () => ({
+      success: true,
+      device_id: process.env.STENOAI_E2E_PINNED_MIC_ID || null,
+      label: null,
+    }),
+    'get-app-version': { success: true, version: process.env.STENOAI_E2E_APP_VERSION || '0.0.0-e2e', name: 'Steno' },
     // Read-only display poll for the About tab's "Check for Updates" button
     // (settings-about.t1). Fully hermetic — no real GitHub call under mock
     // IPC, so this is the only source of truth for that flow in T1.
@@ -1345,7 +1709,7 @@ function install({ ipcMain }) {
     // Transcribe tab reads this on first paint. (The engine itself moved to
     // MOCKS so STENOAI_E2E_MOCK_ENGINE can override it; default parakeet keeps
     // the language picker enabled — parakeet-language-picker.t1.)
-    'get-language': { success: true, language: 'auto' },
+    // get/set-language live in MOCKS so selections survive query refetches.
     // Real production catalog (src/whisper_models.py / src/parakeet_models.py)
     // rather than empty — so the Settings UI's model list actually renders
     // cards to look at (manual/dev use) instead of always erroring "Could not
@@ -1373,8 +1737,8 @@ function install({ ipcMain }) {
       supported_models: {
         [PARAKEET_MODEL_ID]: {
           name: 'Parakeet TDT v3',
-          size: '572MB',
-          installed: true,
+          size: process.platform === 'darwin' ? '2.5GB' : '670MB',
+          installed: process.env.STENOAI_E2E_MOCK_PARAKEET_INSTALLED !== '0',
           description:
             'Highest quality. Supports live transcription in English and 25 European languages — Spanish, French, German, Italian, Portuguese, Dutch, Russian, Polish, Czech, and 16 others.',
           speed: 'very fast',
@@ -1500,10 +1864,65 @@ function install({ ipcMain }) {
     },
   };
 
+  // Invoked-channel log, readable from a spec via app.evaluate(). The
+  // contextBridge object is frozen, so a spec cannot spy on the renderer side;
+  // this is the observable seam for "which IPC did the renderer actually call".
+  global.__mockIpcCalls = [];
+
+  let chatData = null;
+  MOCKS['load-chat-sessions'] = async () => ({ success: true, data: chatData });
+  MOCKS['save-chat-sessions'] = async (_event, data) => {
+    if (global.__holdNextChatSave) {
+      global.__holdNextChatSave = false;
+      return new Promise((resolve) => { global.__failChatSave = () => resolve({ success: false, error: 'Save failed' }); });
+    }
+    chatData = data;
+    return { success: true };
+  };
+  // Send-channel log for the few fire-and-forget channels a spec needs to see
+  // with their arguments (__mockIpcCalls only records invoke()). Deliberately
+  // an allowlist: live-transcribe-chunk fires several times a second and has
+  // no business accumulating here. The real handler still runs.
+  const LOGGED_SENDS = new Set([
+    'live-transcribe-stop',
+    'recording-capture-error',
+    'system-audio-recording-state',
+  ]);
+  global.__mockIpcSends = [];
+  const originalOn = ipcMain.on.bind(ipcMain);
+  ipcMain.on = (channel, handler) => {
+    if (LOGGED_SENDS.has(channel)) {
+      return originalOn(channel, (event, ...args) => {
+        global.__mockIpcSends.push({ channel, args });
+        return handler(event, ...args);
+      });
+    }
+    if (channel === 'chat-context-stream') {
+      return originalOn(channel, (event, queryId, request) => {
+        global.__mockIpcCalls.push({ channel, args: [queryId, request] });
+        const reply = process.env.STENOAI_E2E_CHAT_REPLY || '1. First point\n\n2. Second point\n\n3. Third point';
+        // Tests release held answers explicitly to exercise recording transitions.
+        const finish = () => {
+          if (event.sender.isDestroyed()) return;
+          event.sender.send('query-chunk', { queryId, chunk: reply });
+          event.sender.send('query-done', { queryId, success: true });
+        };
+        if (process.env.STENOAI_E2E_HOLD_CHAT === '1') global.__finishChat = finish;
+        else setTimeout(finish, 20);
+      });
+    }
+    return originalOn(channel, handler);
+  };
+
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = (channel, realFn) => {
     let fn;
-    if (MOCKS[channel]) {
+    if (channel === 'open-external' && process.env.STENOAI_E2E_OPEN_EXTERNAL === '1') {
+      // Interactive previews can open docs in the user's browser. Tests that
+      // opt in replace shell.openExternal with a spy before clicking a link.
+      // Retain the production URL validation; all other T1 runs stay inert.
+      fn = realFn;
+    } else if (MOCKS[channel]) {
       fn = MOCKS[channel];
     } else if (Object.prototype.hasOwnProperty.call(DEFAULTS, channel)) {
       const value = DEFAULTS[channel];
@@ -1516,7 +1935,10 @@ function install({ ipcMain }) {
       // never installed under mock IPC.
       fn = async () => ({ success: true });
     }
-    return originalHandle(channel, fn);
+    return originalHandle(channel, (...args) => {
+      global.__mockIpcCalls.push(channel);
+      return fn(...args);
+    });
   };
 
 }

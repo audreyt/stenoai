@@ -1,7 +1,16 @@
 import * as React from 'react';
+import { t } from '@/i18n';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ipc, type ListedModel, type TranscriptionEngine } from '@/lib/ipc';
+import {
+  ipc,
+  type DiarizationEngine,
+  type ListedModel,
+  type TranscriptionEngine,
+  type ParakeetPullProgressEvent,
+  type SpeakerModelsProgressEvent,
+} from '@/lib/ipc';
 import { unwrap } from '@/lib/result';
+import { speakerModelsStatusKey } from '@/hooks/useSpeakerModels';
 import { APPLE_LANGUAGE_CODES, PARAKEET_LANGUAGE_CODES } from '@/lib/transcription-languages';
 
 export const modelsKeys = {
@@ -22,14 +31,26 @@ export const parakeetKeys = {
   status: () => [...parakeetKeys.all, 'status'] as const,
 };
 
-export const appleSpeechKeys = {
-  all: ['appleSpeech'] as const,
-  status: (language: string) => [...appleSpeechKeys.all, 'status', language] as const,
-};
-
 export const transcriptionEngineKeys = {
   all: ['transcriptionEngine'] as const,
   current: () => [...transcriptionEngineKeys.all, 'current'] as const,
+};
+
+export const appleSpeechKeys = {
+  status: (language: string) => ['appleSpeech', 'status', language] as const,
+};
+
+export const diarizationEngineKeys = {
+  all: ['diarizationEngine'] as const,
+  current: () => [...diarizationEngineKeys.all, 'current'] as const,
+  // Under the shared speaker-models status prefix, so onboarding's
+  // invalidation after its download also refreshes Settings.
+  models: (engine: DiarizationEngine) => [...speakerModelsStatusKey, engine] as const,
+};
+
+export const openaiAsrKeys = {
+  all: ['openaiAsrConfig'] as const,
+  config: () => [...openaiAsrKeys.all, 'config'] as const,
 };
 
 function parseSizeGb(size?: string): number | undefined {
@@ -69,12 +90,7 @@ export function useModels() {
         mlxSizeGb: parseSizeGb(info.mlx_size),
         ggufInstalled: info.gguf_installed,
       }));
-      return {
-        models,
-        current: raw.current_model,
-        provider: raw.provider,
-        totalRamGb: raw.total_ram_gb,
-      };
+      return { models, current: raw.current_model, provider: raw.provider, totalRamGb: raw.total_ram_gb };
     },
   });
 }
@@ -150,10 +166,7 @@ export function usePullModel() {
   // Ollama, which on Apple Silicon is the NVFP4 sibling (see pullAndSelect
   // below) -- IPC progress/completion events report THAT string, so
   // matching against it (not `name`) is what lets this resolve correctly.
-  const [pendingSelect, setPendingSelect] = React.useState<{
-    name: string;
-    pullTarget: string;
-  } | null>(null);
+  const [pendingSelect, setPendingSelect] = React.useState<{ name: string; pullTarget: string } | null>(null);
   const rate = useByteRateTracker();
 
   React.useEffect(() => {
@@ -249,7 +262,7 @@ export function useSwitchToFasterBuild(onVerified?: (mlxTag: string) => void) {
     model: string,
     success: boolean,
     pullError?: string,
-    cancelled?: boolean
+    cancelled?: boolean,
   ) => {
     setProgress((prev) => {
       const { [model]: _drop, ...rest } = prev;
@@ -295,12 +308,10 @@ export function useSwitchToFasterBuild(onVerified?: (mlxTag: string) => void) {
       setProgress((prev) => ({ ...prev, [model]: p }));
       rate.sample(model, p);
     });
-    const offComplete = ipc().on.modelPullComplete(
-      ({ model, success, error: pullError, cancelled: wasCancelled }) => {
-        if (model !== activeTagRef.current) return;
-        void handlePullOutcome(model, success, pullError, wasCancelled);
-      }
-    );
+    const offComplete = ipc().on.modelPullComplete(({ model, success, error: pullError, cancelled: wasCancelled }) => {
+      if (model !== activeTagRef.current) return;
+      void handlePullOutcome(model, success, pullError, wasCancelled);
+    });
     return () => {
       offProgress();
       offComplete();
@@ -499,16 +510,16 @@ export function usePullParakeetModel() {
   const qc = useQueryClient();
   // Parakeet only has the one model today, but keyed-by-id state still
   // matches the Whisper hook shape so the UI doesn't fork on engine.
-  const [progress, setProgress] = React.useState<Record<string, string>>({});
+  const [progress, setProgress] = React.useState<Record<string, ParakeetPullProgressEvent>>({});
   const [pendingSelect, setPendingSelect] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    const offProgress = ipc().on.parakeetPullProgress(({ model, stage }) => {
-      // Coarse staged progress ("downloading"/"loading") rather than a
-      // percentage — see src/parakeet_models.py for rationale. UI shows
-      // a localised label per stage.
-      const key = model ?? 'mlx-community/parakeet-tdt-0.6b-v3';
-      setProgress((prev) => ({ ...prev, [key]: stage }));
+    const offProgress = ipc().on.parakeetPullProgress((event) => {
+      const { model } = event;
+      // File/byte progress belongs to this pull; setup events have no model.
+      if (!model) return;
+      const key = model;
+      setProgress((prev) => ({ ...prev, [key]: event }));
     });
     const offComplete = ipc().on.parakeetPullComplete(async ({ model, success }) => {
       const key = model ?? 'mlx-community/parakeet-tdt-0.6b-v3';
@@ -548,24 +559,6 @@ export function usePullParakeetModel() {
   return { ...mutation, progress };
 }
 
-export function useAppleSpeechStatus(language = 'auto') {
-  return useQuery({
-    queryKey: appleSpeechKeys.status(language),
-    queryFn: async () => unwrap(await ipc().appleSpeech.status(language)),
-  });
-}
-
-export function usePrepareAppleSpeech() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: async (language: string = 'auto') =>
-      unwrap(await ipc().appleSpeech.prepare(language)),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: appleSpeechKeys.all });
-    },
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Active ASR engine — the toggle that gates which engine the live VAD pipeline
 // and the post-stop batch transcriber load.
@@ -581,14 +574,154 @@ export function useTranscriptionEngine() {
   });
 }
 
+export function useAppleSpeechStatus(language = 'auto', enabled = true) {
+  return useQuery({
+    queryKey: appleSpeechKeys.status(language),
+    queryFn: async () => unwrap(await ipc().appleSpeech.status(language)),
+    enabled,
+    staleTime: 60_000,
+  });
+}
+
+export function usePrepareAppleSpeech() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (language: string) => {
+      const status = unwrap(await ipc().appleSpeech.prepare(language));
+      if (!status.available || !status.supported || !status.installed) {
+        throw new Error(t('settings.ai.apple.notReady'));
+      }
+      return status;
+    },
+    onSuccess: (status, language) => qc.setQueryData(appleSpeechKeys.status(language), status),
+  });
+}
+
+export function useDiarizationEngine() {
+  return useQuery({
+    queryKey: diarizationEngineKeys.current(),
+    queryFn: async (): Promise<DiarizationEngine> =>
+      unwrap(await ipc().diarizationEngine.get()).engine,
+  });
+}
+
 /**
- * Apple SpeechTranscriber and Parakeet both provide live results. Whisper is
- * post-stop only. Default to live while the query hydrates so the first paint
- * does not hide pause/reachability controls.
+ * Whether `engine`'s speaker-detection models are on disk: 'unavailable'
+ * when this build has no speaker sidecar, 'unknown' when the check itself
+ * failed (a download, which re-checks, can still be offered). Read-only: it
+ * never downloads anything.
+ */
+export type DiarizationModelsState = 'ready' | 'missing' | 'unavailable' | 'unknown';
+
+const SPEAKER_SIDECAR_UNAVAILABLE = 'Speaker diarization is unavailable on this system';
+
+export function useDiarizationModelsState(engine: DiarizationEngine | undefined) {
+  return useQuery({
+    queryKey: diarizationEngineKeys.models(engine ?? 'sortformer'),
+    enabled: engine !== undefined,
+    queryFn: async (): Promise<DiarizationModelsState> => {
+      const status = await ipc().setup.speakerModelsStatus(engine);
+      if (status.success) return status.ready ? 'ready' : 'missing';
+      return status.error === SPEAKER_SIDECAR_UNAVAILABLE ? 'unavailable' : 'unknown';
+    },
+    // Each check spawns the backend and the sidecar; the answer only changes
+    // when a download finishes, which updates it directly.
+    staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+  });
+}
+
+/**
+ * Download one engine's speaker-detection models, streaming
+ * 'speaker-models-progress' events while it runs. main.js shares one download
+ * per engine between onboarding and Settings, so starting it twice is
+ * harmless. `progress` also reflects a download useSetDiarizationEngine
+ * starts; call `clearProgress` before starting one so a finished run's last
+ * event never shows.
+ */
+export function useDownloadDiarizationModels() {
+  const qc = useQueryClient();
+  const [progress, setProgress] = React.useState<SpeakerModelsProgressEvent | null>(null);
+  React.useEffect(() => ipc().on.speakerModelsProgress(setProgress), []);
+  const clearProgress = React.useCallback(() => setProgress(null), []);
+
+  const download = useMutation({
+    mutationFn: async (engine: DiarizationEngine) => {
+      setProgress(null);
+      const res = await ipc().setup.speakerModels(engine);
+      if (!res.success || !res.ready) throw new Error(res.success ? 'not ready' : res.error);
+      return res;
+    },
+    // Ready immediately, so the Download button can't flash back while the
+    // refetch is in flight.
+    onSuccess: (_res, engine) => qc.setQueryData(diarizationEngineKeys.models(engine), 'ready'),
+    onSettled: () => {
+      setProgress(null);
+      void qc.invalidateQueries({ queryKey: speakerModelsStatusKey });
+    },
+  });
+
+  return { progress, clearProgress, download };
+}
+
+/**
+ * Switch the macOS speaker-diarization engine, or re-prepare the current one.
+ * Meeting processing never downloads models, so whenever the target engine's
+ * models are missing they are downloaded first -- for Nemotron 3, and also for
+ * Sortformer, whose cache moved to FluidAudio 0.17's `sortformer/v3/fp16/`
+ * layout and must be re-downloaded by anyone upgrading from an older build.
+ * The choice is only saved once the models are ready; the backend refuses a
+ * non-default engine otherwise, so a failed download leaves the previous
+ * engine active.
+ */
+export function useSetDiarizationEngine() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      engine: DiarizationEngine,
+    ): Promise<{ engine: DiarizationEngine; modelsConfirmed: boolean }> => {
+      const status = await ipc().setup.speakerModelsStatus(engine);
+      // A failed status check (no sidecar in a dev build) must not block the
+      // Sortformer default the backend accepts without models; Nemotron 3
+      // still goes through prepare, which fails loudly in that case.
+      const missing = status.success ? !status.ready : engine !== 'sortformer';
+      let modelsConfirmed = status.success && status.ready;
+      if (missing) {
+        const prepared = unwrap(await ipc().setup.speakerModels(engine));
+        if (!prepared.ready) throw new Error('Speaker detection models are not ready');
+        modelsConfirmed = true;
+      }
+      const saved = unwrap(await ipc().diarizationEngine.set(engine)).engine;
+      return { engine: saved, modelsConfirmed };
+    },
+    onSuccess: ({ engine, modelsConfirmed }) => {
+      qc.setQueryData(diarizationEngineKeys.current(), engine);
+      // Only cache readiness a status check or download actually confirmed;
+      // a Sortformer save past an unavailable sidecar proves nothing.
+      if (modelsConfirmed) {
+        qc.setQueryData(diarizationEngineKeys.models(engine), 'ready');
+      } else {
+        void qc.invalidateQueries({ queryKey: diarizationEngineKeys.models(engine) });
+      }
+      // Onboarding's status follows the saved engine, which just changed.
+      void qc.invalidateQueries({ queryKey: speakerModelsStatusKey, exact: true });
+    },
+  });
+}
+
+/**
+ * Whether live (during-recording) transcription is available: Parakeet or Apple —
+ * Whisper never spawns the transcribe-stream sidecar, so it has no live
+ * drawer, no partials, and its recording pill keeps Pause/Resume inline.
+ * Defaults to parakeet while the query hydrates so the first paint doesn't
+ * briefly hide live-only controls. Single-sourced here because the
+ * pause-reachability invariant spans PrimaryDock (panel gate), LiveDock
+ * (inline controls), and LiveTranscriptBar (footer controls) — they must all
+ * agree.
  */
 export function useLiveTranscriptAvailable(): boolean {
   const engineQuery = useTranscriptionEngine();
-  return (engineQuery.data ?? 'apple') !== 'whisper';
+  return ['parakeet', 'apple'].includes(engineQuery.data ?? 'parakeet');
 }
 
 // Activating Parakeet must drop a pin Parakeet can't honour as an output
@@ -598,21 +731,15 @@ export function useLiveTranscriptAvailable(): boolean {
 // survives. Shared by every Parakeet-activation path: the explicit engine
 // switch (useSetActiveTranscription) and the post-download auto-select
 // (usePullParakeetModel's complete handler).
-async function coerceLanguageForEngine(
-  supportedCodes: Readonly<Record<string, true>>
-): Promise<string> {
+async function coerceLanguageForParakeet(): Promise<void> {
   try {
     const current = unwrap(await ipc().settings.getLanguage()).language;
-    if (supportedCodes[current] === true) return current;
-    unwrap(await ipc().settings.setLanguage('auto'));
+    if (!PARAKEET_LANGUAGE_CODES.has(current)) {
+      unwrap(await ipc().settings.setLanguage('auto'));
+    }
   } catch {
-    // Best-effort: activation should still be able to report its own error.
+    // Best-effort: activation shouldn't fail because the language read errored.
   }
-  return 'auto';
-}
-
-async function coerceLanguageForParakeet(): Promise<void> {
-  await coerceLanguageForEngine(PARAKEET_LANGUAGE_CODES);
 }
 
 export function useSetActiveTranscription() {
@@ -628,8 +755,10 @@ export function useSetActiveTranscription() {
       if (engine === 'parakeet') {
         await coerceLanguageForParakeet();
       } else if (engine === 'apple') {
-        const language = await coerceLanguageForEngine(APPLE_LANGUAGE_CODES);
-        unwrap(await ipc().appleSpeech.prepare(language));
+        const current = unwrap(await ipc().settings.getLanguage()).language;
+        if (!APPLE_LANGUAGE_CODES.has(current)) {
+          unwrap(await ipc().settings.setLanguage('auto'));
+        }
       }
       unwrap(await ipc().transcriptionEngine.set(engine));
       if (engine === 'whisper' && whisperModel) {
@@ -640,10 +769,52 @@ export function useSetActiveTranscription() {
       qc.invalidateQueries({ queryKey: transcriptionEngineKeys.all });
       qc.invalidateQueries({ queryKey: whisperKeys.all });
       qc.invalidateQueries({ queryKey: parakeetKeys.all });
-      qc.invalidateQueries({ queryKey: appleSpeechKeys.all });
       // Language might have been coerced; refresh the Settings dropdown
       // and the live dock toggle, both of which read from the same key.
       qc.invalidateQueries({ queryKey: ['settings', 'language'] });
     },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible ASR config
+//
+// The non-secret endpoint config (api_url, model) round-trips through the
+// backend config.json. `api_key_set` reflects the encrypted-on-disk key held
+// by the main process (safeStorage) - the key value itself is never returned.
+// ---------------------------------------------------------------------------
+
+/** Query for the current OpenAI ASR endpoint config (url, api_key_set, model). */
+export function useOpenAiAsrConfig() {
+  return useQuery({
+    queryKey: openaiAsrKeys.config(),
+    queryFn: async () => unwrap(await ipc().openaiAsr.getConfig()),
+  });
+}
+
+/**
+ * Mutation to save the non-secret OpenAI ASR config (url and/or model).
+ * Pass only the fields you want to change; others are left untouched. The
+ * API key is set separately via useSetOpenAiAsrKey (never through here).
+ */
+export function useSetOpenAiAsrConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (cfg: { api_url?: string; model?: string }) =>
+      unwrap(await ipc().openaiAsr.setConfig(cfg)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: openaiAsrKeys.all }),
+  });
+}
+
+/**
+ * Mutation to set (or clear, with an empty string) the OpenAI ASR API key.
+ * The key is stored encrypted by the main process; only `api_key_set` is
+ * ever surfaced back.
+ */
+export function useSetOpenAiAsrKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (key: string) => unwrap(await ipc().openaiAsr.setKey(key)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: openaiAsrKeys.all }),
   });
 }

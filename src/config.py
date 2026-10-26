@@ -5,6 +5,8 @@ Handles storing and loading user preferences like model selection.
 """
 
 import copy
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -16,6 +18,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -40,6 +43,149 @@ logger = logging.getLogger(__name__)
 # trailing "\n"). Digits are [0-9], not \d — \d is Unicode-aware by default
 # and would accept visually-similar non-ASCII digits (e.g. Arabic-Indic "١").
 BEDROCK_REGION_RE = re.compile(r"[a-z]{2}(-gov)?-[a-z]+-[0-9]{1,2}")
+
+OPENAI_ASR_DEFAULT_URL = "https://api.openai.com/v1"
+
+
+def _legacy_openai_asr_snapshot_digest(config: Dict[str, Any]) -> Optional[str]:
+    """Digest the exact legacy credential snapshot without exposing its key.
+
+    Electron reads the same two fields once before invoking the cleanup CLI.
+    The digest lets the CLI prove that neither the plaintext key nor its
+    endpoint value changed in the intervening time, without putting the key in
+    argv, stdout, or logs. Keep its versioned UTF-16BE framing aligned with
+    ``legacyCredentialSnapshotDigest`` in app/openai-asr-key-store.js.
+    """
+    raw_legacy_key = config.get("openai_asr_api_key")
+    # This is deliberately a raw snapshot, not Python's whitespace
+    # normalisation. Electron uses the same raw string for its SHA-256 value;
+    # a non-empty but invalid old key still needs CAS-bound deletion, while
+    # only Electron's separately validated normalised key can reach
+    # safeStorage.
+    if not isinstance(raw_legacy_key, str) or raw_legacy_key == "":
+        return None
+    api_url = config.get("openai_asr_api_url", OPENAI_ASR_DEFAULT_URL)
+    if not isinstance(api_url, str):
+        api_url = None
+    # JavaScript strings are UTF-16 code units and can contain unpaired
+    # surrogates. ``surrogatepass`` gives Python the identical code-unit bytes
+    # so every non-empty raw JSON string remains eligible for CAS cleanup.
+    def append_string(canonical: bytearray, value: str) -> None:
+        encoded = value.encode("utf-16-be", "surrogatepass")
+        code_units = len(encoded) // 2
+        if code_units > 0xFFFFFFFF:
+            raise ValueError("Legacy credential snapshot is too large")
+        canonical.extend(code_units.to_bytes(4, "big"))
+        canonical.extend(encoded)
+
+    canonical = bytearray(b"stenoai:legacy-openai-asr-snapshot:v1\0")
+    canonical.append(1)
+    append_string(canonical, raw_legacy_key)
+    if api_url is None:
+        canonical.append(0)
+    else:
+        canonical.append(1)
+        append_string(canonical, api_url)
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _redact_url_credentials(value: object) -> str:
+    """Never echo a user-controlled endpoint into diagnostics."""
+    return "[redacted-url]"
+
+
+def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
+    """Return a safe endpoint or None; legacy config must fail closed."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    # urlsplit() represents a bare trailing '?' or '#' exactly like no query
+    # or fragment at all. Electron rejects those delimiters before argv is
+    # built, so reject them here as well rather than accepting a divergent
+    # direct-CLI configuration path.
+    raw_value = value.strip()
+    if (
+        "?" in raw_value
+        or "#" in raw_value
+        or "\\" in raw_value
+        or not raw_value.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in raw_value)
+    ):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(raw_value)
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}:
+        pass
+    elif scheme != "https":
+        return None
+    # Base endpoints are non-secret config. Query strings and fragments can be
+    # signed credentials and would otherwise land in config.json, argv and
+    # logs, so reject every one rather than maintaining a credential-name
+    # denylist that providers can outgrow.
+    if parsed.query or parsed.fragment:
+        return None
+    canonical_host = hostname
+    if ":" in canonical_host:
+        canonical_host = f"[{canonical_host}]"
+    default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    canonical_netloc = canonical_host if port is None or default_port else f"{canonical_host}:{port}"
+    return urllib.parse.urlunsplit((scheme, canonical_netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _normalise_openai_asr_model(value: object) -> Optional[str]:
+    """Return a bounded argv-safe provider model identifier or None."""
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    if (
+        not model
+        or len(model) > 256
+        or model.startswith("-")
+        or not model.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in model)
+    ):
+        return None
+    return model
+
+
+def _openai_asr_api_origin(value: object) -> Optional[str]:
+    """Return the canonical scheme/host/port origin of a safe ASR endpoint.
+
+    This deliberately starts from the normalised endpoint representation so a
+    credential cannot become valid for a URL that the normal configuration
+    path would reject.  It mirrors WHATWG URL's origin shape used by Electron:
+    lowercase scheme/host and no explicit default port.
+    """
+    normalised = _normalise_openai_asr_api_url(value)
+    if normalised is None:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(normalised)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is None or (parsed.scheme == "https" and port == 443) or (
+        parsed.scheme == "http" and port == 80
+    ):
+        return f"{parsed.scheme}://{host}"
+    return f"{parsed.scheme}://{host}:{port}"
 
 
 def _atomic_write(path: Path, render, encoding: str = 'utf-8') -> None:
@@ -151,14 +297,14 @@ def get_user_data_dir() -> Path:
 def is_bundled() -> bool:
     """True when running from a PyInstaller-frozen bundle.
 
-    The legacy "StenoAI.app"/"Applications" string check was a mac-only safety
+    The legacy "Steno.app"/"Applications" string check was a mac-only safety
     net; sys.frozen is the canonical PyInstaller marker on every platform, with
     the path check kept as a belt-and-braces for mac-source-in-Applications.
     """
     if getattr(sys, "frozen", False):
         return True
     path = str(Path(__file__))
-    return "StenoAI.app" in path or "Applications" in path
+    return "Steno.app" in path or "StenoAI.app" in path or "Applications" in path
 
 
 def is_apple_silicon() -> bool:
@@ -206,8 +352,8 @@ def apple_speech_supported(
 
 
 def default_transcription_engine() -> str:
-    """Fresh installs use Apple's system model where the API exists."""
-    return "apple" if apple_speech_supported() else "parakeet"
+    """Keep the existing Parakeet default until the Apple UI is enabled."""
+    return "parakeet"
 
 
 class Config:
@@ -289,8 +435,10 @@ class Config:
         "es": "Spanish",
         "fr": "French",
         "de": "German",
+        "it": "Italian",
         "nl": "Dutch",
         "pt": "Portuguese",
+        "ru": "Russian",
         "ja": "Japanese",
         "zh-Hans": "Chinese (Simplified)",
         "zh-Hant": "Chinese (Traditional)",
@@ -331,7 +479,11 @@ class Config:
         "yi": "Yiddish", "yo": "Yoruba", "zh": "Chinese",
     }
 
-    VALID_TRANSCRIPTION_ENGINES = ("apple", "parakeet", "whisper")
+    VALID_TRANSCRIPTION_ENGINES = ("apple", "parakeet", "whisper", "openai-asr")
+    # Speaker-diarization engines the macOS steno-diarize sidecar accepts
+    # (its STENOAI_DIARIZE_ENGINE values). Sortformer (4 speaker slots) is the
+    # default; Nemotron 3 (8 slots) is opt-in and needs its own model download.
+    VALID_DIARIZATION_ENGINES = ("sortformer", "nemotron3")
 
     def __init__(self, config_path: Optional[Path] = None):
         """
@@ -710,6 +862,22 @@ class Config:
             return None
         return data if isinstance(data, dict) else None
 
+    def _read_disk_for_secure_transaction(self) -> tuple[bool, Optional[Dict[str, Any]]]:
+        """Read config under an already-held lock without conflating errors with ENOENT.
+
+        Endpoint changes with an origin-bound credential need an authoritative
+        answer about legacy plaintext. A missing config is a valid fresh state;
+        a malformed or inaccessible one must instead fail the transaction.
+        """
+        try:
+            with open(self.config_path, "r") as file_handle:
+                data = json.load(file_handle)
+        except FileNotFoundError:
+            return True, None
+        except Exception:
+            return False, None
+        return (True, data) if isinstance(data, dict) else (False, None)
+
     @classmethod
     def _apply_changes(
         cls, base: Dict[str, Any], current: Dict[str, Any], snapshot: Any
@@ -813,7 +981,7 @@ class Config:
             logger.error(f"Error saving config: {e}")
             return False
 
-    def begin_transaction(self) -> bool:
+    def begin_transaction(self, *, require_readable_disk: bool = False) -> bool:
         """Reload and defer mutations while holding the config file lock."""
         if self._transaction_backup is not None:
             raise RuntimeError("Config transaction already active")
@@ -825,7 +993,14 @@ class Config:
         except filelock.Timeout:
             logger.error(f"Timed out acquiring config lock at {lock.lock_file}")
             return False
-        fresh = self._read_disk_for_merge()
+        if require_readable_disk:
+            readable, fresh = self._read_disk_for_secure_transaction()
+            if not readable:
+                lock.release()
+                logger.error("Could not read config under lock for secure transaction")
+                return False
+        else:
+            fresh = self._read_disk_for_merge()
         if fresh is not None:
             self._config = fresh
             self._snapshot = copy.deepcopy(fresh)
@@ -950,6 +1125,20 @@ class Config:
                 self.IDENTITY_MATCHING_PRIVACY_DEFAULT_VERSION,
             "whisper_model": "large-v3-turbo",
             "transcription_engine": default_transcription_engine(),
+            # macOS speaker diarization engine, see VALID_DIARIZATION_ENGINES.
+            # Settings -> Transcribe only persists "nemotron3" after its
+            # models are prepared, because meeting processing never downloads.
+            "diarization_engine": "sortformer",
+            # OpenAI-compatible ASR endpoint settings.
+            # api_url: base URL of any OpenAI Speech-to-Text compatible server
+            #   (e.g. https://api.openai.com/v1 or Groq).
+            # model: model name passed in the multipart form (e.g. whisper-1).
+            # The API key is NOT stored here -- it is held encrypted by the
+            # Electron main process (safeStorage) and injected into the
+            # transcription subprocess env as STENOAI_OAI_API_KEY, exactly like
+            # the cloud summariser key. See get_openai_asr_api_key().
+            "openai_asr_api_url": OPENAI_ASR_DEFAULT_URL,
+            "openai_asr_model": "whisper-1",
             "version": "1.0"
         }
 
@@ -2077,9 +2266,9 @@ class Config:
     def get_transcription_engine(self) -> str:
         """Return the active ASR engine.
 
-        A config copied from a newer Mac may contain ``apple`` on a platform
-        that cannot run SpeechTranscriber; use Parakeet there without mutating
-        the stored preference.
+        One of the configured on-device or OpenAI-compatible ASR engines.
+        An Apple selection copied to an unsupported platform reads as Parakeet
+        without changing the stored preference. Unknown values also use Parakeet.
         """
         value = self._config.get(
             "transcription_engine", default_transcription_engine()
@@ -2106,6 +2295,28 @@ class Config:
         self._config["transcription_engine"] = engine
         return self._save()
 
+    def get_diarization_engine(self) -> str:
+        """Return the macOS speaker-diarization engine.
+
+        One of VALID_DIARIZATION_ENGINES. Falls back to 'sortformer' for
+        missing or unknown values so a hand-edited config can never select a
+        backend the sidecar rejects (it fails loudly on unknown engines).
+        """
+        value = self._config.get("diarization_engine", "sortformer")
+        return value if value in self.VALID_DIARIZATION_ENGINES else "sortformer"
+
+    def set_diarization_engine(self, engine: str) -> bool:
+        """Persist the speaker-diarization engine. Validates against
+        VALID_DIARIZATION_ENGINES."""
+        if engine not in self.VALID_DIARIZATION_ENGINES:
+            logger.error(
+                f"Invalid diarization engine: {engine}. "
+                f"Must be one of {self.VALID_DIARIZATION_ENGINES}"
+            )
+            return False
+        self._config["diarization_engine"] = engine
+        return self._save()
+
     def get_whisper_model(self) -> str:
         """Get the configured Whisper model size."""
         model = self._config.get("whisper_model", "large-v3-turbo")
@@ -2120,6 +2331,140 @@ class Config:
             logger.error(f"Unsupported Whisper model: {model_size}")
             return False
         self._config["whisper_model"] = model_size
+        return self._save()
+
+    # ------------------------------------------------------------------
+    # OpenAI-compatible ASR endpoint settings
+    #
+    # Only the NON-SECRET fields (url, model) live in config.json. The API
+    # key is a credential and is NEVER persisted here: it is held encrypted
+    # by the Electron main process (safeStorage) and injected into the
+    # transcription subprocess env as STENOAI_OAI_API_KEY, exactly like the
+    # cloud summariser key (get_cloud_api_key). This is deliberate -- a
+    # plaintext key in config.json would leak into backups, diagnostics, and
+    # sync.
+    # ------------------------------------------------------------------
+
+    def get_openai_asr_api_url(self) -> str:
+        """Base URL of the OpenAI-compatible STT endpoint.
+
+        Defaults to the official OpenAI endpoint. Users can override with
+        any OpenAI-compatible server, including HTTPS providers and a local
+        loopback development server.
+        The transcriber appends ``/audio/transcriptions`` to this URL.
+        """
+        if "openai_asr_api_url" not in self._config:
+            return OPENAI_ASR_DEFAULT_URL
+        configured = self._config.get("openai_asr_api_url")
+        safe_url = _normalise_openai_asr_api_url(configured)
+        if safe_url is None:
+            logger.warning("Ignoring unsafe legacy openai_asr_api_url: %s", _redact_url_credentials(configured))
+            return ""
+        return safe_url
+
+    def set_openai_asr_api_url(self, url: str) -> bool:
+        """Set the base URL for the OpenAI-compatible STT endpoint.
+
+        Rejects blank URLs, credentials, queries, fragments, and plaintext
+        remote endpoints. HTTP is allowed only for loopback development
+        servers; all other hosts must use HTTPS.
+        """
+        if not url or not url.strip():
+            logger.error("openai_asr_api_url must not be empty")
+            return False
+        clean_url = _normalise_openai_asr_api_url(url)
+        if clean_url is None:
+            logger.error(
+                "openai_asr_api_url URL must be HTTPS (or loopback HTTP) without "
+                "credentials, queries, or fragments: %s",
+                _redact_url_credentials(url),
+            )
+            return False
+        self._config["openai_asr_api_url"] = clean_url
+        return self._save()
+
+    def has_legacy_openai_asr_api_key(self) -> bool:
+        """Whether the locked in-memory config still carries plaintext ASR key text.
+
+        Call this only while a transaction is active for a settings mutation.
+        A non-empty raw string is enough to block an endpoint change even when
+        it is malformed: only migration may delete that value, and it does so
+        with a separate digest-bound compare-and-delete operation.
+        """
+        legacy_key = self._config.get("openai_asr_api_key")
+        return isinstance(legacy_key, str) and legacy_key != ""
+
+    def get_openai_asr_api_key(self) -> str:
+        """Bearer token for the OpenAI-compatible STT endpoint.
+
+        Read from the env var set by Electron via safeStorage (mirrors
+        get_cloud_api_key). NEVER stored in config.json. Empty string when
+        unset.
+        """
+        import os
+        return os.environ.get("STENOAI_OAI_API_KEY", "")
+
+    def remove_legacy_openai_asr_api_key(
+        self, expected_snapshot_digest: Optional[str] = None,
+    ) -> bool:
+        """Remove a plaintext legacy ASR key, optionally via locked CAS.
+
+        The migration CLI always supplies a SHA-256 digest of Electron's
+        single-read legacy snapshot.  Re-reading under the config lock avoids
+        deleting a replacement entered after Electron read the old plaintext.
+        Direct in-process callers retain the historical no-digest behaviour.
+        """
+        if expected_snapshot_digest is None:
+            if "openai_asr_api_key" not in self._config:
+                return True
+            legacy_key = self._config.pop("openai_asr_api_key")
+            if self._save():
+                return True
+            self._config["openai_asr_api_key"] = legacy_key
+            return False
+
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_snapshot_digest):
+            return False
+
+        lock_path = str(self.config_path) + ".lock"
+        try:
+            with filelock.FileLock(lock_path, timeout=self._SAVE_LOCK_TIMEOUT):
+                current = self._read_disk_for_merge()
+                if current is None:
+                    return False
+                current_digest = _legacy_openai_asr_snapshot_digest(current)
+                if current_digest is None:
+                    # Another writer already removed the key. Nothing remains
+                    # to delete, and crucially no replacement was discarded.
+                    return "openai_asr_api_key" not in current
+                if not hmac.compare_digest(current_digest, expected_snapshot_digest):
+                    return False
+                current.pop("openai_asr_api_key")
+                _atomic_write_json(self.config_path, current)
+                self._config = current
+                self._snapshot = copy.deepcopy(current)
+                logger.info("Removed migrated legacy OpenAI ASR credential")
+                return True
+        except (filelock.Timeout, OSError, ValueError):
+            return False
+
+    def get_openai_asr_model(self) -> str:
+        """Model name passed to the OpenAI-compatible STT endpoint.
+
+        Defaults to ``whisper-1`` (the standard OpenAI Whisper model).
+        Groq uses ``whisper-large-v3``; other providers vary.
+        """
+        return _normalise_openai_asr_model(
+            self._config.get("openai_asr_model", "whisper-1")
+        ) or "whisper-1"
+
+    def set_openai_asr_model(self, model: str) -> bool:
+        """Set the model name for the OpenAI-compatible STT endpoint."""
+        clean_model = _normalise_openai_asr_model(model)
+        if clean_model is None:
+            logger.error("openai_asr_model has an invalid format")
+            return False
+        self._config["openai_asr_model"] = clean_model
         return self._save()
 
     def get_system_audio_enabled(self) -> bool:
