@@ -42,7 +42,10 @@ xcrun swiftc \
 
 # Local builds use an ad-hoc signature. electron-builder re-signs the helper
 # when it signs the containing app bundle.
-codesign --sign - "$OUT" 2>/dev/null || true
+if ! codesign --sign - "$OUT"; then
+    echo "Error: failed to ad-hoc sign steno-transcribe at $OUT" >&2
+    exit 1
+fi
 
 if [ ! -x "$OUT" ]; then
     echo "Error: Apple transcription sidecar was not built at $OUT" >&2

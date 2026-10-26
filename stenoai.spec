@@ -52,16 +52,16 @@ def _macos_is_26_or_newer() -> bool:
     """True on macOS 26+ where the SpeechTranscriber sidecar can be built."""
     if sys.platform != "darwin":
         return False
-    try:
-        import platform
+    import platform
 
-        ver = platform.mac_ver()[0]
+    ver = platform.mac_ver()[0]
+    try:
         major = int(ver.split(".", 1)[0])
-        # Same pre-26-SDK compatibility view as apple_speech_supported():
-        # macOS 26 may be reported as 16.x (python/cpython#135675).
-        return major == 16 or major >= 26
-    except Exception:
-        return False
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise RuntimeError("Cannot determine macOS version for Apple Speech bundle") from exc
+    # Same pre-26-SDK compatibility view as apple_speech_supported():
+    # macOS 26 may be reported as 16.x (python/cpython#135675).
+    return major == 16 or major >= 26
 
 
 _REQUIRES_TRANSCRIBE_SIDECAR = _macos_is_26_or_newer()
@@ -272,7 +272,7 @@ for pkg in _DYLIB_PKGS:
 #   - the GPU runner libs are pruned above and there's no pip-mlx build).
 ollama_datas: list[tuple[str, str, str]] = []
 ollama_bin_dir = os.path.join(SPECPATH, 'bin')
-required_macos_sidecars: dict[str, Path | None] = {
+required_macos_sidecars = {
     'steno-diarize': require_diarize_sidecar(
         Path(ollama_bin_dir) / 'steno-diarize',
         platform=sys.platform,

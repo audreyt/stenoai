@@ -290,7 +290,7 @@ jobs:
 
       # Guards the Ollama/pip-mlx libmlx.dylib ABI collision (see
       # scripts/verify_mlx_bundle.py). dlopen probes run here too - GitHub's
-      # macos-latest arm64 runners resolve symbols fine without a Metal GPU.
+      # The macos-26 arm64 runner resolves symbols without a Metal GPU.
       - name: Verify MLX bundle (libmlx ABI-collision guard)
         run: python scripts/verify_mlx_bundle.py
 

@@ -78,7 +78,11 @@ def _run(arguments: list[str], *, timeout: float) -> dict[str, Any]:
     if completed.returncode != 0:
         if isinstance(payload, dict) and isinstance(payload.get("error"), str):
             raise RuntimeError(payload["error"])
-        raise RuntimeError("Apple on-device transcription failed.")
+        # stderr may include local audio paths or user content; expose only
+        # the exit status when the helper has no structured JSON error.
+        raise RuntimeError(
+            f"Apple on-device transcription failed (sidecar exit {completed.returncode})."
+        )
     if not isinstance(payload, dict):
         raise RuntimeError("Apple transcription sidecar returned invalid output.")
     return payload
@@ -90,7 +94,7 @@ def _is_supported() -> bool:
         from src.config import apple_speech_supported
 
         return apple_speech_supported()
-    except Exception:
+    except ImportError:
         return False
 
 
