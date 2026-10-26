@@ -9,12 +9,15 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { execSync } from 'child_process';
+import { version } from '../../app/package.json';
 
 // Repo-root/app — the Electron app dir (package.json main: main.js). Resolved
 // from this file so the helper works regardless of the cwd Playwright runs in.
 const APP_DIR = path.resolve(__dirname, '..', '..', 'app');
 
 type LaunchOptions = {
+  /** Start after the current release announcement has been acknowledged. */
+  releaseHighlightsSeen?: boolean;
   /** Install the deterministic mock IPC layer (T1, no backend). */
   mockIpc?: boolean;
   /**
@@ -56,7 +59,7 @@ export const test = base.extend<Fixtures>({
   // Factory so each spec decides when/how to launch (T1 passes mockIpc:true).
   // Every app launched through it is closed at teardown.
   launchApp: async ({ userDataDir }, use) => {
-    const launched: ElectronApplication[] = [];
+    const launched: { app: ElectronApplication; proc: ReturnType<ElectronApplication['process']> }[] = [];
 
     const launch = async (opts: LaunchOptions = {}): Promise<LaunchResult> => {
       const env: Record<string, string> = {
@@ -89,9 +92,11 @@ export const test = base.extend<Fixtures>({
       let lastErr: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
+          const executablePath = process.env.STENOAI_E2E_APP_PATH;
           app = await electron.launch({
+            ...(executablePath ? { executablePath } : {}),
             args: [
-              '.',
+              ...(executablePath ? [] : ['.']),
               ...(opts.fakeAudio
                 ? ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']
                 : []),
@@ -105,25 +110,36 @@ export const test = base.extend<Fixtures>({
         }
       }
       if (!app) throw lastErr;
-      launched.push(app);
+      // Capture before a restart spec closes the app; Playwright releases the
+      // process handle on close, so app.process() is unavailable afterward.
+      launched.push({ app, proc: app.process() });
 
       const page = await app.firstWindow();
       // Deterministic launch gate — set in App.tsx's readiness effect. No
       // fixed timeouts anywhere in the suite.
       await page.waitForSelector('[data-app-ready]', { timeout: 30_000 });
+      if (opts.releaseHighlightsSeen) {
+        // Seed persisted user state, leaving the production announcement path
+        // intact. Release-specific specs omit this option to exercise that path.
+        await page.evaluate((currentVersion) => {
+          localStorage.setItem('steno-last-seen-release', currentVersion);
+        }, version);
+        await page.reload();
+        await page.waitForSelector('[data-app-ready]', { timeout: 30_000 });
+      }
       return { app, page };
     };
 
     await use(launch);
 
-    for (const app of launched) {
+    for (const { app, proc } of launched) {
       // app.close() can hang on Windows: the app spawns children (the backend
       // pipeline subprocess, a stray `ollama serve`) that keep the Electron main
       // process alive, so a graceful close never returns and Playwright's worker
       // teardown times out. Race the close with a grace window, then force-kill
       // the whole process tree. macOS closes well within the window, so the
       // fallback never fires there.
-      const proc = app.process();
+      if (proc.exitCode !== null || proc.signalCode !== null) continue;
       try {
         await Promise.race([
           app.close(),

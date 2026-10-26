@@ -15,8 +15,8 @@
 //     resets an out-of-set pin to 'auto'.
 //   - the live transcript bar's language selector
 //     (components/LiveTranscriptBar.tsx) maps PARAKEET_LANGUAGES directly.
-// Adding a language is now a one-line edit here; the codes set is derived, so
-// no second hardcoded list can fall out of sync.
+// New entries also need the curated Whisper list and backend SUPPORTED_LANGUAGES
+// entry; the Parakeet codes set below is derived from this list.
 export interface ParakeetLanguageOption {
   code: string;
   label: string;
@@ -28,6 +28,7 @@ export const PARAKEET_LANGUAGES: readonly ParakeetLanguageOption[] = [
   { code: 'en', label: 'English', hint: 'Best accuracy when meetings are always in English' },
   { code: 'fr', label: 'French', hint: 'Transcribe and summarise in French' },
   { code: 'de', label: 'German', hint: 'Transcribe and summarise in German' },
+  { code: 'it', label: 'Italian', hint: 'Transcribe and summarise in Italian' },
   { code: 'es', label: 'Spanish', hint: 'Transcribe and summarise in Spanish' },
   { code: 'nl', label: 'Dutch', hint: 'Transcribe and summarise in Dutch' },
   { code: 'pt', label: 'Portuguese', hint: 'Transcribe and summarise in Portuguese' },

@@ -10,7 +10,7 @@ summary (#283). Whisper is unaffected (whisper.cpp reports a real
 
 This module fills that gap with a small stopword/function-word classifier over
 the transcript text. It covers exactly the European languages Parakeet
-transcribes well (``en, fr, de, es, nl, pt, ru`` — the ``PARAKEET_LANGUAGES`` set
+transcribes well (``en, fr, de, es, it, nl, pt, ru`` — the ``PARAKEET_LANGUAGES`` set
 minus ``auto``) and returns ``None`` when the evidence is inconclusive, so the
 existing "en" fallback still applies. No pip dependency (PyInstaller bundle size
 + licensing); the method is a plain aggregate word-match count.
@@ -62,6 +62,17 @@ _STOPWORDS: dict[str, frozenset[str]] = {
         "está", "están", "puede", "pueden", "todo", "todos", "nosotros",
         "ellos", "ellas", "usted", "ustedes", "ahora", "entonces",
     }),
+    # Italian leaves out "il", "lo", "ma" and "lui": French and Spanish use the
+    # same words, and they were enough to cost a French transcript its lead.
+    "it": frozenset({
+        "di", "gli", "della", "delle", "degli", "dello", "nel", "nella",
+        "nei", "negli", "alla", "alle", "agli", "dal", "dalla", "sul", "sulla",
+        "che", "non", "per", "è", "sono", "anche", "questo", "questa", "questi",
+        "quello", "quella", "perché", "però", "quindi", "allora", "ancora",
+        "sempre", "molto", "più", "tutto", "tutti", "abbiamo", "siamo",
+        "hanno", "essere", "avere", "fatto", "fare", "cosa", "dove", "adesso",
+        "io", "noi", "voi", "loro", "lei", "ci", "poi", "sui", "dei",
+    }),
     "nl": frozenset({
         "de", "het", "een", "en", "van", "dat", "die", "in", "is", "ik",
         "je", "niet", "met", "op", "te", "zijn", "voor", "maar", "ook",
@@ -111,7 +122,7 @@ _LEAD_RATIO = 1.3
 def detect_transcript_language(text: str) -> Optional[str]:
     """Best-effort language of ``text``, or ``None`` when inconclusive.
 
-    Returns one of ``{en, fr, de, es, nl, pt, ru}`` — the Parakeet-supported set —
+    Returns one of ``{en, fr, de, es, it, nl, pt, ru}`` — the Parakeet-supported set —
     only when the winning language clears ``_MIN_HITS`` stopword matches and
     leads the runner-up by at least ``_LEAD_RATIO``. Diarisation markers and
     timestamps are ignored and only the first ``_MAX_CHARS`` are scanned.

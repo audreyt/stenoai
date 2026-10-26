@@ -68,6 +68,8 @@ jobs:
         include:
           - arch: arm64
             build_cmd: build:arm64
+            # Build on macOS 26 for the opt-in SpeechTranscriber helper.
+            # Check the macOS 14 floor separately for all other binaries.
             runner: macos-26
     runs-on: ${{ matrix.runner }}
 
@@ -97,6 +99,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
+
+    # pip installs the newest wheel the build host accepts. On macos-15 that is
+    # mlx's macosx_15_0 build, whose libmlx.dylib refuses to load below macOS 15,
+    # so Parakeet failed at model load on macOS 14.x (#531). Swap in the
+    # macosx_14_0 wheels of the same versions; verify_macos_minimum.py below
+    # fails the build if anything newer than the app's minimum still ships.
+    - name: Install macOS 14 builds of MLX
+      run: PYTHON=python scripts/install-mlx-macos14.sh
 
     - name: Download bundled binaries (Ollama, ffmpeg)
       run: |
@@ -128,6 +138,9 @@ jobs:
         # ship users a Rosetta'd helper.
         file bin/mic-monitor | grep -q "arm64"
 
+    - name: Build native transfer audio helper
+      run: scripts/build-audio-helper.sh
+
     - name: Build speaker-diarization sidecar (Swift/Core ML)
       run: |
         chmod +x scripts/build-diarize-sidecar.sh
@@ -143,6 +156,8 @@ jobs:
         test -x bin/steno-transcribe
         file bin/steno-transcribe
         file bin/steno-transcribe | grep -q "arm64"
+        bash scripts/test-transcribe-sidecar.sh
+        python -m unittest tests.test_apple_speech.NativeAppleSpeechContractTests
 
     - name: Build Python backend with PyInstaller
       run: |
@@ -150,6 +165,7 @@ jobs:
         # Verify build and architecture
         ls -la dist/stenoai/
         file dist/stenoai/stenoai
+        test -x dist/stenoai/_internal/steno-audio-encode
         test -x dist/stenoai/_internal/steno-diarize
         file dist/stenoai/_internal/steno-diarize | grep -q "arm64"
         test -x dist/stenoai/_internal/steno-transcribe
@@ -162,6 +178,11 @@ jobs:
     # summarization path is exactly what this release gate must catch.
     - name: Verify MLX bundle (libmlx ABI-collision guard)
       run: python scripts/verify_mlx_bundle.py
+
+    # The DMG promises macOS 14.4 (app/package.json minimumSystemVersion). Fail
+    # if any bundled binary needs more, whatever brought it in (#531).
+    - name: Verify bundled binaries run on the minimum macOS
+      run: python scripts/verify_macos_minimum.py
 
     - name: Install Electron dependencies
       working-directory: app

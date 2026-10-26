@@ -2,7 +2,8 @@ import * as React from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { ipc } from '@/lib/ipc';
 import { appendDebugLog } from '@/lib/debugLogs';
-import { isMac } from '@/lib/utils';
+import { isLinux, isMac } from '@/lib/utils';
+import { startLinuxLoopbackStream, type LinuxLoopbackStream } from '@/lib/linuxLoopbackStream';
 import { flushNotesThenProcess } from '@/lib/notesFlush';
 import { unwrap } from '@/lib/result';
 import { getLiveDraft } from './liveDraftStore';
@@ -28,8 +29,12 @@ const SILENCE_SAMPLE_INTERVAL_MS = 1_000;
  * Mounts ONCE at App level. This is the ONLY recording path — whenever the
  * user starts recording it captures the mic (getUserMedia) and, when loopback
  * is enabled (macOS toggle on; Windows always; OS must support it), also the
- * system loopback (getDisplayMedia routed through CoreAudio Process Taps via
- * `electron-audio-loopback` with forceCoreAudioTap). It emits a single STEREO
+ * system loopback: on mac/Windows via getDisplayMedia routed through CoreAudio
+ * Process Taps / WASAPI loopback (`electron-audio-loopback` with
+ * forceCoreAudioTap); on Linux via a MediaStreamTrackGenerator fed from a
+ * main-process pw-record subprocess instead (see lib/linuxLoopbackStream.ts —
+ * getDisplayMedia's video capture would route through a Wayland portal picker
+ * on Linux just for a throwaway video track). Either way it emits a single STEREO
  * WebM/Opus blob with **mic in channel 0 (L), system in channel 1 (R)**,
  * streamed incrementally to disk. The backend's `transcribe_diarised`
  * (src/transcriber.py) detects the stereo layout, splits the channels,
@@ -60,8 +65,10 @@ export function useSystemAudioCapture() {
   // runs while status === 'recording' (the mic is captured regardless). The
   // "Record system audio" setting no longer gates whether we record — it only
   // decides whether system LOOPBACK is mixed in:
-  //  - Windows: always on when the OS supports it (the toggle is hidden; the
-  //    product decision is always mic+system).
+  //  - Windows and Linux: always on when the OS supports it (the toggle is
+  //    hidden on both; the product decision is always mic+system). Whether
+  //    that should stay true now it covers a third platform is an open
+  //    question, raised on #502 and not settled.
   //  - macOS: follows the user's setting (default on; off = mic-only).
   // When the support query is still loading we assume supported so a fast user
   // who records before the IPC resolves still gets loopback.
@@ -101,6 +108,17 @@ export function useSystemAudioCapture() {
   const sysStreamRef = React.useRef<MediaStream | null>(null);
   const audioCtxRef = React.useRef<AudioContext | null>(null);
   const mixedStreamRef = React.useRef<MediaStream | null>(null);
+  // Only set on Linux (see lib/linuxLoopbackStream.ts) — holds the handle
+  // that stops the main-side pw-record subprocess and IPC subscription.
+  // sysStreamRef holds the resulting MediaStream either way, same as mac/
+  // Windows; this ref exists only for the extra teardown step Linux needs.
+  const linuxLoopbackRef = React.useRef<LinuxLoopbackStream | null>(null);
+  const stopLinuxLoopback = () => {
+    if (!linuxLoopbackRef.current) return;
+    const handle = linuxLoopbackRef.current;
+    linuxLoopbackRef.current = null;
+    void handle.stop();
+  };
   // Serialises the incremental writes: each MediaRecorder timeslice is
   // appended to the open on-disk file through this chain so chunks land in
   // arrival order regardless of how their arrayBuffer() promises resolve.
@@ -157,6 +175,7 @@ export function useSystemAudioCapture() {
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       sysStreamRef.current?.getTracks().forEach((t) => t.stop());
       mixedStreamRef.current?.getTracks().forEach((t) => t.stop());
+      stopLinuxLoopback();
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
         audioCtxRef.current.close().catch(() => { /* already closed */ });
       }
@@ -212,6 +231,21 @@ export function useSystemAudioCapture() {
           console.warn('[systemAudioCapture] failed to read microphone preference, using system default', micPrefErr);
         }
         if (cancelled()) { stopAcquired(); return; }
+        // Set when the machine has no audio input device at all (#517).
+        // Routine on a Windows desktop. Rather than failing outright, the
+        // recording continues SYSTEM-AUDIO-ONLY if loopback comes up below;
+        // if it doesn't, this error is rethrown so the user still learns no
+        // microphone was found. Only NotFoundError qualifies: a busy mic or a
+        // denied permission is something the user can fix, and silently
+        // recording without their voice would hide it.
+        let noInputDeviceErr: DOMException | null = null;
+        const isNoInputDevice = (e: unknown): e is DOMException =>
+          e instanceof DOMException && e.name === 'NotFoundError';
+        // Linux only: lets the pw-record onEnded handler tell "the only source
+        // died mid-recording" (stop it) from "died while still starting" (fail
+        // the start).
+        let recorderStarted = false;
+        let onlySourceEndedEarly = false;
         try {
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -234,18 +268,31 @@ export function useSystemAudioCapture() {
           const isMissingDeviceError =
             micErr instanceof DOMException &&
             (micErr.name === 'OverconstrainedError' || micErr.name === 'NotFoundError');
-          if (!pinnedDeviceId || !isMissingDeviceError) throw micErr;
-          console.warn('[systemAudioCapture] pinned microphone unavailable, falling back to system default', micErr);
-          micStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: false,
-              autoGainControl: false,
-            },
-          });
+          if (!pinnedDeviceId && isNoInputDevice(micErr)) {
+            noInputDeviceErr = micErr;
+          } else {
+            if (!pinnedDeviceId || !isMissingDeviceError) throw micErr;
+            console.warn('[systemAudioCapture] pinned microphone unavailable, falling back to system default', micErr);
+            try {
+              micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  echoCancellation: true,
+                  noiseSuppression: false,
+                  autoGainControl: false,
+                },
+              });
+            } catch (fallbackErr) {
+              // The pin is gone AND there is no default device either.
+              if (!isNoInputDevice(fallbackErr)) throw fallbackErr;
+              noInputDeviceErr = fallbackErr;
+            }
+          }
         }
         if (cancelled()) { stopAcquired(); return; }
         micStreamRef.current = micStream;
+        if (noInputDeviceErr) {
+          appendDebugLog('[sysaudio] no audio input device found; trying system audio only');
+        }
 
         // 2. System audio loopback — OPTIONAL + BEST-EFFORT. Skipped entirely
         //    when loopback is disabled (macOS toggle off) or the OS doesn't
@@ -258,31 +305,71 @@ export function useSystemAudioCapture() {
         //    no audio track) we record MIC-ONLY rather than failing: sysStream
         //    stays null and the stereo graph below wires mic → L with a silent R
         //    channel (the backend tolerates an empty Others side). A genuine mic
-        //    failure above still aborts.
+        //    failure above still aborts. With NO input device (noInputDeviceErr)
+        //    the roles swap: loopback becomes the only source, and its failure
+        //    aborts the start instead.
         try {
           if (!loopbackEnabledRef.current) {
             throw new Error('loopback disabled');
           }
-          await bridge.recording.enableLoopbackAudio();
-          if (cancelled()) { stopAcquired(); return; }
-          sysStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true,
-            audio: true,
-          });
-          if (cancelled()) { stopAcquired(); return; }
-          sysStream.getVideoTracks().forEach((t) => {
-            t.stop();
-            sysStream!.removeTrack(t);
-          });
-          if (sysStream.getAudioTracks().length === 0) {
-            throw new Error('No audio track in loopback stream');
+          if (isLinux) {
+            // Bypasses getDisplayMedia — see lib/linuxLoopbackStream.ts.
+            const linuxLoopback = await startLinuxLoopbackStream({
+              // pw-record died mid-recording: the track is already closed, so
+              // the mix continues mic-only. NOT reportCaptureError — that
+              // prefixes "Recording couldn't start", which is false here.
+              // The notification follows the same mic-only path (and the same
+              // notifications_enabled gate) the macOS acquisition-failure case
+              // below uses; the debug line above is the ungated record.
+              onEnded: ({ code, signal }) => {
+                appendDebugLog(`[linux-loopback] capture ended (code=${code}, signal=${signal})`);
+                if (!noInputDeviceErr) {
+                  void bridge.settings.showSystemAudioMicOnlyNotification();
+                  return;
+                }
+                // System-audio-only: that was the ONLY source, so from here on
+                // the recording would be pure silence, indefinitely if silence
+                // auto-stop is off. Stop it the normal way instead, which keeps
+                // and processes what was captured so far. Before the recorder
+                // is running there is nothing to keep, and a global stop would
+                // race this start; flag it and let the start fail below.
+                if (cancelled() || !activeRef.current) return;
+                if (!recorderStarted) {
+                  onlySourceEndedEarly = true;
+                  return;
+                }
+                appendDebugLog('[linux-loopback] only audio source lost; stopping the recording');
+                void bridge.recording.stop().catch(() => { /* logged by main */ });
+              },
+            });
+            if (cancelled()) { void linuxLoopback.stop(); stopAcquired(); return; }
+            sysStream = linuxLoopback.stream;
+            if (sysStream.getAudioTracks().length === 0) {
+              throw new Error('No audio track in Linux loopback stream');
+            }
+            linuxLoopbackRef.current = linuxLoopback;
+          } else {
+            await bridge.recording.enableLoopbackAudio();
+            if (cancelled()) { stopAcquired(); return; }
+            sysStream = await navigator.mediaDevices.getDisplayMedia({
+              video: true,
+              audio: true,
+            });
+            if (cancelled()) { stopAcquired(); return; }
+            sysStream.getVideoTracks().forEach((t) => {
+              t.stop();
+              sysStream!.removeTrack(t);
+            });
+            if (sysStream.getAudioTracks().length === 0) {
+              throw new Error('No audio track in loopback stream');
+            }
           }
           sysStreamRef.current = sysStream;
         } catch (loopbackErr) {
           // Intentionally-disabled loopback (toggle off) is the expected
           // mic-only case — don't log it as a failure; only a genuine
           // unavailability warrants a warning.
-          if (loopbackEnabledRef.current) {
+          if (loopbackEnabledRef.current && !noInputDeviceErr) {
             // Only a genuine permission denial should surface the "grant Screen
             // & System Audio Recording access" guidance. Everything else — the
             // enableLoopbackAudio IPC call failing, an absent audio track, an
@@ -291,7 +378,10 @@ export function useSystemAudioCapture() {
             // user to a setting that isn't the cause. macOS raises a
             // NotAllowedError from getDisplayMedia when Screen & System Audio
             // Recording is denied. main gates the notification on
-            // notifications_enabled; it's macOS-only (Windows never fired it).
+            // notifications_enabled. This ACQUISITION-failure path stays
+            // mac-gated: Windows has no equivalent permission error. Linux does
+            // send the same notification, but from the onEnded path below (a
+            // live capture dying mid-recording), not from here.
             const accessDenied =
               loopbackErr instanceof DOMException && loopbackErr.name === 'NotAllowedError';
             if (accessDenied && isMac) {
@@ -303,7 +393,23 @@ export function useSystemAudioCapture() {
           sysStream?.getTracks().forEach((t) => t.stop());
           sysStream = null;
           sysStreamRef.current = null;
-          try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+          // Branch on PLATFORM, not on whether the ref got assigned: main may
+          // have a live pw-record even when the failure landed before the ref
+          // was set, and disableLoopbackAudio() is a no-op on Linux.
+          if (isLinux) {
+            stopLinuxLoopback();
+            try { await bridge.recording.stopLinuxLoopback(); } catch { /* */ }
+          } else {
+            try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+          }
+          // No microphone AND no system audio: there is nothing to record.
+          // Fail with the original NotFoundError so main's notification names
+          // the real cause (no microphone found) rather than the loopback one.
+          if (noInputDeviceErr) {
+            // eslint-disable-next-line no-console
+            console.warn('[systemAudioCapture] no microphone and no system audio', loopbackErr);
+            throw noInputDeviceErr;
+          }
         }
 
         // 3. Build the stereo graph. AudioContext at 48 kHz matches the
@@ -318,12 +424,15 @@ export function useSystemAudioCapture() {
         const ctx = new AudioContext({ sampleRate: 48000 });
         audioCtxRef.current = ctx;
 
-        const micSource = ctx.createMediaStreamSource(micStream);
+        // No mic source on a system-audio-only recording: micGain then has no
+        // input and feeds silence into L, the mirror image of the mic-only
+        // case's silent R. The backend's per-channel energy gate skips it.
+        const micSource = micStream ? ctx.createMediaStreamSource(micStream) : null;
         const micGain = ctx.createGain();
         micGain.channelCount = 1;
         micGain.channelCountMode = 'explicit';
         micGain.gain.value = 0.7;
-        micSource.connect(micGain);
+        micSource?.connect(micGain);
 
         // System source/gain only exist when loopback was acquired. A
         // mic-only recording leaves the R channel of the merger silent.
@@ -451,6 +560,10 @@ export function useSystemAudioCapture() {
         if (!opened.success) {
           throw new Error(opened.error || 'Could not open recording file');
         }
+        // The only source (Linux pw-record, system-audio-only) died while we
+        // were still starting: nothing left to record, so this is the no-mic,
+        // no-system-audio case after all. The catch below closes the file.
+        if (onlySourceEndedEarly && noInputDeviceErr) throw noInputDeviceErr;
 
         const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
           ? 'audio/webm;codecs=opus'
@@ -478,8 +591,13 @@ export function useSystemAudioCapture() {
                 appendFailedRef.current = true;
                 // eslint-disable-next-line no-console
                 console.error('[systemAudioCapture] chunk append failed:', res.error);
+                // 'ongoing': the recording is still running and only the write
+                // failed. Without the phase this reached the user as "the
+                // recording didn't start" — false twice over.
                 bridge.recording.reportCaptureError(
                   `Recording may be incomplete: ${res.error || 'failed to write audio'}`,
+                  undefined,
+                  'ongoing',
                 );
               }
             })
@@ -491,6 +609,7 @@ export function useSystemAudioCapture() {
         // 1s timeslice so a crash mid-recording loses at most ~1s of audio.
         recorder.start(1_000);
         recorderRef.current = recorder;
+        recorderStarted = true;
 
         // 5. Silence-auto-stop detector. Taps each pre-merge source with its
         //    own AnalyserNode so we can distinguish "mic active" from
@@ -502,7 +621,9 @@ export function useSystemAudioCapture() {
         const micAnalyser = ctx.createAnalyser();
         micAnalyser.fftSize = 512;
         micAnalyser.smoothingTimeConstant = 0;
-        micSource.connect(micAnalyser);
+        // Unconnected on a system-audio-only recording, so micRms reads 0 and
+        // auto-stop falls back to system-audio silence alone.
+        micSource?.connect(micAnalyser);
         // No system analyser on a mic-only recording — sysRms is treated as 0
         // below, so auto-stop falls back to mic-only silence.
         let sysAnalyser: AnalyserNode | null = null;
@@ -697,23 +818,62 @@ export function useSystemAudioCapture() {
         //    Idempotent — main.js already flipped systemAudioRecordingActive
         //    when start-recording-ui ran, but this re-affirms it.
         bridge.recording.reportSystemAudioState(true);
+        // Only now, with the recorder running: the user's own voice is not in
+        // this recording, and they should hear that from us, not from the note.
+        if (noInputDeviceErr) {
+          void bridge.settings.showSystemAudioOnlyNotification();
+        }
       } catch (err) {
+        // A stop or unmount can invalidate this attempt while a media promise
+        // is still pending. At that point the refs and IPC globals may already
+        // belong to a successor, so the stale attempt may only stop the streams
+        // it acquired itself. In particular, teardownStreams() is NOT safe here:
+        // it follows shared refs and would tear down the successor too.
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
         // eslint-disable-next-line no-console
         console.error('[systemAudioCapture] start failed', err);
         teardownStreams();
         activeRef.current = false;
         // Close any file opened before the failure so we don't leak the
         // main-side write stream (no-op if open never ran).
-        try { await bridge.recording.closeSystemAudioFile(); } catch { /* */ }
-        // Tell main to drop the stuck "recording" pill — its optimistic
-        // systemAudioRecordingActive flag was set on start-recording-ui.
-        bridge.recording.reportSystemAudioState(false);
+        try {
+          await bridge.recording.closeSystemAudioFile();
+        } catch {
+          /* */
+        }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
+        // Finish the current attempt's global cleanup before reporting it
+        // inactive. That final state report is what lets main accept a new
+        // recording, so nothing after it may still target global capture state.
+        try {
+          await bridge.recording.disableLoopbackAudio();
+        } catch {
+          /* */
+        }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
+        bridge.liveTranscript.stop();
         // Surface the failure to the user (native notification) — otherwise a
-        // denied mic permission looks like a silent no-op.
+        // denied mic permission looks like a silent no-op. Pass the DOMException
+        // NAME as well as the message: main maps the name to prose, and a name
+        // is a stable identifier where the message text is not.
         bridge.recording.reportCaptureError(
           err instanceof Error ? err.message : 'Recording could not start',
+          err instanceof Error ? err.name : undefined,
+          'start',
         );
-        try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+        // Tell main to drop the stuck "recording" pill — its optimistic
+        // systemAudioRecordingActive flag was set on start-recording-ui. Keep
+        // this LAST: after it, a successor may start immediately.
+        bridge.recording.reportSystemAudioState(false);
       }
     };
 
@@ -814,6 +974,11 @@ export function useSystemAudioCapture() {
   React.useEffect(() => {
     const bridge = ipc();
     return () => {
+      // Invalidate a media request that resolves or rejects after unmount. The
+      // cleanup below owns this hook instance's resources; its abandoned async
+      // start must not later touch global IPC state owned by a remount.
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- cleanup must invalidate the latest token
+      startTokenRef.current++;
       // Clear any live intervals first — the per-recording teardown helper
       // lives in the other useEffect's scope so it isn't reachable here,
       // and without an explicit clear the silence-auto-stop poll would
@@ -856,6 +1021,7 @@ export function useSystemAudioCapture() {
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       sysStreamRef.current?.getTracks().forEach((t) => t.stop());
       mixedStreamRef.current?.getTracks().forEach((t) => t.stop());
+      stopLinuxLoopback();
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
         audioCtxRef.current.close().catch(() => { /* already closed */ });
       }
@@ -867,6 +1033,13 @@ export function useSystemAudioCapture() {
       if (hadOpenFile) {
         activeRef.current = false;
         void bridge.recording.disableLoopbackAudio();
+        // End the live-transcribe sidecar main spawned for this recording
+        // (#568). Nothing else will: a start still awaiting media sees
+        // cancelled() and skips its failure path (which does send this), and
+        // main does not stop the sidecar on an inactive state report, so it
+        // would otherwise run on, blocking Parakeet re-warm and idle update
+        // installs, until the next recording replaces it.
+        bridge.liveTranscript.stop();
         bridge.recording.reportSystemAudioState(false);
       }
     };

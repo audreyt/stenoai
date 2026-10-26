@@ -170,6 +170,16 @@ test('settings setters persist each value to the right config.json key; real dir
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
 });
 
+test('Italian language survives the backend settings round-trip', async ({ launchApp, userDataDir }) => {
+  const { page } = await launchApp();
+  const result = await page.evaluate(() => window.stenoai.settings.setLanguage('it'));
+  expect(result).toMatchObject({ success: true, language: 'it' });
+  await expect.poll(() => readUserConfig(userDataDir).language).toBe('it');
+
+  const reloaded = await page.evaluate(() => window.stenoai.settings.getLanguage());
+  expect(reloaded).toMatchObject({ success: true, language: 'it' });
+});
+
 // set-microphone takes two args (device_id, label) and writes two config
 // keys, so it doesn't fit the single-value CASES shape above — same reason
 // set-storage-path gets its own test below.
@@ -237,7 +247,7 @@ test('Advanced-tab Reset button clears the custom storage path (#304); real dir 
   userDataDir,
 }) => {
   const realDirBefore = fileSig(realUserDataDir());
-  const { page } = await launchApp();
+  const { page } = await launchApp({ releaseHighlightsSeen: true });
 
   // Setup (not under test): seed a custom path via the bridge so the Reset
   // button is rendered (it only shows when custom_path differs from default).

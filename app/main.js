@@ -51,24 +51,57 @@ const path = require('path');
 // Backend CLI seam (spawn wrapper, process-tree kill, bundled-backend paths,
 // runPythonScript), the debug-log sink, and the quit teardown registry are
 // carved out of this file (RFC #327, Phase 0); wired once below via factories.
-const { spawn, killProcessTree, createBackendCli } = require('./backend-cli');
+const { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey } = require('./backend-cli');
+const {
+  isEncryptedKeyCleared,
+  legacyKeyMigrationAction,
+  loadEncryptedKeyForOrigin,
+  markEncryptedKeyClearedAtomically,
+  readOpenAiAsrConfigSnapshot,
+  readOpenAiAsrEndpointSnapshot,
+  saveEncryptedKeyAtomically,
+} = require('./openai-asr-key-store');
+// Keep an unreadable config distinct from a readable config without a legacy
+// key. Migration may treat only the latter as complete.
+const OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE = Symbol('openai-asr-config-snapshot-unreadable');
+const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
 const { registerSettingsIpc } = require('./settings-ipc');
+const { registerMeetingTransferIpc, copyRegularFile } = require('./meeting-transfer-ipc');
+const { STORE_DOCUMENT_LIMIT } = require('./meeting-transfer-store');
 const { registerPersonSampleIpc } = require('./person-sample-ipc');
 const { registerSpeakerIpc } = require('./speaker-ipc');
 const { registerObsidianSync } = require('./obsidian-sync');
 const { registerObsidianIpc } = require('./obsidian-ipc');
 const { isSafeToAutoInstall } = require('./update-idle-gate');
-const { describeUpdateError, updateErrorPhase } = require('./update-error-copy');
+const { describeUpdateError, updateErrorPhase, isMissingUpdateFeedError } = require('./update-error-copy');
 const { isOSUpdateEligible, MIN_MACOS_FOR_AUTOUPDATE } = require('./update-os-gate');
 const processingLog = require('./processing-log');
 const { isMeetingApp, allowsDeviceLevelFallback, isMacos14Plus } = require('./meeting-detect');
+const { isLinuxLoopbackSupported, startLoopbackCapture, createFrameAligner, createSerialQueue } = require('./linux-loopback');
 const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
+const { shareTempDir, sweepShareTemp, SHARE_TEMP_MAX_AGE_MS } = require('./share-temp');
 const { userNotesFilePath } = require('./notes-file');
-const { buildNoteReadyNotificationOptions, buildTranscriptReadyBody } = require('./notification-copy');
+const {
+  setSummary,
+  setKeyPoints,
+  setActionItems,
+  setDiscussionAreas,
+  containsStructuralLine,
+  normalizeMarkdownForParsing,
+} = require('./note-sections');
+const { writeFileAtomicSync } = require('./atomic-write');
+const { createToastScheduler, toastLayering } = require('./toast-scheduler');
+const { readSnapshot, captureSnapshot, markEdited, editedFieldNames } = require('./note-snapshot');
+const {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  buildCaptureErrorBody,
+} = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
+const { classifyReprocessError } = require('./reprocess-error');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
 // notifications — stays here and calls parseShortcutUrl().
@@ -80,6 +113,8 @@ const {
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
 const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
+const { createSpeakerModelPreparer } = require('./speaker-model-prepare');
+const { reprepareSpeakerModelsAfterUpgrade } = require('./speaker-model-upgrade');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -114,15 +149,42 @@ const { autoUpdater } = require('electron-updater');
 
 // E2E test-harness hooks. Set via env vars; production sees none of these.
 //   STENOAI_USER_DATA_DIR — per-test temp userData dir (must be set before app.whenReady)
-//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry
+//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry, and
+//                           the post-upgrade speaker-model re-download unless
+//                           STENOAI_E2E_SPEAKER_UPGRADE=1 opts a spec into it
 //   STENOAI_E2E_MOCK_IPC=1 — install deterministic mock IPC handlers
 //   STENOAI_E2E_HEADLESS=1 - keep the main window rendered but never visible/focused
 if (process.env.STENOAI_USER_DATA_DIR) {
   app.setPath('userData', process.env.STENOAI_USER_DATA_DIR);
 }
 const IS_E2E = process.env.STENOAI_E2E === '1';
+// The subset of the harness that redirects WHERE BYTES GO: the STENOAI_E2E_*_PATH
+// seams in export-transcript / export-note-pdf / save-diagnostics, and the
+// path-returning seam in share-note-file. Those need a second condition beyond
+// IS_E2E, because IS_E2E is nothing but an environment variable: a signed build
+// started with STENOAI_E2E=1 plus one of those paths would silently write a
+// user's export to an attacker-chosen location instead of the file they picked
+// in the save dialog, and never show the dialog at all.
+//
+// `!app.isPackaged` is the right second condition rather than a stricter one:
+// every e2e lane launches the DEV binary from source (`electron.launch({ args:
+// ['.'] })` in e2e/fixtures/electron.ts, and the release gate's T1 smoke runs
+// the same way), so no legitimate test run is packaged. A packaged build now
+// ignores these seams entirely, whatever it is started with.
+//
+// Deliberately NOT folded into IS_E2E itself: its other ~30 uses gate the tray,
+// the dock, the scheduler and telemetry, and re-gating those on packaging would
+// be a far wider behavioural change than closing this hole.
+const ALLOW_E2E_PATH_SEAMS = IS_E2E && !app.isPackaged;
 const IS_E2E_MOCK_IPC = process.env.STENOAI_E2E_MOCK_IPC === '1';
 const IS_E2E_HEADLESS = IS_E2E && process.env.STENOAI_E2E_HEADLESS === '1';
+
+// Carry chat history over from v0.8.0, the one release named "StenoAI".
+if (app.isPackaged && !process.env.STENOAI_USER_DATA_DIR) {
+  require('./legacy-user-data').migrateLegacyUserData({
+    fs, path, appDataDir: app.getPath('appData'), userDataDir: app.getPath('userData'),
+  });
+}
 
 // Global (system-wide) accelerator to toggle recording. CommandOrControl
 // resolves to Cmd on macOS and Ctrl on Windows/Linux, so no manual
@@ -179,8 +241,7 @@ if (IS_E2E_MOCK_IPC) {
   require('./e2e-mock-ipc').install({ ipcMain, BrowserWindow });
 }
 
-// Distinguish dev runs from the packaged "Steno" app in the dock, About menu,
-// and Cmd+Tab. Production keeps the productName from package.json untouched.
+// Give development runs a distinct dock, About menu, and Cmd+Tab name.
 if (!app.isPackaged) {
   app.setName('Steno Dev');
 }
@@ -261,7 +322,11 @@ function isAutoDetectSupported() {
 // Whether system-audio (loopback) capture is available on this OS at all.
 // macOS: CoreAudio Process Tap (14.4+). Windows: electron-audio-loopback uses
 // Chromium's WASAPI loopback on Windows 10+ (both Win10 and Win11 report major
-// version 10). Linux: not wired. Drives the Settings/MainToolbar toggle.
+// version 10). Linux: a PipeWire monitor-port capture (see ./linux-loopback.js)
+// bypassing Chromium's getDisplayMedia path entirely — that path would route
+// through xdg-desktop-portal's ScreenCast picker on Wayland just to get a
+// throwaway video track, a real UX regression versus mac/Windows showing no
+// dialog at all. Drives the Settings/MainToolbar toggle.
 function isSystemAudioSupported() {
   if (process.platform === 'darwin') return isCoreAudioTapSupported();
   if (process.platform === 'win32') {
@@ -272,6 +337,7 @@ function isSystemAudioSupported() {
       return true; // assume a modern Windows if the version probe fails
     }
   }
+  if (process.platform === 'linux') return isLinuxLoopbackSupported();
   return false;
 }
 
@@ -335,6 +401,12 @@ let notificationWindow;
 // macOS-only but are harmlessly ignored on Windows. This is the exact window
 // config the pre-meeting toast already shipped with on both platforms, so
 // there's no new platform-specific surface to gate.
+//
+// Keyboard: the toast is deliberately never focusable, like the OS's own
+// banners, so it cannot steal focus from whatever the user is typing in. Every
+// toast action has a keyboard path elsewhere: Resume in the main window and the
+// tray menu, Take Notes via the record shortcut or tray, Summarise in the note
+// (#412).
 const { EventEmitter } = require('events');
 
 class Notification extends EventEmitter {
@@ -354,18 +426,27 @@ class Notification extends EventEmitter {
       })),
     };
     if (options.iconType) this.payload.iconType = options.iconType;
+    if (options.detail) this.payload.detail = options.detail;
+    // A persistent toast has no auto-close; it stays until acted on or closed
+    // from code, and comes back after a toast that interrupted it (#412).
+    this.persistent = Boolean(options.persistent);
+    // Toasts sharing a tag replace each other instead of queueing (#412).
+    this.tag = options.tag || null;
   }
 
   show() {
-    // Supersede any current toast (single-toast semantics).
-    if (notificationWindow && !notificationWindow.isDestroyed()) {
-      notificationWindow.close();
-    }
+    // One toast on screen at a time; later ones wait their turn (#412).
+    toastScheduler.show(this);
+  }
 
+  // Called by toastScheduler when it is this toast's turn.
+  _present() {
     const { screen } = require('electron');
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width } = primaryDisplay.workAreaSize;
-    const { x, y } = primaryDisplay.workArea;
+    // The display the user is looking at, not always the primary one: someone
+    // presenting on an external monitor would otherwise never see it (#412).
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const { width } = display.workAreaSize;
+    const { x, y } = display.workArea;
 
     // Capture the window in a local `win` so the ready-to-show / closed
     // closures below always reference THIS toast's window — never a later one
@@ -425,49 +506,78 @@ class Notification extends EventEmitter {
     // trackNotificationLifecycle's own click/dismiss bookkeeping.
     win._analyticsInteracted = false;
 
-    const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
-    win.loadFile(rendererDist, { hash: '/notification' });
-
     let autoCloseTimer;
-    // Registered immediately (not inside ready-to-show) so a toast superseded
-    // BEFORE it finishes loading still emits 'close' and clears the module-level
-    // ref — the auto-close timer simply hasn't been armed yet in that case.
+    let readyTimer;
+    // Registered immediately (not inside ready-to-show) so a toast closed
+    // BEFORE it finishes loading still reaches the scheduler and clears the
+    // module-level ref; the auto-close timer simply hasn't been armed yet.
     win.on('closed', () => {
       if (autoCloseTimer) clearTimeout(autoCloseTimer);
-      this.emit('close');
+      if (readyTimer) clearTimeout(readyTimer);
       if (notificationWindow === win) notificationWindow = null;
+      // False when the window only closed to let another toast through; this
+      // toast is queued again and has not been dismissed.
+      const closedForGood = toastScheduler.windowClosed(this);
+      if (closedForGood) this.emit('close');
     });
 
-    win.once('ready-to-show', () => {
-      win.showInactive();
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-      win.setAlwaysOnTop(true, 'screen-saver', 1);
+    // A window that never loads, or whose renderer dies before first paint,
+    // never fires ready-to-show. Close it, or every later toast would wait
+    // behind it.
+    const closeUnloaded = () => {
+      if (!win.isDestroyed()) win.close();
+    };
+    win.webContents.once('did-fail-load', closeUnloaded);
+    win.webContents.once('render-process-gone', closeUnloaded);
+    readyTimer = setTimeout(closeUnloaded, 10000);
+    const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
+    win.loadFile(rendererDist, { hash: '/notification' }).catch(closeUnloaded);
 
-      // Keep the 15s auto-close (matches the pre-existing pre-meeting toast).
-      autoCloseTimer = setTimeout(() => {
-        if (!win.isDestroyed()) win.close();
-      }, 15000);
+    win.once('ready-to-show', () => {
+      clearTimeout(readyTimer);
+      win.showInactive();
+      // Only a persistent toast may cover a fullscreen app; see toastLayering.
+      // A persistent toast is still there after the user leaves fullscreen.
+      const layering = toastLayering(this);
+      win.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: layering.visibleOnFullScreen,
+        skipTransformProcessType: layering.skipTransformProcessType,
+      });
+      win.setAlwaysOnTop(true, layering.level, 1);
+
+      // Keep the 15s auto-close (matches the pre-existing pre-meeting toast),
+      // except for a persistent toast.
+      if (!this.persistent) {
+        autoCloseTimer = setTimeout(() => {
+          if (!win.isDestroyed()) win.close();
+        }, 15000);
+      }
 
       win.webContents.send('show-notification', this.payload);
+      // Only now is the toast actually on screen; analytics count it here.
+      this.emit('show');
     });
   }
 
   close() {
-    // Only act if we're still the active toast — a superseded toast's window is
-    // already gone, so this is a harmless no-op in that case.
-    if (
-      notificationWindow &&
-      notificationWindow._activeCustomNotification === this &&
-      !notificationWindow.isDestroyed()
-    ) {
-      notificationWindow.close();
-    }
+    // A toast still waiting its turn is dropped without ever showing; the one
+    // on screen has its window closed, which emits 'close' via 'closed'.
+    if (toastScheduler.cancel(this) === 'removed') this.emit('close');
   }
 
   static isSupported() {
     return true;
   }
 }
+
+const toastScheduler = createToastScheduler({
+  present: (notif) => notif._present(),
+  dismissWindow: (notif) => {
+    if (notif._window && !notif._window.isDestroyed()) notif._window.close();
+  },
+  // Pushed out of a full queue without ever showing.
+  onDropped: (notif) => notif.emit('close'),
+});
 
 let pythonProcess;
 let tray = null;
@@ -948,12 +1058,19 @@ ipcMain.on('track', (_event, eventName, properties) => {
 // click/action from an unclicked auto-dismiss/timeout.
 function trackNotificationLifecycle(notif, type, extraProps = {}) {
   let clicked = false;
+  let shown = false;
   const props = { type, ...extraProps };
-  trackEvent('notification_shown', props);
+  // Counted when the toast is actually on screen, once even if an interrupted
+  // persistent toast is presented again; a toast dropped from the queue was
+  // never shown and is neither shown nor dismissed (#412).
+  notif.once('show', () => {
+    shown = true;
+    trackEvent('notification_shown', props);
+  });
   notif.on('click', () => { clicked = true; trackEvent('notification_clicked', props); });
   notif.on('action', () => { clicked = true; trackEvent('notification_clicked', props); });
   notif.on('close', () => {
-    if (!clicked) trackEvent('notification_dismissed', props);
+    if (shown && !clicked) trackEvent('notification_dismissed', props);
   });
 }
 
@@ -1258,7 +1375,7 @@ function validateSafeFilePath(filepath, allowedBaseDirs) {
 // Deleting a note HIDES only its summary file, by renaming it into a hidden
 // sibling dir (`output/.pending-delete/<id>/`). Every backend scan identifies a
 // note SOLELY by its summary glob (`list_meetings` / global chat glob
-// `output/*_summary.{json,md}`, non-recursive), so hiding the summary makes the
+// `output/<stem>_summary.{json,md}`, non-recursive), so hiding the summary makes the
 // note invisible to all of them via a SINGLE atomic same-filesystem rename — no
 // multi-file moves, no cross-volume copy, no manifest, no restore/purge/sweep.
 //
@@ -1387,6 +1504,20 @@ function isAllowedMeetingSource(src, allowedBaseDirs) {
   return leafDirs.includes(realParent);
 }
 
+// Transfer tracks belong only to the validated summary's immutable stem.
+// Neither a receipt nor the renderer can supply a different media directory.
+function transferMediaDirectory(outputDir, stem) {
+  if (!/^transfer_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(stem ?? '')) return null;
+  try {
+    const root = path.join(fs.realpathSync(outputDir), '.meeting-transfer');
+    const media = path.join(root, stem);
+    for (const directory of [root, media]) {
+      if (!fs.lstatSync(directory).isDirectory() || fs.realpathSync(directory) !== directory) return null;
+    }
+    return media;
+  } catch (_) { return null; }
+}
+
 // No-clobber occupancy test. Uses lstat (NOT existsSync) so a DANGLING symlink
 // at the path counts as occupied: existsSync follows the link and returns false
 // for a broken target, which would let a renameSync silently REPLACE the symlink
@@ -1469,9 +1600,20 @@ function commitPendingDelete(id) {
   // not the note itself: a rare permanently-locked orphan is accepted (fail-safe
   // direction — never risk the note over a stray file). Log any that survived.
   for (const p of entry.ancillaryPaths) {
+    // Recheck the private media ancestors after the undo window as well.
+    if (entry.transferMediaDir && path.dirname(p) === entry.transferMediaDir
+      && transferMediaDirectory(path.dirname(entry.originalSummaryPath), path.basename(entry.transferMediaDir)) !== entry.transferMediaDir) {
+      console.warn('Commit: retained transfer media after storage revalidation failed:', path.basename(entry.transferMediaDir));
+      continue;
+    }
     if (!unlinkBestEffort(p)) {
       console.warn(`Commit: orphaned ancillary file (could not remove): ${p}`);
     }
+  }
+  if (entry.transferMediaDir
+    && transferMediaDirectory(path.dirname(entry.originalSummaryPath), path.basename(entry.transferMediaDir)) === entry.transferMediaDir) {
+    // Only an empty directory may go; a failed unlink preserves its contents.
+    try { fs.rmdirSync(entry.transferMediaDir); } catch (_) {}
   }
   removeHiddenScaffold(entry.hiddenDir);
   pendingDeletes.delete(id);
@@ -1752,6 +1894,18 @@ function updateTrayMenu() {
       label: 'Open Steno',
       click: showAndFocusWindow
     },
+    // A keyboard-reachable Resume for a paused recording: the "Recording
+    // paused" toast is never focusable (#412). Same renderer path as its button.
+    ...(isRecording && recordingRuntimeState.isPaused
+      ? [{
+          label: 'Resume Recording',
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('auto-resume-requested');
+            }
+          },
+        }]
+      : []),
     {
       label: isRecording ? 'Stop Recording' : 'Start Recording',
       click: () => {
@@ -1847,8 +2001,24 @@ function rewarmParakeet(reason) {
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
+  const meetingTransfer = registerMeetingTransferIpc({
+    app, ipcMain, dialog, getMainWindow: () => mainWindow, exposeMainWindow,
+    getOutputDir, getUserDataDir,
+    isBusy: () => currentRecordingProcess !== null || systemAudioRecordingActive || isProcessing || activeReprocessJobs.size > 0,
+    readMeeting: readMeetingForTransfer,
+    findAudioSource: findMeetingTransferAudio,
+    prepareAudio: prepareMeetingTransferAudio,
+    makeShareMenu: items => new (require('electron').ShareMenu)(items),
+  });
+  if (process.platform === 'darwin') {
+    for (const arg of process.argv.slice(1)) meetingTransfer.openFile(arg);
+  }
+
   ipcMain.on('warmup-parakeet-hint', () => rewarmParakeet('renderer-hint'));
   app.on('second-instance', (event, argv) => {
+    if (process.platform === 'darwin') {
+      for (const arg of argv.slice(1)) meetingTransfer.openFile(arg);
+    }
     const shortcutUrl = extractShortcutUrlFromArgv(argv);
     if (shortcutUrl) {
       if (app.isReady()) {
@@ -1989,6 +2159,29 @@ if (!gotSingleInstanceLock) {
       processingLog.logLine('app', `startup v${app.getVersion()} platform=${process.platform}`);
     } catch (e) {
       console.warn('processing-log init failed (non-fatal):', e?.message);
+    }
+
+    // Migrate the pre-safeStorage plaintext ASR credential on every launch,
+    // independent of the active engine or whether Settings is opened. The
+    // helper encrypts, verifies a decrypt/readback, then asks the backend to
+    // remove plaintext only after that succeeds.
+    void migrateLegacyOpenAiAsrApiKey();
+
+    // Speaker models cached before the FluidAudio 0.17 upgrade no longer
+    // load, and meeting processing never downloads; fetch them again in the
+    // background for users who had opted in (see speaker-model-upgrade.js).
+    // The shared preparer reports progress to Settings like any download.
+    // Off in e2e like the other network-bound startup work: a spec that seeds
+    // an old cache against the real sidecar must not start a real download.
+    if (!IS_E2E_MOCK_IPC && (!IS_E2E || process.env.STENOAI_E2E_SPEAKER_UPGRADE === '1')) {
+      void reprepareSpeakerModelsAfterUpgrade({
+        platform: process.platform,
+        userDataDir: getUserDataDir(),
+        env: process.env,
+        checkStatus: () => runSpeakerModelCommand('speaker-model-status'),
+        prepare: () => prepareSpeakerModels(),
+        onLog: sendDebugLog,
+      });
     }
 
     // Application menu. macOS uses the global menu bar with mac-only roles
@@ -2222,6 +2415,25 @@ if (!gotSingleInstanceLock) {
       }
     } catch (e) {
       console.warn('Live-snapshot sweep failed (non-fatal):', e?.message);
+    }
+
+    // Sweep share-sheet temp files older than a day. This is the ONLY cleanup
+    // for that directory: a file handed to ShareMenu must survive as long as the
+    // destination holds it (an open Mail draft, an AirDrop transfer waiting to be
+    // accepted), and popup() never reports when that ends - so nothing is deleted
+    // during a session. See share-temp.js for the full reasoning. Best-effort: an
+    // undeletable temp directory must not interrupt a launch.
+    try {
+      const { deleted } = sweepShareTemp(
+        shareTempDir(app.getPath('temp')),
+        Date.now(),
+        SHARE_TEMP_MAX_AGE_MS,
+      );
+      if (deleted.length > 0) {
+        sendDebugLog(`Swept ${deleted.length} stale share temp file(s)`);
+      }
+    } catch (e) {
+      console.warn('Share temp sweep failed (non-fatal):', e?.message);
     }
 
     // Load custom storage path for file validation. Skipped under E2E (spawns
@@ -2675,25 +2887,6 @@ async function readReportsSidecar(meetingPath, allowedOutputDirs) {
   }
 }
 
-// Port of simple_recorder._REASONING_TAG_HEADER_PATTERN / _normalize_markdown_for_parsing.
-// A reasoning-model summary can emit its closing think tag inline with the first
-// header (e.g. `</thought>## Summary`); without a break the section-splitter never
-// sees the `## ` at line start and drops the whole summary. This pushes the header
-// onto its own line before splitting. Scoped to think/thought/thinking/reasoning so
-// unrelated inline markup can't trigger a spurious break.
-//   Kept equivalent to the Python side for the ASCII tags + whitespace that
-//   actually occur in model output (same tag set: `i` = Python re.IGNORECASE,
-//   `g` = re.sub replaces all occurrences, `\s` spans the space/newline between
-//   tag and header). JS and Python `\s`/IGNORECASE differ only on exotic Unicode
-//   whitespace and non-ASCII case folds, which don't appear here. Any edit MUST
-//   be mirrored in simple_recorder._normalize_markdown_for_parsing (see #346).
-const REASONING_TAG_HEADER_PATTERN = /(<\/(?:think|thought|thinking|reasoning)>)\s*(#{1,6}\s)/gi;
-
-function normalizeMarkdownForParsing(mdText) {
-  // Ensure headers immediately following a reasoning tag start on a new line.
-  return mdText.replace(REASONING_TAG_HEADER_PATTERN, '$1\n$2');
-}
-
 // Mirrors simple_recorder._parse_meeting_markdown so the detail page (get-meeting)
 // can render .md meetings without a Python round-trip. The two parsers MUST stay
 // byte-for-byte equivalent on everything they surface into session_info / the
@@ -2838,6 +3031,7 @@ function parseMeetingMarkdown(content, mdPath) {
     diarised_text: meta.is_diarised ? sections.transcript || '' : null,
     user_notes: sections['user notes'] ?? null,
     folders: meta.folders || [],
+    continued_recordings: Array.isArray(meta.continued_recordings) ? meta.continued_recordings : [],
   };
 }
 
@@ -2890,6 +3084,54 @@ async function validateMeetingFilePath(summaryFile) {
   return { realPath, allowedOutputDirs };
 }
 
+// The transfer exporter reads a stable saved snapshot rather than trusting
+// renderer-supplied meeting content or an arbitrary audio path.
+async function readMeetingForTransfer(summaryFile) {
+  const validated = await validateMeetingFilePath(summaryFile);
+  if (validated.error) throw { code: 'unsafe_storage' };
+  const handle = await fs.promises.open(validated.realPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size > BigInt(STORE_DOCUMENT_LIMIT)) throw { code: 'unsafe_storage' };
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw { code: 'source_changed' };
+    const content = bytes.toString('utf8');
+    const meeting = validated.realPath.endsWith('.md')
+      ? parseMeetingMarkdown(content, validated.realPath) : JSON.parse(content);
+    if (!meeting.session_info) throw { code: 'unsafe_storage' };
+    return { realPath: validated.realPath, meeting, fingerprint: require('crypto').createHash('sha256').update(bytes).digest('hex') };
+  } finally { await handle.close(); }
+}
+
+async function findMeetingTransferAudio(summaryFile) {
+  return require('./meeting-transfer-audio').findAudioSource(summaryFile, getAllowedBaseDirs(), IMPORT_AUDIO_EXTENSIONS);
+}
+
+async function prepareMeetingTransferAudio(source) {
+  const { sourcePath, identity } = source;
+  const { privateDirectory } = require('./meeting-transfer-store');
+  const root = await privateDirectory(getUserDataDir(), 'meeting-transfer');
+  const scratch = await fs.promises.mkdtemp(path.join(root, 'audio-'));
+  const cleanup = () => fs.promises.rm(scratch, { recursive: true, force: true });
+  try {
+    const input = path.join(scratch, 'source' + path.extname(sourcePath));
+    await copyRegularFile(sourcePath, input, identity);
+    const target = path.join(scratch, 'track.caf');
+    const backendDir = path.dirname(getBackendPath());
+    const candidates = name => [path.join(backendDir, '_internal', name), path.join(backendDir, name)];
+    const helperCandidates = candidates('steno-audio-encode');
+    if (!app.isPackaged) helperCandidates.push(path.join(__dirname, '..', 'bin', 'steno-audio-encode'));
+    const values = await require('./meeting-transfer-audio').convertTransferAudio(input, target, {
+      nativeHelper: helperCandidates.find(candidate => fs.existsSync(candidate)),
+      ffmpeg: candidates('ffmpeg').find(candidate => fs.existsSync(candidate)),
+    });
+    await fs.promises.chmod(target, 0o600);
+    const metadata = { ...values, logicalTrackID: 'track-1', kind: 'imported' };
+    return { audio: [{ metadata, sourcePath: target }], cleanup };
+  } catch (error) { await cleanup(); throw error; }
+}
+
 ipcMain.handle('get-meeting', async (_event, summaryFile) => {
   try {
     const validated = await validateMeetingFilePath(summaryFile);
@@ -2921,11 +3163,17 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
       // TranscriptPanel), so we return everything parseMeetingMarkdown yields.
       const mdMeeting = parseMeetingMarkdown(content, realResolved);
       const mdSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-      return { success: true, meeting: { ...mdMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
+      // edited_fields comes LAST in every spread so it is always main's own
+      // reading of the sidecar, never a value that happened to be parsed out of
+      // the note file. It drives the regenerate guard, so a note that cannot
+      // supply one has to arrive as an empty list rather than as undefined -
+      // editedFieldNames guarantees that for a missing, corrupt or
+      // wrong-versioned sidecar alike.
+      return { success: true, meeting: { ...mdMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: mdSidecar.reports, active_report: mdSidecar.active_report, edited_fields: editedFieldNames(realResolved) } };
     }
     const jsonMeeting = JSON.parse(content);
     const jsonSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-    return { success: true, meeting: { ...jsonMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
+    return { success: true, meeting: { ...jsonMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report, edited_fields: editedFieldNames(realResolved) } };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -2941,6 +3189,11 @@ ipcMain.handle('clear-state', async () => {
 });
 
 ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, sessionName, retranscribe) => {
+  let errorCode = 'generation_failed';
+  const rememberError = (error) => {
+    const classified = classifyReprocessError(error);
+    if (classified !== 'generation_failed') errorCode = classified;
+  };
   try {
     // Security: symlink-safe containment-check the renderer-supplied summary path
     // before it reaches the backend CLI, and pass the canonical realPath (not the
@@ -2948,7 +3201,8 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // summaryFile — that's UI correlation the renderer matches on, not file access.
     const validated = await validateMeetingFilePath(summaryFile);
     if (validated.error) {
-      return { success: false, error: validated.error };
+      sendDebugLog(`Reprocess path validation failed: ${validated.error}`);
+      return { success: false, error: 'Note generation failed', error_code: errorCode };
     }
     const { realPath } = validated;
 
@@ -2972,8 +3226,10 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // stuck.
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
-    const aiEnv = getAiEnv();
-    const reprocessEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reprocessSecrets = retranscribe
+      ? { ...getAiEnv(), ...getTranscriptionEnv() }
+      : getAiEnv();
+    const reprocessEnv = getBackendEnv(reprocessSecrets);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -2988,6 +3244,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
       // assume. Threaded into processing-complete so the renderer fires
       // "Note ready" only when notes exist (#bug2).
       let summarizationCompleted = false;
+      let streamFailed = false;
 
       // Liveness watchdog — see makeInactivityWatchdog. Summary CHUNK:
       // lines (and HEARTBEAT: lines if a retranscribe is ever added here)
@@ -3027,10 +3284,15 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
             }
           } else if (line.startsWith('STREAM_ERROR:')) {
             const errMsg = line.slice('STREAM_ERROR:'.length);
+            streamFailed = true;
+            rememberError(errMsg);
             sendDebugLog(`❌ Reprocess stream error: ${errMsg}`);
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile });
+              mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile, error_code: errorCode });
             }
+          } else if (line.startsWith('ERROR:')) {
+            rememberError(line.slice('ERROR:'.length));
+            forwardDiagnosticStdout(line, 'reprocess');
           } else {
             // Unclassified stdout: forward only diagnostic markers, drop content.
             forwardDiagnosticStdout(line, 'reprocess');
@@ -3049,7 +3311,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
 
       proc.on('close', (code) => {
         watchdog.clear();
-        if (code === 0) {
+        if (code === 0 && !streamFailed && !watchdog.timedOut) {
           console.log(`✅ Completed reprocessing: ${sessionName}`);
           // Reprocess / generate-notes / re-transcribe rewrote the note — mirror
           // it into the vault (#413) if sync is on. Use the canonical realPath
@@ -3093,12 +3355,17 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
             })
             .finally(() => resolve());
         } else {
+          // A STREAM_ERROR is more specific than a generic exit or trailing
+          // diagnostic. Keep it through both terminal events and the result.
+          if (errorCode === 'generation_failed' && watchdog.timedOut) errorCode = 'generation_timeout';
+          if (errorCode === 'generation_failed') rememberError(stderrBuf);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('processing-complete', {
               success: false,
               sessionName,
               summaryFile,
               message: `Reprocessing failed (exit ${code})`,
+              error_code: errorCode,
             });
           }
           reject(new Error(`reprocess exited with code ${code}: ${stderrBuf.slice(-500)}`));
@@ -3110,7 +3377,8 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     return { success: true };
   } catch (error) {
     sendDebugLog(`❌ Reprocessing failed: ${error.message}`);
-    return { success: false, error: error.message };
+    if (errorCode === 'generation_failed') rememberError(error);
+    return { success: false, error: 'Note generation failed', error_code: errorCode };
   } finally {
     activeReprocessJobs.delete(summaryFile);
   }
@@ -3185,7 +3453,7 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName });
 
     const aiEnv = getAiEnv();
-    const reportEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reportEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -3344,7 +3612,7 @@ ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) =>
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
     const aiEnv = getAiEnv();
-    const regenEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const regenEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), ['regen-title', realPath], {
@@ -3447,6 +3715,70 @@ ipcMain.handle('query-transcript', async (event, summaryFile, question) => {
 });
 
 const activeQueryProcs = new Map();
+const contextQueries = new Map();
+const { validateRequest: validateChatRequest, liveSnapshot, runQuery: runChatQuery } = require('./chat-query');
+
+ipcMain.on('chat-context-stream', async (event, queryId, request) => {
+  const sender = event.sender;
+  let chunkCount = 0;
+  let tracked = false;
+  const send = (channel, data) => {
+    if (channel === 'query-chunk') chunkCount++;
+    if (channel === 'query-done' && !tracked && data.error !== 'Answer stopped.') {
+      tracked = true;
+      trackEvent('chat_message_sent', {
+        success: data.success,
+        scope: request?.scope === 'live' || request?.scope === 'meeting' ? 'single_meeting' : 'global',
+        query_length: textLengthBucket(typeof request?.question === 'string' ? request.question : ''),
+        has_response: chunkCount > 0,
+      });
+    }
+    if (!sender.isDestroyed()) sender.send(channel, { queryId, ...data });
+  };
+  if (!mainWindow || sender !== mainWindow.webContents || event.senderFrame !== sender.mainFrame) return;
+  if (typeof queryId !== 'string' || !queryId || queryId.length > 256 || contextQueries.has(queryId)) return;
+  if (contextQueries.size >= 4) {
+    send('query-done', { success: false, error: 'Wait for another answer to finish.' });
+    return;
+  }
+  let cancelled = false;
+  const entry = { sender, cancel: () => { cancelled = true; } };
+  contextQueries.set(queryId, entry);
+  const onDestroyed = () => entry.cancel();
+  sender.once('destroyed', onDestroyed);
+  const cleanup = () => {
+    contextQueries.delete(queryId);
+    if (!sender.isDestroyed()) sender.removeListener('destroyed', onDestroyed);
+  };
+  try {
+    const payload = validateChatRequest(request);
+    if (payload.scope === 'live') {
+      if (!systemAudioRecordingActive || request.recordingId !== String(recordingRuntimeState.startedAtMs)
+          || !recordingRuntimeState.startedAtMs) throw new Error('This recording is no longer active.');
+      payload.transcript = liveSnapshot(liveTranscriptState);
+      // A continued recording can start after a cold launch, with no in-memory
+      // prior segments. Read its saved transcript via the validated note path.
+      if (currentRecordingAppendTarget) {
+        payload.file = currentRecordingAppendTarget;
+        payload.transcript = liveSnapshot({ segments: liveTranscriptState.segments });
+      }
+    } else if (payload.scope === 'meeting') {
+      const validated = await validateMeetingFilePath(request.file);
+      if (validated.error) throw new Error('This meeting is unavailable.');
+      payload.file = validated.realPath;
+    }
+    if (cancelled || sender.isDestroyed()) { cleanup(); return; }
+    const query = runChatQuery({
+      spawn: require('child_process').spawn,
+      backend: getBackendPath(), env: getBackendEnv(getAiEnv()), cwd: getBackendCwd(),
+      payload, send, onFinish: cleanup,
+    });
+    entry.cancel = query.cancel;
+  } catch (error) {
+    if (!cancelled) send('query-done', { success: false, error: error.message });
+    cleanup();
+  }
+});
 
 // Cancellation intent for streaming queries that are still in their pre-spawn
 // async window. query-transcript-stream now `await`s validateMeetingFilePath
@@ -3459,6 +3791,11 @@ const activeQueryProcs = new Map();
 const pendingQueryCancels = new Map();
 
 ipcMain.on('query-cancel', (_event, queryId) => {
+  const contextQuery = contextQueries.get(queryId);
+  if (contextQuery) {
+    if (contextQuery.sender === _event.sender) contextQuery.cancel();
+    return;
+  }
   const proc = activeQueryProcs.get(queryId);
   if (proc) {
     console.log(`[QUERY] Cancelling queryId=${queryId}`);
@@ -3487,7 +3824,7 @@ ipcMain.on('query-cancel', (_event, queryId) => {
 ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, question) => {
   console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
   sendDebugLog(`🤖 Streaming query (${String(question || '').length} chars)`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   // chat_message_sent restores visibility into single-meeting chat (dormant
   // since the old bare-ping ai_query_used stopped being reachable once chat
@@ -3676,7 +4013,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
 // fewer recent notes instead of overflowing. No retrieval (RAG) yet.
 ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
   sendDebugLog(`💬 Global chat query (${String(question || '').length} chars, folder: ${folderId || 'all'})`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   const args = ['chat-global-streaming', '-q', question];
   if (folderId && typeof folderId === 'string' && folderId !== 'all') {
@@ -3879,9 +4216,10 @@ ipcMain.handle('export-transcript', async (event, defaultFilename, content) => {
       return { success: false, error: 'No transcript content to export.' };
     }
 
-    // Test-only seam: only honor it under e2e, so a stray env var in a real
-    // launch can't silently redirect a user's export to an arbitrary path.
-    const seamPath = IS_E2E ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
+    // Test-only seam: honored only in an UNPACKAGED e2e run, so a stray env var
+    // in a real launch can't silently redirect a user's export to an arbitrary
+    // path. See ALLOW_E2E_PATH_SEAMS - IS_E2E alone is just an env var.
+    const seamPath = ALLOW_E2E_PATH_SEAMS ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
     let targetPath = seamPath;
 
     if (!targetPath) {
@@ -4003,9 +4341,10 @@ ipcMain.handle('export-note-pdf', async (event, defaultFilename, html) => {
       return { success: false, error: 'No notes content to export.' };
     }
 
-    // Test-only seam: only honor it under e2e, so a stray env var in a real
-    // launch can't silently redirect a user's export to an arbitrary path.
-    const seamPath = IS_E2E ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
+    // Test-only seam: honored only in an UNPACKAGED e2e run (see
+    // ALLOW_E2E_PATH_SEAMS), so a stray env var in a real launch can't silently
+    // redirect a user's export to an arbitrary path.
+    const seamPath = ALLOW_E2E_PATH_SEAMS ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
     let targetPath = seamPath;
 
     if (!targetPath) {
@@ -4057,9 +4396,10 @@ ipcMain.handle('save-diagnostics', async (event, defaultFilename, content) => {
       return { success: false, error: 'No diagnostics content to save.' };
     }
 
-    // Test-only seam: only honor it under e2e, so a stray env var in a real
-    // launch can't silently redirect a user's save to an arbitrary path.
-    const seamPath = IS_E2E ? process.env.STENOAI_E2E_DIAGNOSTICS_PATH : undefined;
+    // Test-only seam: honored only in an UNPACKAGED e2e run (see
+    // ALLOW_E2E_PATH_SEAMS), so a stray env var in a real launch can't silently
+    // redirect a user's save to an arbitrary path.
+    const seamPath = ALLOW_E2E_PATH_SEAMS ? process.env.STENOAI_E2E_DIAGNOSTICS_PATH : undefined;
     let targetPath = seamPath;
 
     if (!targetPath) {
@@ -4098,6 +4438,129 @@ ipcMain.handle('save-diagnostics', async (event, defaultFilename, content) => {
   }
 });
 
+// Whether a native share sheet actually exists on this machine. macOS-only:
+// Electron exposes ShareMenu on darwin and nothing anywhere else. The second
+// half of the check is not paranoia - if a future Electron drops or renames the
+// export, this degrades to a hidden menu group instead of a main-process crash
+// on `new undefined(...)`.
+function shareSheetAvailable() {
+  if (process.platform !== 'darwin') return false;
+  try {
+    return typeof require('electron').ShareMenu === 'function';
+  } catch (_) {
+    return false;
+  }
+}
+
+// The renderer asks once and hides the three share entries when this is false.
+// That flag is only a hint for what to draw; the handler below re-checks, which
+// is what actually keeps a stray call from crashing the process.
+ipcMain.handle('share-capability', () => shareSheetAvailable());
+
+// Hand a note to the native macOS share sheet (AirDrop, Mail, Messages, Notes).
+// Follows the same split as the three export handlers above: the renderer builds
+// the content, we own the bytes. Differences from them, all deliberate:
+//   - No save dialog. The destination is our own managed temp directory, because
+//     the sheet needs a real file and the user never picks a location.
+//   - The filename is user-visible: it becomes the attachment name the recipient
+//     reads, so defaultExportFilename()'s dated slug is used as-is.
+//   - Files are never deleted during the session (see share-temp.js).
+// Returns { success } only; success means the sheet opened, since popup() has no
+// completion callback and the app never learns the destination.
+ipcMain.handle('share-note-file', async (event, kind, defaultFilename, payload, anchor) => {
+  try {
+    if (kind !== 'pdf' && kind !== 'text') {
+      return { success: false, error: 'Unsupported share type.' };
+    }
+    if (typeof payload !== 'string' || payload.length === 0) {
+      return { success: false, error: 'No content to share.' };
+    }
+
+    // Fail before rendering: a stray call off darwin must not pay for a 15
+    // second PDF render just to be refused. In an unpackaged e2e run we
+    // deliberately continue on every platform, because the file write is what
+    // those specs assert and T2 runs on Windows too.
+    if (!ALLOW_E2E_PATH_SEAMS && !shareSheetAvailable()) {
+      return { success: false, error: 'Sharing is not available on this platform.' };
+    }
+
+    // The renderer supplies a suggested name only. Unlike the export handlers,
+    // where the reduced name merely seeds a dialog the user confirms, here it is
+    // joined onto a directory we write into - so `.` and `..` have to be rejected
+    // as well, not just directory components.
+    const fallback = kind === 'pdf' ? 'notes.pdf' : 'notes.md';
+    let base = fallback;
+    if (typeof defaultFilename === 'string' && defaultFilename.trim()) {
+      const reduced = path.basename(defaultFilename).slice(0, 200);
+      if (reduced && reduced !== '.' && reduced !== '..') base = reduced;
+    }
+
+    const dir = shareTempDir(app.getPath('temp'));
+    const targetPath = path.join(dir, base);
+
+    // Rasterise BEFORE touching the destination, so a render failure leaves no
+    // file behind. Mirrors export-note-pdf.
+    const bytes = kind === 'pdf' ? await renderHtmlToPdf(payload) : payload;
+
+    // Atomic write: tmp file in the SAME directory, then rename into place.
+    // Sharing the same note twice overwrites the first file, which is fine: the
+    // content is identical and Mail copies an attachment into the draft. The
+    // exception, since the name is deliberately not randomised: another process
+    // running as the same user could have planted a file of that name in this
+    // directory first, and the rename would replace it. Accepted - the filename
+    // has to stay the readable one the recipient sees, and anyone who can write
+    // here can already read the notes we put here.
+    const tmpPath = path.join(dir, `.${base}.${require('crypto').randomBytes(6).toString('hex')}.tmp`);
+    try {
+      await fs.promises.writeFile(tmpPath, bytes, kind === 'pdf' ? undefined : 'utf-8');
+      await fs.promises.rename(tmpPath, targetPath);
+    } catch (writeErr) {
+      try { await fs.promises.unlink(tmpPath); } catch (_) {}
+      throw writeErr;
+    }
+
+    // Test-only seam, mirroring STENOAI_E2E_EXPORT_PATH: a native sheet cannot be
+    // automated (Playwright can neither see nor dismiss it, and an open sheet
+    // blocks the run), so under e2e we stop after the write and return where the
+    // file went. The path is returned ONLY here - outside the seam the renderer
+    // has no business knowing, and a leaked absolute path is exactly what the
+    // basename reduction exists to prevent.
+    if (ALLOW_E2E_PATH_SEAMS) return { success: true, path: targetPath };
+
+    // Re-check rather than trust the entry gate above: this is the line that
+    // stops `new undefined(...)` from taking the main process down.
+    if (!shareSheetAvailable()) {
+      return { success: false, error: 'Sharing is not available on this platform.' };
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return { success: false, error: 'No window to share from.' };
+    }
+    const { ShareMenu } = require('electron');
+    const menu = new ShareMenu({ filePaths: [targetPath] });
+    // Anchor on the clicked entry so the sheet pops from the button rather than
+    // the window corner. The rectangle was read up to 15 seconds ago, before the
+    // PDF render, so a scroll, a window move or a resize can have moved it, and
+    // after a shrink it can sit outside the window entirely. An out-of-range
+    // anchor is worse than none: dropping it lets Electron place the sheet with
+    // coordinates that are at least current. A malformed anchor is dropped for
+    // the same reason rather than defaulted to 0,0.
+    const popupOptions = { window: mainWindow };
+    if (anchor && Number.isFinite(anchor.x) && Number.isFinite(anchor.y)) {
+      const { width, height } = mainWindow.getContentBounds();
+      const x = Math.round(anchor.x);
+      const y = Math.round(anchor.y);
+      if (x >= 0 && y >= 0 && x <= width && y <= height) {
+        popupOptions.x = x;
+        popupOptions.y = y;
+      }
+    }
+    menu.popup(popupOptions);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+});
+
 // Replace (or remove, when empty) the "## User Notes" section at the tail of a
 // meeting markdown body. Kept a pure string transform so it's unit-testable and
 // never touches the summary/transcript sections above it. `body` is everything
@@ -4116,6 +4579,12 @@ function upsertUserNotesSection(body, notes) {
 }
 
 ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
+  // Which note content fields this call rewrote. Declared at handler scope, not
+  // inside the markdown branch, so the single write site further down can record
+  // the edit without guessing whether the variable exists. Only the markdown
+  // branch fills it: the legacy .json format has no snapshot sidecar and keeps
+  // its previous behaviour, so it always reports an empty list.
+  const changed = [];
   try {
     // Security: the renderer is untrusted, so containment-check the summary path
     // (symlink-safe, output/ only) and operate exclusively on the canonical
@@ -4126,6 +4595,108 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
     }
     const { realPath } = validated;
 
+    if (!updates || typeof updates !== 'object') {
+      return { success: false, error: 'Invalid update payload' };
+    }
+    const isMarkdown = realPath.endsWith('.md');
+
+    // Type-check the note content fields before anything is read or written.
+    // The section writers coerce with String(), so a wrong-typed value would
+    // not fail loudly - it would land in the note as "[object Object]", and a
+    // nested one would slip a forged heading past the structural scan below,
+    // which can only inspect strings: key_points: [['## Transcript']] holds no
+    // string to scan yet stringifies straight back into a heading. Rejecting
+    // the whole payload is both safer and kinder than writing a mangled note.
+    const isStringArray = (value) =>
+      Array.isArray(value) && value.every((item) => typeof item === 'string');
+    // `analysis` may be absent (or null, which is how an empty analysis can
+    // come back through a JSON round trip); a title is what makes a topic.
+    const isDiscussionAreaList = (value) =>
+      Array.isArray(value) &&
+      value.every(
+        (area) =>
+          area !== null &&
+          typeof area === 'object' &&
+          !Array.isArray(area) &&
+          typeof area.title === 'string' &&
+          (area.analysis === undefined || area.analysis === null || typeof area.analysis === 'string'),
+      );
+
+    // A bullet-list entry is ONE line by construction: renderBulletList writes
+    // "- <entry>", and both parsers keep only lines that start with "- "
+    // (app/main.js:2639/2647, and the Python mirror). A second line in an entry
+    // is therefore dropped on the next read, and the save after that rewrites
+    // the section from the parsed array and deletes it from the file too. The
+    // renderer is where such a string first becomes reachable, so refuse it
+    // here rather than joining or truncating it behind the user's back.
+    const LINE_BREAK = /[\r\n]/;
+
+    if (updates.summary !== undefined && typeof updates.summary !== 'string') {
+      return { success: false, error: 'summary must be a string.' };
+    }
+    if (updates.user_notes !== undefined && updates.user_notes !== null && typeof updates.user_notes !== 'string') {
+      return { success: false, error: 'user_notes must be a string or null.' };
+    }
+    if (updates.key_points !== undefined) {
+      if (!isStringArray(updates.key_points)) {
+        return { success: false, error: 'key_points must be an array of strings.' };
+      }
+      if (updates.key_points.some((item) => LINE_BREAK.test(item))) {
+        return { success: false, error: 'A key point may not contain a line break.' };
+      }
+    }
+    if (updates.action_items !== undefined) {
+      if (!isStringArray(updates.action_items)) {
+        return { success: false, error: 'action_items must be an array of strings.' };
+      }
+      if (updates.action_items.some((item) => LINE_BREAK.test(item))) {
+        return { success: false, error: 'An action item may not contain a line break.' };
+      }
+    }
+    if (updates.discussion_areas !== undefined) {
+      if (!isDiscussionAreaList(updates.discussion_areas)) {
+        return {
+          success: false,
+          error: 'discussion_areas must be an array of { title, analysis } objects.',
+        };
+      }
+      if (updates.discussion_areas.some((area) => LINE_BREAK.test(area.title))) {
+        return { success: false, error: 'A discussion title may not contain a line break.' };
+      }
+    }
+
+    // The renderer is untrusted: a field containing a '## ' line would forge a
+    // section boundary and silently rewrite the note's structure for every
+    // consumer (both parsers, the clipboard export, the PDF export, org share).
+    //
+    // Scan the NORMALIZED text, because that is the grammar the parsers
+    // actually split on: both of them run normalizeMarkdownForParsing (and its
+    // Python mirror) BEFORE the '## ' split, which breaks a reasoning close-tag
+    // away from a heading glued to it - so "b</think>## Summary" is a legal
+    // mid-line string at write time and a real heading at read time. Anchoring
+    // on '^' alone would let that through, and the forged heading would then
+    // win the parser's last-occurrence rule and blank the real section. This is
+    // not only an attack: the normalizer exists precisely because models emit
+    // that shape, so a user pasting model output hits it by accident. Tying the
+    // gate to the parser's own normalizer keeps the two from drifting apart.
+    // Reject, never strip: silently rewriting the user's text is worse.
+    const textCandidates = [
+      updates.summary,
+      ...(Array.isArray(updates.key_points) ? updates.key_points : []),
+      ...(Array.isArray(updates.action_items) ? updates.action_items : []),
+      ...(Array.isArray(updates.discussion_areas)
+        ? updates.discussion_areas.flatMap((area) => [area && area.title, area && area.analysis])
+        : []),
+    ].filter((value) => typeof value === 'string');
+    // My notes supports Markdown. Only level-two headings split the stored
+    // .md note into sections; other heading levels remain ordinary notes.
+    // JSON notes store this field separately and need no heading restriction.
+    const userNotesBoundary = isMarkdown && typeof updates.user_notes === 'string'
+      && /^## /m.test(normalizeMarkdownForParsing(updates.user_notes));
+    if (userNotesBoundary || textCandidates.some((value) => containsStructuralLine(normalizeMarkdownForParsing(value)))) {
+      return { success: false, error: 'A note field may not contain a markdown heading.' };
+    }
+
     // Read existing data
     if (!fs.existsSync(realPath)) {
       return {
@@ -4134,7 +4705,6 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
       };
     }
 
-    const isMarkdown = realPath.endsWith('.md');
     let data;
 
     if (isMarkdown) {
@@ -4163,6 +4733,24 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
       let body = raw;
       let updatedRaw = raw;
 
+      // Does this call touch the note's generated content (as opposed to only
+      // its title or the user's own notes)? Drives the snapshot capture below.
+      const structural =
+        updates.summary !== undefined ||
+        updates.key_points !== undefined ||
+        updates.action_items !== undefined ||
+        updates.discussion_areas !== undefined;
+
+      // Does it touch the note BODY at all? Every body writer - the generated
+      // sections AND the user's own notes - lives inside the frontmatter branch
+      // below, so this is what the missing-frontmatter guard has to key off.
+      // `structural` alone would leave the My-notes autosave (which records no
+      // edited field) reporting success over a file it never changed.
+      const bodyEdit = structural || updates.user_notes !== undefined;
+      // Set only where the body is actually reachable. A note whose frontmatter
+      // is missing or never closed leaves this false, and the guard fires.
+      let frontmatterParsed = false;
+
       if (raw.startsWith('---')) {
         // Split with NO limit and rejoin the tail: split('---', 3) DISCARDS any
         // '---' in the body (markdown thematic breaks in summaries, and the
@@ -4172,6 +4760,7 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
         // clearNoteProcessingFlag / parseMeetingMarkdown's split/slice(2).join.
         const parts = raw.split('---');
         if (parts.length >= 3) {
+          frontmatterParsed = true;
           const fmText = parts[1];
           body = parts.slice(2).join('---');
           const lines = fmText.split('\n');
@@ -4215,11 +4804,83 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
           if (updates.user_notes !== undefined) {
             body = upsertUserNotesSection(body, updates.user_notes);
           }
+
+          // Snapshot BEFORE the first structural edit. For a note that predates
+          // this feature the current content is the model's own output, because
+          // the note has never been editable - so a lazy capture here is still
+          // an accurate original.
+          if (structural && !readSnapshot(realPath)) {
+            try {
+              const before = parseMeetingMarkdown(raw, realPath);
+              captureSnapshot(
+                realPath,
+                {
+                  summary: before.summary,
+                  key_points: before.key_points,
+                  action_items: before.action_items,
+                  discussion_areas: before.discussion_areas,
+                  participants: before.participants,
+                },
+                'first_edit',
+              );
+            } catch (snapshotError) {
+              // note-snapshot's writes throw by design (a path it cannot derive
+              // a sidecar from must not be written to). That contract protects
+              // the note, and it must not also cost the user their edit: the
+              // sidecar is a diff base for later learning, the edit is the
+              // product. Log it and save anyway. The cost is that this note has
+              // no original to compare against, so a later regenerate cannot
+              // warn that it is about to discard edits (see the regenerate
+              // guard) - worth surfacing in the log, not worth refusing a save
+              // that would otherwise succeed.
+              console.error('Note snapshot capture failed (saving anyway):', snapshotError);
+            }
+          }
+
+          if (updates.summary !== undefined) {
+            body = setSummary(body, updates.summary);
+            changed.push('summary');
+          }
+          if (updates.discussion_areas !== undefined) {
+            body = setDiscussionAreas(body, updates.discussion_areas);
+            changed.push('discussion_areas');
+          }
+          if (updates.key_points !== undefined) {
+            body = setKeyPoints(body, updates.key_points);
+            changed.push('key_points');
+          }
+          if (updates.action_items !== undefined) {
+            body = setActionItems(body, updates.action_items);
+            changed.push('action_items');
+          }
+
           updatedRaw = `---${newLines.join('\n')}---${body}`;
         }
       }
 
-      fs.writeFileSync(realPath, updatedRaw, 'utf8');
+      // A content edit only reaches `body` inside the frontmatter block above.
+      // If we get here having been asked for one while that block was skipped,
+      // the note had no parsable frontmatter and the edit was silently dropped
+      // - report that instead of returning success over a file we did not
+      // change. This covers My notes as well as the generated sections: it is
+      // the autosaving editor, so it is the one that loses text unprompted.
+      if (bodyEdit && !frontmatterParsed) {
+        return { success: false, error: 'Note has no readable frontmatter; refusing to edit it.' };
+      }
+
+      // Atomic: a crash or a full disk mid-write must not leave a truncated
+      // note behind, and this write can now carry the summary itself.
+      writeFileAtomicSync(realPath, updatedRaw);
+      if (changed.length) {
+        try {
+          markEdited(realPath, changed);
+        } catch (snapshotError) {
+          // Same trade as the capture above: the note is already saved, so a
+          // sidecar bookkeeping failure must not turn a successful save into a
+          // reported failure.
+          console.error('Note snapshot update failed (note was saved):', snapshotError);
+        }
+      }
 
       // Title/notes edits fire no processing-complete, so mirror explicitly
       // (#413). A title change here drives the vault-file rename via the index.
@@ -4262,7 +4923,10 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
 
     return {
       success: true,
-      message: 'Meeting updated successfully'
+      message: 'Meeting updated successfully',
+      // Markdown notes only: which generated sections this call rewrote. Empty
+      // for a title/notes-only save and for the legacy .json format.
+      edited_fields: changed,
     };
   } catch (error) {
     console.error('Update meeting error:', error);
@@ -4347,8 +5011,9 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
 
     // --- Enumerate the ANCILLARY file set (unlinked only at commit), bound to
     // this note's STEM ONLY (never the renderer-supplied transcript_file /
-    // audio_file): the <stem>_reports.json sidecar and the stem-derived
-    // transcript + recording(s). Only the SUMMARY file itself is hidden.
+    // audio_file): the <stem>_reports.json and <stem>_original.json sidecars and
+    // the stem-derived transcript + recording(s). Only the SUMMARY file itself
+    // is hidden.
     //
     // Deliberately EXCLUDED: `<safeName>_notes.txt`. That draft-notes file is
     // named from the renderer-controlled session title, NOT the stem, so two
@@ -4356,18 +5021,27 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
     // permanently unlink another note's draft. It isn't safely bindable to this
     // note's identity, so we leave it orphaned (the fail-safe direction).
     const ancillaryCandidates = [];
-    // Reports sidecar: <stem>_summary.{md,json} -> <stem>_reports.json.
-    {
+    // Stem-derived sidecars: <stem>_summary.{md,json} -> <stem>_<suffix>.
+    //   _reports.json  - generated template reports (#249 backups included).
+    //   _original.json - the model's own output for this note (app/note-snapshot.js
+    //     and simple_recorder.py's _write_original_snapshot). It holds summary,
+    //     key_points, action_items, discussion_areas AND participants, i.e. the
+    //     substance of the meeting and who was in it. Leaving it behind would
+    //     mean a committed delete still leaves a readable copy of the meeting on
+    //     disk, with no UI that ever shows it - a privacy regression against the
+    //     local-first promise, not just untidiness. Same "unlinked only at
+    //     commit" semantics as the rest: an undo must restore a COMPLETE note.
+    for (const sidecarSuffix of ['_reports.json', '_original.json']) {
       let sidecarBase = null;
       for (const suf of ['_summary.md', '_summary.json']) {
         if (summaryBase.endsWith(suf)) {
-          sidecarBase = summaryBase.slice(0, -suf.length) + '_reports.json';
+          sidecarBase = summaryBase.slice(0, -suf.length) + sidecarSuffix;
           break;
         }
       }
       if (!sidecarBase) {
         const ext = path.extname(summaryBase);
-        sidecarBase = summaryBase.slice(0, summaryBase.length - ext.length) + '_reports.json';
+        sidecarBase = summaryBase.slice(0, summaryBase.length - ext.length) + sidecarSuffix;
       }
       ancillaryCandidates.push(path.join(outputDir, sidecarBase));
     }
@@ -4387,6 +5061,16 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
     // Deleting a person is its own explicit action in the Speakers panel.
     if (stem) {
       ancillaryCandidates.push(path.join(outputDir, `${stem}_speakers.json`));
+    }
+    // Imported transfer audio is bound to the same immutable summary stem.
+    // Enumerate only canonical track files, never paths from meeting JSON.
+    const transferMediaDir = transferMediaDirectory(outputDir, stem);
+    if (transferMediaDir) {
+      try {
+        for (const name of fs.readdirSync(transferMediaDir)) {
+          if (/^track-[1-9][0-9]*\.caf$/.test(name)) ancillaryCandidates.push(path.join(transferMediaDir, name));
+        }
+      } catch (_) { /* text-only package */ }
     }
     // Derive the transcript + recording from the summary stem (FACT A). A normal
     // .md note carries ONLY summary_file, so without this the transcript and the
@@ -4435,7 +5119,7 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
     // --- Twin edge (ANOMALOUS, FAIL-SAFE): a note names EXACTLY ONE
     // summary_file, and we hide only that one. If a stem somehow has BOTH
     // <stem>_summary.json AND <stem>_summary.md, hiding the named one leaves the
-    // other, and the `output/*_summary.{json,md}` scan keeps the note VISIBLE —
+    // other, and the `output/<stem>_summary.{json,md}` scan keeps the note VISIBLE —
     // so the delete under-hides (note REAPPEARS), never over-deletes: nothing is
     // lost. This is accepted deliberately: the app's own writers only ever
     // produce <stem>_summary.md (JSON summaries are legacy, read-only; reprocess
@@ -4467,7 +5151,9 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
         console.warn(`Skipping non-regular-file ancillary (not tracked): ${p}`);
         continue;
       }
-      if (!isAllowedMeetingSource(p, allowedBaseDirs)) {
+      const isTransferTrack = transferMediaDir && path.dirname(p) === transferMediaDir
+        && /^track-[1-9][0-9]*\.caf$/.test(path.basename(p));
+      if (!isTransferTrack && !isAllowedMeetingSource(p, allowedBaseDirs)) {
         console.warn(`Skipping ancillary outside allowed meeting folders (not tracked): ${p}`);
         continue;
       }
@@ -4539,6 +5225,7 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
       hiddenSummaryPath,
       canonicalSummary,
       ancillaryPaths,
+      transferMediaDir,
       deadline,
       state: 'pending',
       timer: null,
@@ -4654,6 +5341,10 @@ ipcMain.handle('get-queue-status', async () => {
           ? Math.floor((Date.now() - currentProcessingStartedAtMs) / 1000)
           : 0),
     sessionName: currentRecordingSessionName,
+    recordingId: systemAudioRecordingActive && recordingRuntimeState.startedAtMs
+      ? String(recordingRuntimeState.startedAtMs) : null,
+    chatSummaryFile: systemAudioRecordingActive
+      ? (currentRecordingAppendTarget || activeSysAudioSummaryFile) : null,
     // The note (summary-file realpath) an active continue/resume is recording
     // INTO, so the renderer can tell "recording this note" from "recording a
     // different one" by identity rather than by the (collidable) display name.
@@ -4786,10 +5477,8 @@ function spawnLiveTranscribe(sessionName) {
     liveTranscribeSessionName = null;
     liveTranscribeStdoutBuf = '';
   }
-  const aiEnv = getAiEnv();
-  const env = Object.keys(aiEnv).length > 0
-    ? { ...require('process').env, ...aiEnv }
-    : undefined;
+  const aiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
+  const env = getBackendEnv(aiEnv);
   parakeetLoadStartedAt = Date.now();
   liveTranscribeProcess = spawn(getBackendPath(), ['transcribe-stream'], {
     cwd: getBackendCwd(),
@@ -5060,7 +5749,8 @@ function loadTranscriptionEngine() {
     if (!fs.existsSync(cfgPath)) return 'parakeet';
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     const engine = cfg.transcription_engine;
-    return engine === 'whisper' ? 'whisper' : 'parakeet';
+    if (engine === 'whisper' || engine === 'openai-asr') return engine;
+    return 'parakeet';
   } catch (_) {
     return 'parakeet';
   }
@@ -5077,12 +5767,21 @@ function loadTranscriptionContext() {
       return { engine: 'parakeet', model: 'parakeet', language: 'auto' };
     }
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-    const engine = cfg.transcription_engine === 'whisper' ? 'whisper' : 'parakeet';
-    return {
-      engine,
+    const rawEngine = cfg.transcription_engine;
+    const engine = (rawEngine === 'whisper' || rawEngine === 'openai-asr') ? rawEngine : 'parakeet';
+    let model;
+    if (engine === 'whisper') {
+      model = sanitizeModelForAnalytics(cfg.whisper_model);
+    } else if (engine === 'openai-asr') {
+      model = sanitizeModelForAnalytics(cfg.openai_asr_model) || 'whisper-1';
+    } else {
       // Parakeet has no separate user-selectable model today (single bundled
       // default) -- report the engine name rather than guess a variant id.
-      model: engine === 'whisper' ? sanitizeModelForAnalytics(cfg.whisper_model) : 'parakeet',
+      model = 'parakeet';
+    }
+    return {
+      engine,
+      model,
       language: cfg.language || 'auto',
     };
   } catch (_) {
@@ -5335,6 +6034,7 @@ function markRecordingPaused() {
   }
   recordingRuntimeState.isPaused = true;
   recordingRuntimeState.pausedAtMs = Date.now();
+  updateTrayMenu(); // offers Resume Recording
 }
 
 function markRecordingResumed() {
@@ -5346,6 +6046,7 @@ function markRecordingResumed() {
   }
   recordingRuntimeState.isPaused = false;
   recordingRuntimeState.pausedAtMs = null;
+  updateTrayMenu();
 }
 
 function getRecordingElapsedSeconds() {
@@ -5391,9 +6092,11 @@ let systemSuspendedForWatchdogs = false;
 
 function makeInactivityWatchdog(proc, ms, label) {
   let timer = null;
+  let timedOut = false;
   const arm = () => {
     timer = setTimeout(() => {
       timer = null;
+      timedOut = true;
       activeInactivityWatchdogs.delete(watchdog);
       console.error(`${label} produced no output for ${Math.round(ms / 60000)} minutes, killing`);
       sendDebugLog(`${label} inactive for ${Math.round(ms / 60000)} minutes — killing process`);
@@ -5401,6 +6104,8 @@ function makeInactivityWatchdog(proc, ms, label) {
     }, ms);
   };
   const watchdog = {
+    // Retain the cause after clear(): close handlers need it after cleanup.
+    get timedOut() { return timedOut; },
     // Any stdout/stderr activity proves liveness — push the deadline out.
     reset() {
       if (timer === null) return; // fired, cleared, or frozen — don't re-arm
@@ -5486,8 +6191,10 @@ async function processNextInQueue() {
   let summarizationCompleted = false;
 
   try {
-    const queueAiEnv = getAiEnv();
-    const queueEnv = Object.keys(queueAiEnv).length > 0 ? { ...require('process').env, ...queueAiEnv } : undefined;
+    // process-streaming does BOTH transcription (needs the ASR key) and
+    // summarization (needs the AI env), so merge both.
+    const queueAiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
+    const queueEnv = getBackendEnv(queueAiEnv);
     const processArgs = ['process-streaming', currentProcessingJob.audioFile, '--name', currentProcessingJob.sessionName];
     if (currentProcessingJob.notesFile && fs.existsSync(currentProcessingJob.notesFile)) {
       processArgs.push('--notes', currentProcessingJob.notesFile);
@@ -5687,6 +6394,7 @@ async function processNextInQueue() {
                 mainWindow.webContents.send('processing-complete', {
                   success: true,
                   sessionName: sessionNameAtClose,
+                  summaryFile: savedSummaryFile || undefined,
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
@@ -5705,6 +6413,7 @@ async function processNextInQueue() {
                 mainWindow.webContents.send('processing-complete', {
                   success: true,
                   sessionName: sessionNameAtClose,
+                  summaryFile: savedSummaryFile || undefined,
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
@@ -6090,6 +6799,7 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     // retired, so there is no longer a mic-XOR-system fork here.
     sendDebugLog(`Starting renderer-driven recording (name ${String(actualSessionName || '').length} chars)`);
     currentRecordingSessionName = actualSessionName;
+    activeSysAudioSummaryFile = null;
     startRecordingRuntimeState();
     // Flip the active flag immediately so the queue handler reports
     // hasRecording=true on the very next poll, which is what cues the renderer
@@ -6239,6 +6949,9 @@ function showSleepPausedNotification() {
     // The Resume action button is always rendered by the custom toast (both
     // platforms); the click handler below covers a body tap as well.
     actions: [{ type: 'button', text: 'Resume' }],
+    // The user is usually away when this fires, so it must still be there when
+    // they come back; closeSleepPausedNotification() removes it (#412).
+    persistent: true,
   });
   const resume = () => {
     sleepPausedNotif = null;
@@ -6247,7 +6960,7 @@ function showSleepPausedNotification() {
       mainWindow.webContents.send('auto-resume-requested');
     }
   };
-  notif.on('action', (_evt, _index) => resume());
+  notif.on('action', () => resume());
   notif.on('click', resume);
   trackNotificationLifecycle(notif, 'sleep_paused');
   notif.show();
@@ -6404,7 +7117,18 @@ ipcMain.handle('startup-setup-check', async () => {
   }
 });
 
-async function runSpeakerModelCommand(command) {
+// Speaker-diarization engines the steno-diarize sidecar accepts. Mirrors
+// Config.VALID_DIARIZATION_ENGINES; checked here so a renderer-supplied value
+// can never reach the CLI argv as anything but a known engine name.
+const DIARIZATION_ENGINES = ['sortformer', 'nemotron3'];
+
+function isDiarizationEngine(value) {
+  return typeof value === 'string' && DIARIZATION_ENGINES.includes(value);
+}
+
+// `engine` (optional) targets that engine's models instead of the saved
+// setting -- Settings prepares a choice before persisting it.
+async function runSpeakerModelCommand(command, engine) {
   if (process.platform !== 'darwin') {
     return {
       success: false,
@@ -6412,13 +7136,20 @@ async function runSpeakerModelCommand(command) {
       error: 'Speaker diarization is unavailable on this system',
     };
   }
-  const output = await runPythonScript('simple_recorder.py', [command]);
+  const args = [command];
+  if (engine !== undefined && engine !== null) {
+    if (!isDiarizationEngine(engine)) {
+      return { success: false, ready: false, error: 'Unknown speaker detection engine' };
+    }
+    args.push('--engine', engine);
+  }
+  const output = await runPythonScript('simple_recorder.py', args);
   return parseSpeakerModelStatusOutput(output);
 }
 
-ipcMain.handle('speaker-model-status', async () => {
+ipcMain.handle('speaker-model-status', async (event, engine) => {
   try {
-    return await runSpeakerModelCommand('speaker-model-status');
+    return await runSpeakerModelCommand('speaker-model-status', engine);
   } catch {
     sendDebugLog('Speaker diarization model status check failed');
     return {
@@ -6429,22 +7160,34 @@ ipcMain.handle('speaker-model-status', async () => {
   }
 });
 
-ipcMain.handle('setup-speaker-models', async () => {
-  try {
-    sendDebugLog('Preparing local speaker diarization models...');
-    const result = await runSpeakerModelCommand('prepare-speaker-models');
-    if (result.success && result.ready) {
-      sendDebugLog('Speaker diarization models ready');
+// One shared download for onboarding and Settings; progress goes to the
+// renderer as 'speaker-models-progress' ({ percent, phase }).
+const prepareSpeakerModels = createSpeakerModelPreparer({
+  spawn,
+  getBackendPath,
+  getBackendCwd,
+  makeLineReader,
+  onLog: sendDebugLog,
+  platform: process.platform,
+  onProgress: (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('speaker-models-progress', progress);
     }
-    return result;
-  } catch {
-    sendDebugLog('Speaker diarization model setup failed');
-    return {
-      success: false,
-      ready: false,
-      error: 'Speaker diarization model setup failed',
-    };
+  },
+});
+
+// `engine` (optional) downloads that engine's models instead of the saved
+// setting's -- Settings prepares a choice before persisting it.
+ipcMain.handle('setup-speaker-models', async (event, engine) => {
+  if (engine !== undefined && engine !== null && !isDiarizationEngine(engine)) {
+    return { success: false, ready: false, error: 'Unknown speaker detection engine' };
   }
+  sendDebugLog('Preparing local speaker diarization models...');
+  const result = await prepareSpeakerModels(engine ?? undefined);
+  sendDebugLog(result.success && result.ready
+    ? 'Speaker diarization models ready'
+    : 'Speaker diarization model setup failed');
+  return result;
 });
 
 // ── Auto-updater ──
@@ -6506,7 +7249,7 @@ function gatherIdleInstallState() {
     isProcessing,
     queueLength: processingQueue.length,
     liveActive: liveTranscribeProcess != null,
-    streaming: activeQueryProcs.size > 0,
+    streaming: activeQueryProcs.size > 0 || contextQueries.size > 0,
     otherJobsActive: activeReprocessJobs.size > 0,
     idleSeconds: powerMonitor.getSystemIdleTime(),
     idleThresholdSeconds: IDLE_AUTO_INSTALL_THRESHOLD_SECONDS,
@@ -6736,12 +7479,14 @@ function setupAutoUpdater() {
     // download is still running forever, and About would show a stuck
     // progress bar with no way to tell it failed.
     pendingDownloadPercent = null;
-    // Until a release carrying this platform's update feed (latest.yml on
-    // Windows) is published, the updater 404s on the feed file. That's an
-    // expected transitional state, not a real failure — log it quietly so it
-    // doesn't read as a scary stack trace for alpha testers, and don't
-    // surface it to the renderer as an error.
-    if (/latest(-mac)?\.yml/i.test(msg) && /(404|cannot find)/i.test(msg)) {
+    // Until a release carrying this platform's update feed is published
+    // (latest.yml on Windows, latest-linux*.yml on Linux — which ships none
+    // at all today), the updater 404s on the feed file. That's an expected
+    // state, not a real failure — log it quietly so it doesn't read as a
+    // scary stack trace for alpha testers, and don't surface it to the
+    // renderer as an error. See isMissingUpdateFeedError for why the match
+    // is not spelled out inline any more.
+    if (isMissingUpdateFeedError(msg)) {
       sendDebugLog('Auto-updater: no update feed published for this release yet — skipping.');
       return;
     }
@@ -7053,11 +7798,14 @@ function showMeetingDetectedNotification(appName, originatingEvt, calEvent) {
     title: 'Meeting detected',
     body: calEvent?.title || appName,
     actions: [{ type: 'button', text: 'Take Notes' }],
+    // Only the latest detection is worth a tap; an older one waiting in the
+    // toast queue would offer to record a meeting that is already over.
+    tag: 'meeting-detected',
   });
   // Both the "Take Notes" button and the notification body start recording — one
   // action, so a single tap anywhere works.
   const trigger = () => requestAutoRecord(appName, originatingEvt, calEvent);
-  notif.on('action', (_evt, _index) => trigger()); // shown when banner style = Alerts
+  notif.on('action', () => trigger()); // shown when banner style = Alerts
   notif.on('click', () => trigger());              // body tap (always available)
   trackNotificationLifecycle(notif, 'meeting_detected');
   notif.show();
@@ -7072,6 +7820,15 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
   // app-detection string (e.g. "an app — 2026-06-01 17:00") to the user
   // whenever title regeneration produced nothing.
   const sessionName = calEvent?.title || 'Note';
+  // A tap on a detection toast that is still on screen after a recording has
+  // started must not re-point auto-stop at another app's meeting.
+  // currentRecordingSessionName also covers a brief capture flap, during which
+  // systemAudioRecordingActive reads false while the recording is still live.
+  if (currentRecordingProcess || systemAudioRecordingActive || currentRecordingSessionName) {
+    sendDebugLog('[auto-detect] record request ignored: a recording is already running');
+    exposeMainWindow();
+    return;
+  }
   sendDebugLog(`[auto-detect] user requested record (calendar-titled: ${calEvent?.title ? 'yes' : 'no'})`);
 
   // Track the originating app so we can pair its mic-stop with this recording
@@ -7625,28 +8382,29 @@ ipcMain.handle('setup-ollama-and-model', async () => {
 
 ipcMain.handle('setup-parakeet', async () => {
   try {
-    // Download Parakeet TDT v3 (~572 MB) via the bundled backend. Used by
-    // the Setup wizard's step 2 for fresh installs. Emits coarse stage
-    // lines (PARAKEET_PULL_STAGE:downloading / :loading) rather than
-    // byte-level progress — see src/parakeet_models.py for why.
+    // Download Parakeet TDT v3 via the bundled backend. Used by
+    // the Setup wizard. Structured progress distinguishes cache download
+    // from model initialisation.
     const backendPath = getBackendPath();
-    sendDebugLog('Downloading Parakeet TDT v3 (~572 MB)...');
+    sendDebugLog('Downloading Parakeet TDT v3...');
     sendDebugLog(`$ ${backendPath} download-parakeet-model`);
 
     return new Promise((resolve) => {
       const proc = spawn(backendPath, ['download-parakeet-model'], { stdio: 'pipe' });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
 
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { stage });
+              mainWindow.webContents.send('parakeet-pull-progress', progress);
             }
           } else {
             lastStdoutLine = trimmed;
@@ -7662,7 +8420,7 @@ ipcMain.handle('setup-parakeet', async () => {
       proc.on('close', (code) => {
         let parsed = null;
         try { parsed = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const ok = code === 0 && (!parsed || parsed.success !== false);
+        const ok = code === 0 && parsed?.success === true;
         if (ok) {
           sendDebugLog('Parakeet model ready');
           resolve({ success: true, message: 'Parakeet model ready' });
@@ -7989,6 +8747,83 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
   } catch (e) { return { success: false, error: e.message }; }
 });
 
+ipcMain.handle('get-diarization-engine', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-diarization-engine'], true);
+    const jsonData = JSON.parse(result.trim());
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// The CLI refuses to save a non-default engine whose models are not ready
+// (success: false, models_ready: false); the renderer prepares them first
+// via setup-speaker-models.
+ipcMain.handle('set-diarization-engine', async (event, engine) => {
+  if (!isDiarizationEngine(engine)) {
+    return { success: false, error: 'Unknown speaker detection engine' };
+  }
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-diarization-engine', engine]);
+    const jsonData = JSON.parse(result.trim());
+    if (jsonData.success) {
+      trackEvent('model_changed', { model: engine, kind: 'diarization_engine' });
+    }
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// OpenAI-compatible ASR: the NON-SECRET config (url/model) shells to the CLI
+// like set-cloud-api-url does. api_key_set is always overridden with the
+// safeStorage truth (hasOpenAiAsrKey) - the CLI only sees the env-var key,
+// which isn't injected on these calls, so its own api_key_set is unreliable.
+ipcMain.handle('get-openai-asr-config', async () => {
+  try {
+    await migrateLegacyOpenAiAsrApiKey();
+    const result = await runPythonScript('simple_recorder.py', ['get-openai-asr-config'], true);
+    const jsonData = JSON.parse(result.trim());
+    jsonData.api_key_set = hasOpenAiAsrKey();
+    return jsonData;
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+registerOpenAiAsrIpc({
+  ipcMain,
+  runPythonScript,
+  migrateLegacyOpenAiAsrApiKey,
+  hasOpenAiAsrKey,
+});
+
+// The SECRET key: stored encrypted via safeStorage (never argv, never
+// config.json), mirroring set-cloud-api-key. Passing an empty string clears it
+// (deletes the file).
+ipcMain.handle('set-openai-asr-key', async (_event, key) => {
+  try {
+    if (typeof key !== 'string') {
+      return { success: false, error: 'OpenAI ASR API key must be a string' };
+    }
+    if (!key) {
+      markOpenAiAsrKeyCleared();
+      // The durable marker already makes every encrypted/legacy copy
+      // ineffective. Retry plaintext removal now, while retaining the marker
+      // if the locked config write is temporarily unavailable.
+      await migrateLegacyOpenAiAsrApiKey();
+      return { success: true, api_key_set: false };
+    }
+    // Finish compare-and-delete cleanup before rotation, so a failed cleanup
+    // cannot report success with plaintext left behind or overwrite the new key.
+    if (!await migrateLegacyOpenAiAsrApiKey()) {
+      return { success: false, error: 'OpenAI ASR credential migration is incomplete' };
+    }
+    const origin = getOpenAiAsrEndpointOrigin();
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    const saved = saveOpenAiAsrKey(key, origin);
+    return {
+      success: saved,
+      api_key_set: saved && Boolean(loadOpenAiAsrKey(origin)),
+    };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
 ipcMain.handle('list-parakeet-models', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['list-parakeet-models'], true);
@@ -8138,8 +8973,7 @@ ipcMain.handle('pull-whisper-model', async (event, modelName) => {
 ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
   // Mirrors pull-whisper-model: settle-gate + SIGTERM-then-SIGKILL escalation
   // so a stalled HF download can never leave the renderer spinner hanging.
-  // Progress is coarse — we relay PARAKEET_PULL_STAGE:<stage> lines from the
-  // Python child rather than byte counts. See src/parakeet_models.py for why.
+  // Relay structured progress from the Python downloader.
   try {
     sendDebugLog(`Pulling Parakeet model: ${modelId || '<default>'}`);
     return new Promise((resolve) => {
@@ -8147,6 +8981,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       if (modelId) args.push(modelId);
       const proc = spawn(getBackendPath(), args, { cwd: getBackendCwd() });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
       let timedOut = false;
       let settled = false;
       let sigkillTimer = null;
@@ -8180,14 +9015,15 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       }, 30 * 60 * 1000);
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { model: modelId, stage });
+              mainWindow.webContents.send('parakeet-pull-progress', { ...progress, model: modelId });
             }
           } else {
             lastStdoutLine = trimmed;
@@ -8201,7 +9037,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       proc.on('close', (code) => {
         let pullResult = null;
         try { pullResult = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const succeeded = !timedOut && code === 0 && (!pullResult || pullResult.success !== false);
+        const succeeded = !timedOut && code === 0 && pullResult?.success === true;
         if (succeeded) {
           finishOnce(
             { success: true, model: modelId },
@@ -8281,16 +9117,20 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
 });
 
 // Fired by useSystemAudioCapture.ts when an enabled loopback acquisition
-// genuinely fails (for example, System Audio Recording permission is denied).
-// It is not fired when the user turns system audio off or the OS is unsupported.
-// Clicking it opens Settings via the same tray-open-settings event the tray
-// menu uses.
+// genuinely fails (for example, System Audio Recording permission is denied),
+// or when a live Linux capture dies mid-recording. It is not fired when the
+// user turns system audio off or the OS is unsupported. Clicking it opens
+// Settings via the same tray-open-settings event the tray menu uses.
 ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   try {
     if (!(await notificationsEnabled())) return { success: true, shown: false };
     const notif = new Notification({
       title: 'Recording mic-only',
-      body: 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.',
+      // The permissions hint is macOS-only; elsewhere there is no such setting
+      // to send the user to.
+      body: process.platform === 'darwin'
+        ? 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.'
+        : 'System audio could not be captured. Continuing with the microphone only.',
       iconType: 'alert',
     });
     notif.on('click', () => {
@@ -8308,6 +9148,34 @@ ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   }
 });
 
+// The mirror image (#517): no audio input device at all, so the recording runs
+// on system audio alone. Fired by useSystemAudioCapture.ts only once the
+// recorder is actually running; with no system audio either, the start fails
+// through recording-capture-error instead. Same notifications_enabled gate and
+// Settings click-through as the mic-only notice above.
+ipcMain.handle('show-system-audio-only-notification', async () => {
+  try {
+    if (!(await notificationsEnabled())) return { success: true, shown: false };
+    const notif = new Notification({
+      title: 'Recording system audio only',
+      body: "Steno couldn't find a microphone, so your own voice isn't being recorded.",
+      iconType: 'alert',
+    });
+    notif.on('click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        exposeMainWindow();
+        mainWindow.webContents.send('tray-open-settings');
+      }
+    });
+    trackNotificationLifecycle(notif, 'system_audio_only');
+    notif.show();
+    return { success: true, shown: true };
+  } catch (e) {
+    sendDebugLog(`Failed to show system-audio-only notification: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+});
+
 // Fired by the renderer's processing-complete handler when we skipped
 // auto-navigate (user was on a route other than /meetings/processing).
 // Clicking the banner is an explicit "take me there" from the user (unlike
@@ -8320,8 +9188,8 @@ async function showNoteReadyNotification(payload) {
   // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
   if (!(await notificationsEnabled())) return { success: true, shown: false };
   const { summaryFile } = payload || {};
-  const { title, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
-  const notif = new Notification({ title, body, iconType });
+  const { title, detail, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
+  const notif = new Notification({ title, detail, body, iconType });
   notif.on('click', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       exposeMainWindow();
@@ -8796,6 +9664,151 @@ function hasCloudApiKey() {
   return fs.existsSync(getCloudKeyPath());
 }
 
+// --- OpenAI-compatible ASR (transcription) API key -------------------------
+// Mirrors the cloud summariser key exactly: encrypted-at-rest via safeStorage,
+// stored under getUserDataDir() (honours STENOAI_USER_DATA_DIR test isolation),
+// never written to config.json, and injected into the TRANSCRIPTION subprocess
+// env as STENOAI_OAI_API_KEY. This is the security-critical difference from the
+// upstream PR, which persisted the key in plaintext config.json.
+function getOpenAiAsrKeyPath() {
+  return path.join(getUserDataDir(), '.openai-asr-api-key');
+}
+
+// Credentials belong to a network origin, not a configurable URL path. URL's
+// origin canonicalises scheme, hostname, and the effective port (including
+// default-port elision), so equivalent endpoints compare equal while a host,
+// scheme, or port change cannot reuse the old bearer token.
+function getOpenAiAsrEndpointOrigin() {
+  return readOpenAiAsrEndpointSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  })?.origin || null;
+}
+
+function isOpenAiAsrKeyCleared() {
+  return isEncryptedKeyCleared({ fs, keyPath: getOpenAiAsrKeyPath() });
+}
+
+function markOpenAiAsrKeyCleared() {
+  return markEncryptedKeyClearedAtomically({
+    fs,
+    path,
+    processId: process.pid,
+    now: Date.now(),
+    keyPath: getOpenAiAsrKeyPath(),
+  });
+}
+
+function saveOpenAiAsrKey(key, origin) {
+  try {
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    return saveEncryptedKeyAtomically({
+      fs,
+      path,
+      processId: process.pid,
+      now: Date.now(),
+      keyPath: getOpenAiAsrKeyPath(),
+      key,
+      origin,
+      safeStorage: getSafeStorage(),
+    });
+  } catch (error) {
+    console.error(error.message);
+    throw error;
+  }
+}
+
+function loadOpenAiAsrCredential(origin) {
+  try {
+    if (isOpenAiAsrKeyCleared()) return null;
+    if (!origin) return null;
+    const keyPath = getOpenAiAsrKeyPath();
+    migrateLegacyCredentialFile(keyPath, '.openai-asr-api-key');
+    const key = loadEncryptedKeyForOrigin({ fs, keyPath, origin, safeStorage: getSafeStorage() });
+    return key ? { key, origin } : null;
+  } catch (error) {
+    console.error('Failed to load OpenAI ASR API key:', error.message);
+    return null;
+  }
+}
+
+function loadOpenAiAsrKey(origin) {
+  return loadOpenAiAsrCredential(origin)?.key || null;
+}
+
+function hasOpenAiAsrKey() {
+  const origin = getOpenAiAsrEndpointOrigin();
+  return Boolean(origin && loadOpenAiAsrKey(origin));
+}
+
+function readLegacyOpenAiAsrCredential() {
+  const snapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  return snapshot === null ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE : snapshot.legacy;
+}
+
+function secureLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
+  if (!legacy || !legacy.key || !legacy.origin) return false;
+  const stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action !== 'secure') return action === 'remove-legacy' && Boolean(stored);
+  try {
+    // Do not remove config.json's value unless encrypt + decrypt both work.
+    return saveOpenAiAsrKey(legacy.key, legacy.origin)
+      && Boolean(loadOpenAiAsrKey(legacy.origin));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function migrateLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
+  if (!legacy) return true;
+  const removeLegacyKey = async () => {
+    try {
+      const raw = await runPythonScript(
+        'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
+        { STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy.snapshotDigest },
+      );
+      return JSON.parse(raw.trim()).success === true;
+    } catch (_) {
+      // A clear marker remains authoritative, or the encrypted copy is safe;
+      // either way the plaintext can be removed on a future retry.
+      return false;
+    }
+  };
+  // Invalid raw legacy values must never become encrypted credentials. They
+  // still have a raw-digest CAS snapshot, so remove only that exact stale
+  // plaintext instead of leaving it in config.json indefinitely.
+  if (!legacy.key || !legacy.origin) return removeLegacyKey();
+
+  let stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action === 'none') return false;
+  if (action === 'remove-legacy') return removeLegacyKey();
+  if (action === 'secure') {
+    try {
+      if (!saveOpenAiAsrKey(legacy.key, legacy.origin)) return false;
+      stored = loadOpenAiAsrKey(legacy.origin);
+      if (stored !== legacy.key) return false;
+    } catch (_) {
+      return false;
+    }
+  }
+  return removeLegacyKey();
+}
+
 // Build the env additions a Python AI-driven subprocess needs. Merges
 // the encrypted-on-disk cloud key (decrypted only here, never written
 // to the env if absent) AND the org adapter URL+JWT when a session
@@ -8810,6 +9823,43 @@ function getAiEnv() {
   if (session && session.adapterUrl && session.token && !isJwtExpired(session.token)) {
     env.STENOAI_ADAPTER_URL = session.adapterUrl;
     env.STENOAI_ADAPTER_TOKEN = session.token;
+  }
+  return env;
+}
+
+function getBackendEnv(extra = {}) {
+  return { ...withoutOpenAiAsrKey(require('process').env), ...extra };
+}
+
+// Env additions a transcription subprocess needs. Only when openai-asr is the
+// configured engine, decrypt its key from safeStorage and surface its
+// endpoint-bound credential snapshot to Python atomically.
+function getTranscriptionEnv() {
+  const env = {};
+  if (loadTranscriptionEngine() !== 'openai-asr') return env;
+  // A legacy plaintext key must be secured before this first cloud job. The
+  // deletion itself is async (via the locked Python config writer), but this
+  // sync path can safely use the encrypted copy immediately.
+  const configSnapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  // Endpoint, origin, and any legacy credential come from one direct config
+  // read. Do not let the asynchronous cleanup read a replacement endpoint.
+  const legacy = configSnapshot === null
+    ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE
+    : configSnapshot.legacy;
+  secureLegacyOpenAiAsrApiKey(legacy);
+  void migrateLegacyOpenAiAsrApiKey(legacy);
+  const endpoint = configSnapshot?.endpoint || null;
+  const credential = endpoint ? loadOpenAiAsrCredential(endpoint.origin) : null;
+  if (credential) {
+    env.STENOAI_OAI_API_KEY = credential.key;
+    env.STENOAI_OAI_API_ORIGIN = credential.origin;
+    // This WHATWG-canonical ASCII URL and the origin above come from one
+    // config snapshot. Python validates it again without re-reading a mutable
+    // endpoint while the bearer credential is in scope.
+    env.STENOAI_OAI_API_URL = endpoint.apiUrl;
   }
   return env;
 }
@@ -9418,6 +10468,66 @@ ipcMain.handle('close-system-audio-file', async () => {
   }
 });
 
+// Linux system-audio loopback — spawns pw-record and streams raw PCM to the
+// renderer instead of going through Chromium's capture path (see
+// ./linux-loopback.js for why). Module-level, like activeSysAudioWriteStream.
+let activeLinuxLoopback = null;
+
+// Serialises start/stop — see createSerialQueue in ./linux-loopback.js for why.
+const queueLinuxLoopback = createSerialQueue();
+
+ipcMain.handle('start-linux-loopback', () => queueLinuxLoopback(async () => {
+  try {
+    // Reclaim an unstopped prior capture, same as open-system-audio-file above
+    // — and not a rare race: a renderer reload remounts useSystemAudioCapture
+    // with a fresh activeRef, which restarts capture off main's still-
+    // 'recording' status. Leaving the old process running would feed the
+    // renderer's new subscription both streams interleaved, and stop-linux-
+    // loopback only knows the newer one.
+    if (activeLinuxLoopback) {
+      const prior = activeLinuxLoopback;
+      activeLinuxLoopback = null;
+      sendDebugLog('[linux-loopback] abandoning unstopped prior capture');
+      prior.stdout.removeAllListeners('data');
+      await prior.stop();
+    }
+    const capture = await startLoopbackCapture({
+      onError: (err) => sendDebugLog(`[linux-loopback] capture error: ${err.message}`),
+    });
+    const align = createFrameAligner(2 * capture.channels); // s16 = 2 bytes/sample
+    capture.stdout.on('data', (chunk) => {
+      const whole = align(chunk);
+      if (whole) mainWindow?.webContents.send('linux-loopback-chunk', whole);
+    });
+    capture.proc.on('exit', (code, signal) => {
+      // stop() clears the ref before killing, so reaching here still-referenced
+      // means pw-record died on its own. Tell the renderer — otherwise the
+      // recording continues with a dead system channel and no warning.
+      if (activeLinuxLoopback?.proc === capture.proc) {
+        sendDebugLog(`[linux-loopback] pw-record exited unexpectedly (code=${code}, signal=${signal})`);
+        activeLinuxLoopback = null;
+        mainWindow?.webContents.send('linux-loopback-ended', { code, signal });
+      }
+    });
+    activeLinuxLoopback = capture;
+    sendDebugLog(`[linux-loopback] capturing from ${capture.target}`);
+    return { success: true, sampleRate: capture.sampleRate, channels: capture.channels };
+  } catch (error) {
+    sendDebugLog(`[linux-loopback] start failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}));
+
+ipcMain.handle('stop-linux-loopback', () => queueLinuxLoopback(async () => {
+  const capture = activeLinuxLoopback;
+  activeLinuxLoopback = null;
+  if (!capture) return { success: true };
+  capture.stdout.removeAllListeners('data');
+  await capture.stop();
+  sendDebugLog('[linux-loopback] stopped');
+  return { success: true };
+}));
+
 // A failed renderer-side capture (mic permission denied, no audio device)
 // would otherwise be silent — the optimistic "recording" pill is dropped via
 // system-audio-recording-state, but the user gets no reason. Surface a native
@@ -9437,11 +10547,13 @@ function showRecordingFailedNotification(body) {
   }
 }
 
-ipcMain.on('recording-capture-error', (_event, message) => {
-  sendDebugLog(`[sysaudio] capture error: ${message}`);
-  showRecordingFailedNotification(
-    message ? `Recording couldn't start: ${message}` : "Recording couldn't start.",
-  );
+ipcMain.on('recording-capture-error', (_event, message, name, phase) => {
+  // The raw text stays in the debug log, where it is what a diagnosis needs —
+  // and ONLY there. What reaches the notification is prose built from the
+  // error's name and the caller's phase; see buildCaptureErrorBody for why the
+  // message itself is never consulted.
+  sendDebugLog(`[sysaudio] capture error (${phase || 'start'}): ${name ? `${name}: ` : ''}${message}`);
+  showRecordingFailedNotification(buildCaptureErrorBody({ name, phase }));
 });
 
 ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {
@@ -9759,7 +10871,7 @@ function getOllamaEnv() {
   } else {
     ollamaDir = path.join(__dirname, '..', 'bin');
   }
-  const env = { ...process.env };
+  const env = getBackendEnv();
   if (process.platform === 'darwin') {
     const existing = env.DYLD_LIBRARY_PATH || '';
     env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}:${existing}` : ollamaDir;
@@ -11513,6 +12625,9 @@ async function firePreMeetingNotification(event) {
     ? new Date(event.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : '';
   notif.payload.meeting_url = event.meeting_url;
+  // The calendar's own colour for the accent bar; the toast stays neutral
+  // without one (#412).
+  if (event.color) notif.payload.color = event.color;
   notif.payload.attendees = event.attendees
     ? event.attendees.map((a) => a.name || a.email).join(', ')
     : '';
@@ -11528,13 +12643,17 @@ async function firePreMeetingNotification(event) {
   // this 'close' fires, so reading the module-level var would attribute this
   // toast's dismissal to the NEXT toast's interaction flag — dropping or
   // duplicating the dismiss. The per-instance window keeps the flag correct.
+  let premeetingShown = false;
+  notif.once('show', () => {
+    premeetingShown = true;
+    trackEvent('notification_shown', { type: 'premeeting' });
+  });
   notif.on('close', () => {
-    if (!notif._window || !notif._window._analyticsInteracted) {
+    if (premeetingShown && (!notif._window || !notif._window._analyticsInteracted)) {
       trackEvent('notification_dismissed', { type: 'premeeting' });
     }
   });
   notif.show();
-  trackEvent('notification_shown', { type: 'premeeting' });
 
   // Mark fired only after we've actually shown it, so an unshowable notif
   // (no OS support) isn't permanently skipped by the scheduler's dedupe.
@@ -11546,24 +12665,33 @@ async function firePreMeetingNotification(event) {
 // Join/body tap, an action button, or the X). Flags _analyticsInteracted so the
 // pre-meeting path doesn't ALSO count a passive dismiss for the same toast, then
 // closes the window (which fires the notification's 'close' event).
-ipcMain.handle('close-notification-window', () => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+// Only the toast window itself may drive these; the sender check keeps another
+// renderer (the main window, a future one) from closing or clicking a toast.
+const fromToastWindow = (event) =>
+  notificationWindow && !notificationWindow.isDestroyed() &&
+  event.sender === notificationWindow.webContents;
+
+ipcMain.handle('close-notification-window', (event) => {
+  if (fromToastWindow(event)) {
     notificationWindow._analyticsInteracted = true;
     notificationWindow.close();
   }
 });
 
 // Renderer → main: an action button was tapped on the generic (non-pre-meeting)
-// toast. Re-emit as the notification's 'action' event (with the button index,
-// matching Electron's Notification 'action' signature) so the call site's
+// toast. Re-emit as the notification's 'action' event (the button index on
+// details.actionIndex, matching Electron's Notification 'action' event) so the call site's
 // existing `.on('action', ...)` handler + trackNotificationLifecycle both fire.
-ipcMain.on('notification-action-clicked', (_event, { actionId, notifId } = {}) => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+ipcMain.on('notification-action-clicked', (event, { actionId, notifId } = {}) => {
+  if (fromToastWindow(event)) {
     const notif = notificationWindow._activeCustomNotification;
     if (notif && notif.payload.id === notifId) {
-      notificationWindow._analyticsInteracted = true;
       const index = notif.payload.actions.findIndex((a) => a.id === actionId);
-      notif.emit('action', {}, index);
+      if (index === -1) return;
+      notificationWindow._analyticsInteracted = true;
+      // Electron 42 shape: the index lives on details.actionIndex; the old
+      // positional index argument is deprecated (#412).
+      notif.emit('action', { actionIndex: index });
     }
   }
 });
@@ -11571,8 +12699,8 @@ ipcMain.on('notification-action-clicked', (_event, { actionId, notifId } = {}) =
 // Renderer → main: the body of the generic toast was tapped. Re-emit as the
 // notification's 'click' event so the call site's `.on('click', ...)` handler +
 // trackNotificationLifecycle both fire.
-ipcMain.on('notification-body-clicked', (_event, { notifId } = {}) => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+ipcMain.on('notification-body-clicked', (event, { notifId } = {}) => {
+  if (fromToastWindow(event)) {
     const notif = notificationWindow._activeCustomNotification;
     if (notif && notif.payload.id === notifId) {
       notificationWindow._analyticsInteracted = true;

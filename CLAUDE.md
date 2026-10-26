@@ -46,8 +46,20 @@ For setup from a clean checkout, see `CONTRIBUTING.md` and `README.md`.
 Per-channel acoustic speaker diarization (splitting multiple speakers sharing
 one side of a call — e.g. two people around one mic, or multiple remote
 participants on system audio) runs through `bin/steno-diarize`, a Swift/
-CoreML sidecar (`diarize-sidecar/`) wrapping FluidAudio's Sortformer
-diarizer, invoked from Python (`src.transcriber._run_steno_diarize`) — never
+CoreML sidecar (`diarize-sidecar/`) wrapping FluidAudio's diarizers —
+Sortformer (default) or Nemotron 3, an 8-speaker streaming model (streaming
+preset via `STENOAI_DIARIZE_NEMOTRON_PRESET`, default `c128-split-w8a8`, the
+100%-ANE-resident split-graph build). The user picks the engine in
+Settings -> Transcribe ("Speaker detection"), persisted as the
+`diarization_engine` config key; `src.transcriber._steno_diarize_env()`
+turns it into the sidecar's `STENOAI_DIARIZE_ENGINE` for every invocation
+(`diarize`, `model-status`, `prepare-models`), and an already-set
+`STENOAI_DIARIZE_ENGINE` still wins as a developer override. Because
+meeting processing never downloads models, `set-diarization-engine` refuses
+a non-default engine until its models are ready; the renderer prepares them
+first via `prepare-speaker-models --engine nemotron3`. The stdout JSON contract is
+identical for both engines, so Python never branches on engine.
+Invoked from Python (`src.transcriber._run_steno_diarize`) — never
 from Electron, since the batch pipeline is entirely Python-orchestrated.
 Build it *before* `pyinstaller stenoai.spec`, same as `download-ollama.sh`:
 
@@ -68,6 +80,10 @@ never get acoustic diarization;
 
 FluidAudio models are prepared explicitly during macOS onboarding with
 `prepare-speaker-models` and checked without writes via `speaker-model-status`.
+FluidAudio 0.17 moved the Sortformer cache to `sortformer/v3/fp16/` (a
+rebuilt model set), so an install onboarded on an older build reads as
+missing until it re-downloads; Settings -> Speaker detection shows the saved
+engine's readiness and offers that Download, since nothing else will.
 Normal meeting processing never downloads or repairs these models: the Swift
 sidecar enables FluidAudio's offline-only mode before loading them and falls
 back to channel labels when the cache is unavailable. The cache lives below
@@ -128,7 +144,11 @@ overrides an agent's own test-level defaults.
     ASR, no real model), and the calendar/notifications pair `calendar-auth.t2`
     (auth-status from a local token file + auto-detect-meetings toggle) /
     `notifications.t2` (the notifications_enabled toggle gating the note-ready /
-    silence notifications via the `shown` signal), and the onboarding spec
+    silence notifications via the `shown` signal), `diarization-engine.t2` (the
+    Speaker detection setting: Sortformer default, a non-default engine refused
+    while its models are missing, IPC allowlist, and a pre-0.17 Sortformer
+    cache reading as missing on macOS; its UI half, the download-then-save
+    picker and the upgrade Download action, is `diarization-engine.t1`), and the onboarding spec
     `setup-check.t2` (the setup-wizard allGood + checks contract) (all model-free,
     run in `t2-macos` /
     `t2-windows`); `transcription-pipeline.t2` and `honest-failure.t2` (tagged
@@ -355,6 +375,19 @@ Releases are automated via `.github/workflows/build-release.yml`. Never create r
      - is vague about what actually broke ("Fixed an issue choosing X" → "Fixed an issue that could prevent choosing X").
    - Each bullet should read as one clear clause on first pass. If in doubt, read it aloud.
 4. **Bump version** in `app/package.json`.
+   - **Update the in-app What's new panel** in `app/renderer/src/lib/releaseHighlights.ts`
+     alongside the public changelog. Keep 2–4 short, user-facing highlights for
+     this release, with a working in-app destination for each. Remove the previous
+     release's highlights; the build binds this list to `app/package.json`'s version.
+     Reuse bundled logos where relevant (for example Anthropic/OpenAI for Agents),
+     and include a small local illustration or screenshot when it explains the feature.
+     Keep visuals optional, accessible, and readable in light and dark mode; do not
+     fetch release content or images on launch. For a maintenance release with no
+     highlights, use an empty list so no dialog is shown.
+   - Preview both themes and check: an upgrade shows the panel once when the app
+     is foregrounded and idle; dismissal survives restart; first-run setup and
+     recording are not interrupted; Settings → About can reopen it. Run
+     `npm run test:e2e -- --project=t1 whats-new.t1.spec.ts` from `app/`.
 5. **Commit and merge** the README + changelog + version bump to `main` (or push directly if explicitly authorised).
 6. **Draft release notes** as markdown — they become the GitHub Release body verbatim:
    - One-line summary at the top.
@@ -370,9 +403,9 @@ Releases are automated via `.github/workflows/build-release.yml`. Never create r
    ```
    (If using `-m` instead of `-F`, pass `--cleanup=whitespace` anyway — the comment-stripping default applies to both.)
 9. The tag push triggers the workflow which:
-   - Builds signed + notarized DMGs for both arm64 and x64
+   - Builds the signed + notarized macOS arm64 DMG and ZIP; the release workflow is Apple-Silicon-only
    - Creates a GitHub Release with the tag message as the body
-   - Uploads both DMGs as release assets
+   - Uploads the DMG, ZIP, stable download alias, and `latest-mac.yml` update manifest as release assets
    - Posts a release announcement to Discord (summary + a few headline features + the contributor thank-you), via the `Announce release on Discord` step (`scripts/discord-release-announce.mjs`). This is automatic and requires no manual Discord post. It no-ops unless the `DISCORD_WEBHOOK_URL` repo secret is set (an incoming webhook for the announcements channel), and is `continue-on-error` so a Discord hiccup never fails the release.
 10. Do NOT build DMGs locally for releases, do NOT use `gh release create` manually. Do NOT post the Discord release announcement by hand — the workflow does it.
 

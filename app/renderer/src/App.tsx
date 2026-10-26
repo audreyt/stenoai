@@ -5,6 +5,7 @@ import { Sandbox } from '@/routes/Sandbox';
 import { Settings } from '@/routes/Settings';
 import { Setup } from '@/routes/Setup';
 import { Chat } from '@/routes/Chat';
+import { Agents } from '@/routes/Agents';
 import { ChatConversation } from '@/routes/ChatConversation';
 import { StreamingProvider } from '@/hooks/useStreamingQuery';
 import { Home } from '@/routes/Home';
@@ -35,6 +36,19 @@ import { useCalendarEvents, useCalendarAuthBus } from '@/hooks/useCalendarEvents
 import { navigate, useRoute, rememberNonSettingsRoute } from '@/lib/router';
 import { ipc } from '@/lib/ipc';
 import { primeDebugLogs } from '@/lib/debugLogs';
+import { useMeetingTransferEvents } from '@/hooks/useMeetingTransfer';
+import { WhatsNewProvider } from '@/components/WhatsNew';
+
+async function hasInstalledTranscriptionModel() {
+  const [parakeet, whisper] = await Promise.all([
+    ipc().parakeetModels.status(),
+    ipc().whisperModels.list(),
+  ]);
+  return (parakeet.success && parakeet.installed === true) ||
+    (whisper.success && Object.values(whisper.supported_models ?? {}).some(
+      model => (model as { installed?: boolean }).installed === true,
+    ));
+}
 
 export function App() {
   useTheme();
@@ -102,6 +116,7 @@ export function App() {
   // Settings would otherwise each register their own pair and fire
   // invalidateQueries N times per auth event).
   useCalendarAuthBus();
+  useMeetingTransferEvents();
 
   // Track the last non-settings route so the sidebar Settings toggle and the
   // Settings page's Back button can return the user to where they came from
@@ -151,52 +166,66 @@ export function App() {
   // whisper-list read on-disk state (no running service needed), so it's a
   // reliable "needs setup" signal. We only redirect from a neutral landing
   // route and never while recording/processing, so we don't yank the user out
-  // of anything in flight. Runs once.
+  // of anything in flight. Check on every entry route so release announcements
+  // can wait for this decision even when the app opens directly into Settings.
   const didSetupGateRef = React.useRef(false);
+  const didSetupRedirectRef = React.useRef(false);
+  const [setupGateResolved, setSetupGateResolved] = React.useState(false);
+  const [initialSetup, setInitialSetup] = React.useState(false);
   React.useEffect(() => {
     if (didSetupGateRef.current) return;
     if (recording.isLoading) return;
-    const onNeutralRoute = route === '/' || route === '' || route === '/meetings';
-    const busy =
-      recording.status === 'recording' ||
-      recording.status === 'paused' ||
-      recording.status === 'processing';
-    if (!onNeutralRoute || busy) return;
     didSetupGateRef.current = true;
     (async () => {
       try {
-        const [parakeet, whisper] = await Promise.all([
-          ipc().parakeetModels.status(),
-          ipc().whisperModels.list(),
-        ]);
-        const parakeetInstalled = parakeet.success && parakeet.installed === true;
-        const anyWhisperInstalled =
-          whisper.success &&
-          Object.values(whisper.supported_models ?? {}).some(
-            (m) => (m as { installed?: boolean }).installed === true,
-          );
-        if (!parakeetInstalled && !anyWhisperInstalled) {
-          navigate('/setup');
+        if (!await hasInstalledTranscriptionModel()) {
+          setInitialSetup(true);
         }
       } catch {
         // Best-effort onboarding gate; never block the app on it.
+      } finally {
+        setSetupGateResolved(true);
       }
     })();
-  }, [recording.isLoading, recording.status, route]);
+  }, [recording.isLoading]);
+
+  React.useEffect(() => {
+    if (!setupGateResolved || !initialSetup || didSetupRedirectRef.current) return;
+    const onNeutralRoute = route === '/' || route === '' || route === '/meetings';
+    const busy = recording.isLoading || recording.status === 'recording' ||
+      recording.status === 'paused' || recording.status === 'processing';
+    if (!onNeutralRoute || busy) return;
+    let cancelled = false;
+    // A model may have been installed in Settings since the startup check.
+    // Revalidate at the point of navigation, and discard stale route replies.
+    void (async () => {
+      try {
+        const installed = await hasInstalledTranscriptionModel();
+        if (cancelled) return;
+        didSetupRedirectRef.current = true;
+        if (installed) setInitialSetup(false);
+        else navigate('/setup');
+      } catch {
+        // A failed check must not send a configured user back through setup.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [setupGateResolved, initialSetup, recording.isLoading, recording.status, route]);
 
   const isProcessingRoute = route === '/meetings/processing';
   // The /chat page has its own large composer, so the floating AskBar dock
   // would just stack a second redundant input below the same page. The
   // sub-route /chat/<id> (conversation view) also owns its own composer.
   // Note: no /recording exclusion — recording coexists with the app, and
-  // during it PrimaryDock renders the Ask bar disabled next to the pill.
+  // during it PrimaryDock renders the Ask bar next to the pill.
   const isChatRoute = route === '/chat' || route.startsWith('/chat/');
   // App-chrome routes where a chat composer never belongs. When idle the
-  // AskBar self-hides there anyway (no active meeting), but the disabled
-  // recording shell renders even without one — without this exclusion it
+  // AskBar self-hides there anyway (no active meeting), but the recording
+  // composer renders even without one — without this exclusion it
   // would float over Settings/Setup and block clicks in that band; the
   // pill docks alone there instead.
   const isChromeRoute =
+    route === '/agents' ||
     route === '/settings' ||
     route.startsWith('/settings?') ||
     route === '/setup' ||
@@ -207,6 +236,12 @@ export function App() {
     recording.status === 'recording' || recording.status === 'paused';
 
   return (
+    <WhatsNewProvider
+      onboarding={route === '/setup'}
+      initializeBaseline={initialSetup}
+      suppressed={!setupGateResolved || privacyNotice.isPending || showPrivacyModal}
+      blocked={recording.isLoading || recordingActive || recording.status === 'processing'}
+    >
     <CommandPaletteProvider>
       <CommandPaletteHotkey />
       <StreamingProvider>
@@ -218,18 +253,15 @@ export function App() {
 
         {/* Bottom dock — shared anchor across recording → processing → meeting.
             Recording is status-driven, not route-driven: PrimaryDock docks the
-            transcription pill next to a disabled Ask bar while a recording is
+            transcription pill next to the Ask bar while a recording is
             active (or swaps in the expanded LiveTranscriptBar), and falls back
             to the plain Ask bar when idle. Processing owns the slot on its
             route — UNLESS a new recording is active (back-to-back notes: note
             A processing while note B records); the recording's pill + Stop
             must stay reachable everywhere, so recording wins the slot. */}
         <BottomDockSlot>
-          {isProcessingRoute && !recordingActive ? (
-            <ProcessingDock />
-          ) : (
-            <PrimaryDock showAskBar={showAskBar} />
-          )}
+          {isProcessingRoute && !recordingActive && <ProcessingDock />}
+          <PrimaryDock showAskBar={showAskBar} />
         </BottomDockSlot>
 
         {/* Transcript — floats above the chat bar (only on real meeting routes).
@@ -258,6 +290,7 @@ export function App() {
       </AskBarProvider>
       </StreamingProvider>
     </CommandPaletteProvider>
+    </WhatsNewProvider>
   );
 }
 
@@ -303,6 +336,7 @@ function RouteView({ route }: { route: string }) {
   if (route === '/setup') return <Setup />;
   if (route === '/recording') return <Recording />;
   if (route === '/chat') return <Chat />;
+  if (route === '/agents') return <Agents />;
   if (route.startsWith('/chat/')) {
     const sessionId = safeDecode(route.slice('/chat/'.length));
     return <ChatConversation sessionId={sessionId} />;

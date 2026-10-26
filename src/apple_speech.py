@@ -53,6 +53,8 @@ def resolve_sidecar() -> Optional[str]:
 
 
 def _run(arguments: list[str], *, timeout: float) -> dict[str, Any]:
+    if not _is_supported():
+        raise RuntimeError("Apple on-device transcription is unavailable on this Mac.")
     sidecar = resolve_sidecar()
     if sidecar is None:
         raise RuntimeError("Apple on-device transcription is unavailable in this build.")
@@ -106,7 +108,7 @@ def _unavailable_status() -> dict[str, Any]:
 
 def status(language: str = "auto") -> dict[str, Any]:
     """Return availability, locale support, and system-asset state."""
-    if not _is_supported():
+    if not _is_supported() or resolve_sidecar() is None:
         return _unavailable_status()
     return _run(["status", language], timeout=15)
 

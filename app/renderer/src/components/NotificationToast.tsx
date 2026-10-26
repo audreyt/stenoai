@@ -15,6 +15,7 @@ interface NotificationAction {
 interface NotificationData {
   id?: string;
   title: string;
+  detail?: string;
   body?: string;
   time?: string;
   meeting_url?: string;
@@ -109,17 +110,11 @@ export function NotificationToast() {
     ipc().notification.close();
   };
 
-  const getEventColor = (title: string) => {
-    if (data.color) return data.color;
-    const colors = ['#10B981', '#3B82F6', '#8B5CF6', '#EC4899', '#F59E0B', '#EF4444', '#06B6D4'];
-    let hash = 0;
-    for (let i = 0; i < title.length; i++) {
-      hash = title.charCodeAt(i) + ((hash << 5) - hash);
-    }
-    return colors[Math.abs(hash) % colors.length];
-  };
-
-  const barColor = getEventColor(data.title);
+  // Only a calendar event's own colour means something here. Everything else
+  // used to get a colour hashed from its title, which read as meaningful and
+  // broke the paper + ink palette; it now gets the neutral ink bar (#412). The
+  // iconType tint already carries a toast's state.
+  const barColor = data.color;
   const iconMeta = notificationIconMeta(data.iconType);
 
   return (
@@ -154,12 +149,13 @@ export function NotificationToast() {
               <AppIcon size={20} color="currentColor" />
             </div>
             <div
-              className="h-8 w-1 rounded-full ml-2 shrink-0"
-              style={{ backgroundColor: barColor }}
+              data-testid="toast-accent-bar"
+              className={`h-8 w-1 rounded-full ml-2 shrink-0${barColor ? '' : ' bg-gray-300 dark:bg-white/20'}`}
+              style={barColor ? { backgroundColor: barColor } : undefined}
             ></div>
             <div className="flex flex-col justify-center ml-3 min-w-0">
               <span className="text-[14px] font-medium text-gray-900 tracking-tight leading-tight truncate max-w-[220px] dark:text-gray-100">
-                {data.title}
+                {[data.title, data.detail].filter(Boolean).join(' · ')}
               </span>
               {(data.body || data.time) && (
                 <span className="text-[12px] font-normal text-gray-500 leading-tight mt-0.5 truncate max-w-[220px] dark:text-gray-400">
@@ -187,7 +183,7 @@ export function NotificationToast() {
                 onClick={handleJoin}
                 className="flex items-center gap-2 rounded-[10px] border border-gray-200 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-900 transition-all hover:bg-gray-50 hover:shadow-sm active:bg-gray-100 active:scale-[0.98] shrink-0 dark:border-white/10 dark:bg-[#2C2C2E] dark:text-gray-100 dark:hover:bg-[#3C3C3E] dark:active:bg-[#1C1C1E]"
               >
-                <ProfessionalCameraIcon className="h-5 w-5" backgroundColor={barColor} />
+                <ProfessionalCameraIcon className="h-5 w-5" backgroundColor={barColor ?? '#1B1B19'} />
                 <span>Join &amp; take notes</span>
               </button>
             ) : null

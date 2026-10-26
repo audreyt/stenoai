@@ -65,6 +65,16 @@ ES_TEXT = (
     "personas empiecen a usarlo, porque esa es la parte que más me preocupa "
     "en este momento."
 )
+IT_TEXT = (
+    "Allora, la cosa principale che dobbiamo decidere oggi è se rilasciare il "
+    "nuovo flusso questa settimana o aspettare la prossima versione. Penso che "
+    "i dati che abbiamo dall'ultimo test sono buoni, ma ci sono ancora alcune "
+    "cose che potrebbero essere migliori prima di mandarlo a tutti gli utenti. "
+    "Cosa vorresti fare per la pagina dei prezzi? Possiamo anche parlare di "
+    "come il team gestirà il supporto quando più persone inizieranno a usarlo, "
+    "perché è la parte che mi preoccupa di più adesso."
+)
+
 NL_TEXT = (
     "Dus de vraag die we vandaag moeten beslissen is of we de nieuwe flow deze "
     "week gaan uitbrengen of wachten tot de volgende versie. Ik denk dat de "
@@ -118,6 +128,7 @@ class DetectTranscriptLanguageTests(unittest.TestCase):
             "fr": FR_TEXT,
             "de": DE_TEXT,
             "es": ES_TEXT,
+            "it": IT_TEXT,
             "nl": NL_TEXT,
             "pt": PT_TEXT,
             "ru": RU_TEXT,
@@ -125,6 +136,17 @@ class DetectTranscriptLanguageTests(unittest.TestCase):
         for expected, text in cases.items():
             with self.subTest(language=expected):
                 self.assertEqual(detect_transcript_language(text), expected)
+
+    def test_french_with_shared_italian_words_stays_french(self):
+        # "il", "ma" and "lui" are French too; they must not pull French
+        # below the lead threshold now that Italian is detected.
+        text = (
+            "Il dit que ma collègue lui répondra demain. Il veut que ma "
+            "proposition lui parvienne avant lundi. Il pense que ma réponse lui "
+            "suffira, mais je préfère que nous en parlions avec lui. Il veut que "
+            "ma collègue et moi préparions une autre proposition pour lui."
+        )
+        self.assertEqual(detect_transcript_language(text), "fr")
 
     def test_ignores_diarisation_markers_and_timestamps(self):
         # Markers ([You]/[Others]) and [HH:MM:SS] stamps must not derail the
@@ -158,10 +180,12 @@ class DetectTranscriptLanguageTests(unittest.TestCase):
 class ResolveOutputLanguagePriorityTests(unittest.TestCase):
     def test_pinned_config_wins_over_everything(self):
         # A concrete pin beats both an engine language and the transcript body.
-        self.assertEqual(
-            resolve_output_language("fr", detected_language="de", transcript_text=EN_TEXT),
-            "fr",
-        )
+        for language in ("fr", "it"):
+            with self.subTest(language=language):
+                self.assertEqual(
+                    resolve_output_language(language, detected_language="de", transcript_text=EN_TEXT),
+                    language,
+                )
 
     def test_engine_detected_wins_over_text_detection(self):
         # In auto mode a real engine language (Whisper) takes precedence over

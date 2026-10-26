@@ -35,6 +35,8 @@ export const COPY_ATTRIBUTES = [
   'aria-description',
   // This app's own copy-bearing component props
   'label',
+  'entryLabel',
+  'addLabel',
   'description',
   'hint',
   'heading',
@@ -79,6 +81,7 @@ export const I18N_GATE_RULE_IDS = [
 export const KNOWN_NON_COPY_ATTRIBUTES = [
   'className', // structure
   'descriptionId', // aria wiring, an id
+  'aria-labelledby', // references element ids; the referenced elements carry the copy
   'name', // form field / entity name
   'folderName', // user-entered data
   'meetingName', // user-entered data
@@ -225,6 +228,31 @@ const CSS_LIKE = [
   /^(-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg)?\s+)+-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg)?$/i, // "0 14px"
 ];
 
+/**
+ * One token of a composed CSS value once its function calls are collapsed: a length or
+ * number, an arithmetic operator, a border-style or sizing keyword, or the `{{…}}`
+ * placeholder a template-literal interpolation becomes in the inventory.
+ */
+const CSS_VALUE_TOKEN =
+  /^(?:-?\d*\.?\d+(?:px|rem|em|vh|vw|%|s|ms|deg|fr|ch)?|[+*\/-]|solid|dashed|dotted|none|auto|\{\{…\}\})$/;
+
+/**
+ * A composed CSS value such as `calc(var(--a) + var(--b))`, `minmax(0, 1fr) var(--x)` or
+ * `1px solid {{…}}`. CSS_LIKE only knows single, unnested calls and plain lengths, so
+ * these used to read as multi-word prose and land in the copy contract. They stay in the
+ * inventory, but in the uncertain partition: a style edit is not a copy change.
+ */
+function readsAsCssValue(text) {
+  if (!/[a-z-]+\(/i.test(text) && !/\d(?:px|rem|em|fr)\b/.test(text)) return false;
+  let rest = text;
+  let previous;
+  do {
+    previous = rest;
+    rest = rest.replace(/[a-z-]+\([^()]*\)/gi, ' 0 ');
+  } while (rest !== previous);
+  return rest.replace(/,/g, ' ').trim().split(/\s+/).every((token) => CSS_VALUE_TOKEN.test(token));
+}
+
 /** Storage units are technical tokens, not words a translator should move. */
 const STORAGE_UNIT = /^(?:B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$/;
 
@@ -299,6 +327,7 @@ export function readsAsCopy(text) {
   const trimmed = String(text ?? '').trim();
   if (definitelyNotCopy(trimmed)) return false;
   if (STORAGE_UNIT.test(trimmed)) return false;
+  if (readsAsCssValue(trimmed)) return false;
   const tokens = trimmed.split(/\s+/);
   // Some complete Tailwind lists survive the conservative reject list because variants
   // and arbitrary values obscure their utility prefixes. Keep them in the inventory's

@@ -1,3 +1,5 @@
+import { t } from '@/i18n';
+
 // Templated preset prompts surfaced two ways:
 //   1. Chip row at the bottom of the /chat entry page (always visible).
 //   2. Popover triggered by typing '/' as the first character in either
@@ -11,24 +13,59 @@ export interface ChatPreset {
 
 export const PRESETS: ChatPreset[] = [
   {
-    label: 'List recent todos',
-    prompt: 'List my action items from the last week.',
-    description: 'Pulls outstanding to-dos from recent meeting notes',
+    get label() {
+      return t('chat.presets.chartNotes.label');
+    },
+    get prompt() {
+      return t('chat.presets.chartNotes.prompt');
+    },
+    get description() {
+      return t('chat.presets.chartNotes.description');
+    },
   },
   {
-    label: 'Coach me',
-    prompt: 'Coach me on my recent meetings — patterns, blind spots, things to work on.',
-    description: 'Looks for patterns and suggests areas to improve',
+    get label() {
+      return t('chat.presets.recentTodos.label');
+    },
+    get prompt() {
+      return t('chat.presets.recentTodos.prompt');
+    },
+    get description() {
+      return t('chat.presets.recentTodos.description');
+    },
   },
   {
-    label: 'Write weekly recap',
-    prompt: 'Write a recap of this week based on my notes.',
-    description: 'Summary of the week across every meeting',
+    get label() {
+      return t('chat.presets.coach.label');
+    },
+    get prompt() {
+      return t('chat.presets.coach.prompt');
+    },
+    get description() {
+      return t('chat.presets.coach.description');
+    },
   },
   {
-    label: 'Blind spots',
-    prompt: 'What blind spots have come up across my recent meetings?',
-    description: 'Surfaces themes you may have missed',
+    get label() {
+      return t('chat.presets.weeklyRecap.label');
+    },
+    get prompt() {
+      return t('chat.presets.weeklyRecap.prompt');
+    },
+    get description() {
+      return t('chat.presets.weeklyRecap.description');
+    },
+  },
+  {
+    get label() {
+      return t('chat.presets.blindSpots.label');
+    },
+    get prompt() {
+      return t('chat.presets.blindSpots.prompt');
+    },
+    get description() {
+      return t('chat.presets.blindSpots.description');
+    },
   },
 ];
 

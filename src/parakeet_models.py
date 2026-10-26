@@ -9,7 +9,7 @@ between the MLX backend (mac) and the ONNX backend (Windows / Linux).
 The user-facing name and behaviour are the same on every platform;
 only the underlying HuggingFace repo (and thus the on-disk size +
 cache layout) differs. Sizes here reflect the int8-quantised ONNX
-encoder on Windows and the float16 MLX weights on mac.
+encoder on Windows and the published MLX snapshot on mac.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 SUPPORTED_PARAKEET_MODELS: dict[str, dict] = {
     DEFAULT_MODEL_ID: {
         "name": "Parakeet TDT v3",
-        "size": "670MB" if sys.platform != "darwin" else "572MB",
+        "size": "670MB" if sys.platform != "darwin" else "2.5GB",
         "description": (
             "Highest quality. Supports live transcription in English "
             "and 25 European languages — Spanish, French, German, "
@@ -174,31 +174,43 @@ def disable_implicit_hf_token() -> None:
 
 def download(
     model_id: str = DEFAULT_MODEL_ID,
-    progress_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> bool:
-    """Download (or no-op-load-from-cache) a Parakeet model snapshot.
+    """Fetch runtime files into the existing HF cache, then initialise the model.
 
-    ``progress_callback`` is invoked with stage strings — ``"downloading"``
-    at start and ``"loading"`` once the snapshot is on disk and we're
-    warming MLX weights. Returns True on success, False on any failure
-    (caller surfaces).
-
-    We delegate to ``src.parakeet.ensure_loaded`` so download caching and
-    HuggingFace hub interaction stay owned by the same module the live
-    pipeline imports — no risk of two divergent code paths fetching the
-    same snapshot.
+    Progress reports completed files and, where the installed hub API supports
+    it, bytes for the current file. When the Hub's metadata gives exact file
+    sizes it also reports ``downloaded_bytes`` / ``total_bytes`` -- a measured
+    percentage, never an estimate or ETA.
     """
     if model_id not in SUPPORTED_PARAKEET_MODELS:
         logger.error("Unknown Parakeet model: %s", model_id)
         return False
 
     try:
-        if progress_callback is not None:
-            progress_callback("downloading")
+        emit = progress_callback or (lambda event: None)
+        emit({"stage": "preparing"})
+        if not is_installed(model_id):
+            _download_snapshot(model_id, emit)
+        emit({"stage": "loading"})
         from src.parakeet import ensure_loaded
-        if progress_callback is not None:
-            progress_callback("loading")
-        ensure_loaded(model_id)
+        # The hub was imported during download. Setting HF_HUB_OFFLINE in
+        # the loader's environment is now too late for its import-time flag.
+        # This CLI operation must load the completed cache, not resolve main
+        # online again while the UI says the download has finished.
+        from huggingface_hub import constants
+        from huggingface_hub.utils import _http
+        reset_sessions = getattr(_http, "reset_sessions", lambda: None)
+        was_offline = constants.HF_HUB_OFFLINE
+        constants.HF_HUB_OFFLINE = True
+        try:
+            # requests-based hub releases cache the adapter at session creation.
+            reset_sessions()
+            ensure_loaded(model_id)
+        finally:
+            constants.HF_HUB_OFFLINE = was_offline
+            reset_sessions()
+        emit({"stage": "complete"})
         return True
     except Exception as e:
         # parakeet-mlx / onnx-asr fall back to treating the repo id as a local
@@ -220,3 +232,80 @@ def download(
         else:
             logger.error("Parakeet model download/load failed: %s", e)
         return False
+
+
+def _download_snapshot(model_id: str, emit: Callable[[dict], None]) -> None:
+    """Use HF's cache/resume/locking APIs, never a second model cache.
+
+    Older hub releases lack per-file tqdm injection: they still report actual
+    completed files. Newer releases expose byte callbacks for HTTP and Xet.
+    """
+    import inspect
+    from tqdm.auto import tqdm
+
+    disable_implicit_hf_token()
+    from huggingface_hub import hf_hub_download
+
+    files = _REQUIRED_SNAPSHOT_FILES[model_id]
+    supports_progress = "tqdm_class" in inspect.signature(hf_hub_download).parameters
+    # Pin the snapshot up front when the Hub says which one is current, so the
+    # sizes and the downloads describe the same files. Otherwise the first
+    # download resolves it, as before.
+    revision, sizes = _snapshot_file_sizes(model_id, files)
+    done_bytes = 0
+    for index, filename in enumerate(files):
+        base = {"stage": "downloading", "completed_files": index, "total_files": len(files)}
+        if sizes:
+            base.update(total_bytes=sum(sizes.values()), downloaded_bytes=done_bytes)
+        emit(base)
+
+        class DownloadProgress(tqdm):
+            def __init__(self, *args, **kwargs):
+                # Electron pipes stdout/stderr. Older hub versions otherwise
+                # disable tqdm (and its callbacks) when no terminal is attached.
+                kwargs.pop("name", None)
+                kwargs["disable"] = False
+                super().__init__(*args, **kwargs)
+
+            def display(self, *args, **kwargs):
+                # n includes resumed bytes; this is file progress, not network
+                # throughput. Avoid deriving speed or ETA from cached bytes.
+                if self.unit == "B":
+                    event = {**base, "file_bytes": self.n}
+                    if sizes:
+                        event["downloaded_bytes"] = done_bytes + min(self.n, sizes[filename])
+                    emit(event)
+
+        kwargs = {"tqdm_class": DownloadProgress} if supports_progress else {}
+        cached = hf_hub_download(model_id, filename, revision=revision, token=False, **kwargs)
+        # The first file resolves main and writes its cache ref. Pin subsequent
+        # files to that same snapshot so an upstream update cannot mix weights.
+        if revision is None:
+            revision = Path(cached).parent.name
+        finished = {**base, "completed_files": index + 1}
+        if sizes:
+            done_bytes += sizes[filename]
+            finished["downloaded_bytes"] = done_bytes
+        emit(finished)
+
+
+def _snapshot_file_sizes(
+    model_id: str, files: tuple[str, ...]
+) -> tuple[Optional[str], Optional[dict[str, int]]]:
+    """The current snapshot revision and the exact byte size of each file in
+    it, from the Hub's metadata, so progress can be a real percentage of the
+    total rather than an estimate. ``(None, None)`` when the metadata calls are
+    unavailable or fail -- progress then reports files and current-file bytes
+    only, as before."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        revision = api.model_info(model_id, token=False).sha
+        infos = api.get_paths_info(model_id, list(files), revision=revision, token=False)
+        sizes = {info.path: int(info.size) for info in infos}
+    except Exception as e:  # metadata is a nicety; never fail the download for it
+        logger.info("Parakeet download size lookup unavailable: %s", e)
+        return None, None
+    if not revision or set(sizes) != set(files) or any(size <= 0 for size in sizes.values()):
+        return None, None
+    return revision, sizes

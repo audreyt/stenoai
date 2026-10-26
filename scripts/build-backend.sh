@@ -44,6 +44,8 @@ fi
 # Install project dependencies
 echo "Installing project dependencies..."
 pip install -r requirements.txt
+# Ship the macOS 14 MLX builds, as the release does (#531).
+PYTHON=python3 "$SCRIPT_DIR/install-mlx-macos14.sh"
 echo ""
 
 # Clean previous builds
@@ -80,6 +82,12 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 python3 -m PyInstaller stenoai.spec --noconfirm
+
+# Same guard as the release and e2e workflows (#531): no bundled binary may need
+# a newer macOS than the app's minimum.
+if [ "$(uname -s)" = "Darwin" ]; then
+    python3 "$SCRIPT_DIR/verify_macos_minimum.py"
+fi
 
 # Check if build succeeded
 if [ -d "dist/stenoai" ]; then

@@ -657,7 +657,7 @@ Summary output language: {config.get_language_name(output_language)}
             "output_language": output_language,
             "speaker_clusters": speaker_clusters,
             "turn_manifest": turn_manifest,
-            # Fraction of transcription windows that came back usable, worst
+            # Fraction of audio read by usable transcription windows, worst
             # channel, or None where the backend does no windowing of its own.
             # None means "unknown", not "complete" -- see the live-transcript
             # fallback in process_streaming.
@@ -893,9 +893,6 @@ Summary output language: {config.get_language_name(output_language)}
                 print(f"TITLE:{session_name}", flush=True)
                 print(f"Auto-generated title: {session_name}")
 
-        # Step 4: Parse streamed markdown into structured JSON
-        parsed = self._parse_streamed_markdown(streamed_md)
-
         # Step 5: Save as .md (primary format for new meetings)
         summary_path = self.output_dir / f"{audio_path.stem}_summary.md"
         processed_at = datetime.now().isoformat()
@@ -921,6 +918,7 @@ Summary output language: {config.get_language_name(output_language)}
             md_lines.append('')
             md_lines.append(notes_text)
         _atomic_write_text(summary_path, '\n'.join(md_lines))
+        _write_original_snapshot(summary_path)
 
         # Persist the raw diarization clusters/embeddings this run already
         # computed (zero extra diarization cost -- see
@@ -957,6 +955,74 @@ Summary output language: {config.get_language_name(output_language)}
                 "summary_file": str(summary_path),
             }
         }
+
+
+def _write_original_snapshot(summary_path) -> None:
+    """Persist the model's own output next to a freshly written note.
+
+    The note file is rebuilt from scratch by reprocess, so the snapshot cannot
+    live inside it. It is the diff base the note editor needs in order to warn
+    before a regenerate discards user corrections, and it is best-effort: a
+    failure here must never fail a pipeline run that produced a good note.
+
+    This writer OVERWRITES an existing sidecar unconditionally, while the JS
+    writer (app/note-snapshot.js captureSnapshot) never does. That is one rule,
+    not two conventions: only the writer that just (re)generated the note's
+    content may replace its snapshot. The rule, the reasoning and its accepted
+    downgrade consequence are written down once, in the "WHO MAY OVERWRITE"
+    block at the top of app/note-snapshot.js.
+
+    Reads the note back from disk and parses it with `_parse_meeting_markdown`
+    (the mirror of app/main.js's parseMeetingMarkdown) rather than reusing a
+    streamed-markdown parse: `_parse_streamed_markdown` collapses whitespace
+    differently (joins the summary with spaces, strips each topic line), so
+    snapshotting its output would disagree with what the note editor itself
+    reads back from this same file - a spurious diff on every unedited note.
+    Parsing the just-written file is what makes the two agree by construction.
+    """
+    try:
+        summary_path = Path(summary_path)
+        str_path = str(summary_path)
+        suffix = '_summary.md'
+        # Anchored on the end of the path, matching app/note-snapshot.js's
+        # noteSnapshotPath. An unanchored str.replace() would silently derive
+        # the wrong sidecar path for a summary file that doesn't end in
+        # "_summary.md" (e.g. reprocess called on a bare ".md" file) and the
+        # write below would then land on - and destroy - the note itself
+        # instead of a sidecar next to it. Raise here instead: the except
+        # below turns it into a logged warning, never a note-destroying write.
+        if not str_path.endswith(suffix):
+            raise ValueError(
+                f"expected a path ending in '{suffix}', got: {str_path}"
+            )
+        snapshot_path = Path(str_path[: -len(suffix)] + '_original.json')
+        parsed = _parse_meeting_markdown(summary_path)
+        payload = {
+            'version': 1,
+            'captured_at': datetime.now().isoformat(),
+            'capture': 'generation',
+            'original': {
+                'summary': parsed.get('summary', ''),
+                'key_points': parsed.get('key_points', []),
+                'action_items': parsed.get('action_items', []),
+                'discussion_areas': parsed.get('discussion_areas', []),
+                'participants': parsed.get('participants', []),
+            },
+            # A regenerated note starts clean: its corrections were either
+            # confirmed as discarded by the user or never existed.
+            'edited_fields': [],
+            'edited_at': None,
+        }
+        # Atomic write (tempfile + os.replace): a plain write_text() truncates
+        # first, and a crash mid-write leaves a torn JSON file. That's worse
+        # than a transient bad read here - readSnapshot (app/note-snapshot.js)
+        # treats unparseable JSON as "absent", but captureSnapshot refuses to
+        # overwrite a FILE that already exists, so a torn sidecar permanently
+        # loses this note's diff base and silences the regenerate warning for
+        # it forever.
+        _atomic_write_json(snapshot_path, payload)
+    except Exception as exc:
+        logger.warning(f"Could not write original snapshot for {summary_path}: {exc}")
 
 
 def generate_default_template_report(summary_path, transcript, notes, language,
@@ -1017,7 +1083,7 @@ try:
 except ImportError:
     _SILENCE_SENTINEL = "No speech detected in audio"
 
-# Below this share of usable transcription windows a batch transcript stops
+# Below this share of audio read by usable windows, a batch transcript stops
 # being "the transcript" and the complete live transcript is the better
 # rescue. Deliberately low: a meeting that lost a window or two is still far
 # better than the streaming text, and swapping too eagerly is how the old
@@ -1035,7 +1101,7 @@ def _unusable_batch_reason(
     None when it can.
 
     Three ways it can't: the transcription crashed, it came back as exactly
-    the silence sentinel, or it lost more than half its transcription windows
+    the silence sentinel, or it lost more than half its audio
     (see _MIN_BATCH_WINDOW_COVERAGE). Deliberately NOT length -- a five-minute
     stand-up is allowed to be short, and an earlier length threshold here
     replaced correct transcripts because of it.
@@ -1051,11 +1117,28 @@ def _unusable_batch_reason(
     if batch_text.strip() == _SILENCE_SENTINEL:
         return "returned only silence"
     if window_coverage is not None and window_coverage < _MIN_BATCH_WINDOW_COVERAGE:
-        return f"covered only {window_coverage:.0%} of its transcription windows"
+        return f"read only {window_coverage:.0%} of the audio"
     return None
 
 
-def _append_segment_to_note(target: Path, new_text: str, duration_seconds):
+# The separator _append_segment_to_note writes between a note's recordings.
+_RESUMED_SEPARATOR_RE = re.compile(r'^--- Resumed\b.*---$', re.MULTILINE)
+
+
+def _parse_continued_recordings(frontmatter: str) -> list:
+    """The `continued_recordings` list from a .md note's raw frontmatter."""
+    for line in frontmatter.split('\n'):
+        if line.startswith('continued_recordings:'):
+            try:
+                value = json.loads(line.partition(':')[2].strip())
+            except ValueError:
+                return []
+            return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+    return []
+
+
+def _append_segment_to_note(target: Path, new_text: str, duration_seconds,
+                            recording_stem: Optional[str] = None):
     """Fold a continue-recording segment into an existing note.
 
     Appends `new_text` (with a resumed-at separator) to the note's Transcript
@@ -1063,6 +1146,10 @@ def _append_segment_to_note(target: Path, new_text: str, duration_seconds):
     "Regenerate notes"), and extends duration_seconds. Supports both note
     formats: .md (frontmatter surgery, summary body untouched) and legacy
     .json. `reprocess` clears the stale flag when it rewrites the note.
+
+    `recording_stem` (the continuation's recording filename stem) is added to
+    the note's `continued_recordings` list, so re-transcribe can find every
+    segment's audio: the note's own stem only matches the first recording.
     """
     if not target.exists():
         raise FileNotFoundError(f"append target not found: {target}")
@@ -1084,7 +1171,9 @@ def _append_segment_to_note(target: Path, new_text: str, duration_seconds):
             fm_lines = [
                 ln for ln in mid.strip().split('\n')
                 if not ln.startswith('notes_stale:')
+                and not ln.startswith('continued_recordings:')
             ]
+            continued = _parse_continued_recordings(mid)
             for i, ln in enumerate(fm_lines):
                 if ln.startswith('duration_seconds:'):
                     try:
@@ -1094,6 +1183,10 @@ def _append_segment_to_note(target: Path, new_text: str, duration_seconds):
                         pass
                     break
             fm_lines.append('notes_stale: true')
+            if recording_stem:
+                fm_lines.append(
+                    f'continued_recordings: {json.dumps(continued + [recording_stem])}'
+                )
             content = f"---\n{chr(10).join(fm_lines)}\n---{rest}"
         # (A .md note without frontmatter shouldn't exist; append-only below.)
 
@@ -1113,6 +1206,10 @@ def _append_segment_to_note(target: Path, new_text: str, duration_seconds):
         data['transcript'] = (data.get('transcript') or '').rstrip('\n') + segment
         si = data.setdefault('session_info', {})
         si['notes_stale'] = True
+        if recording_stem:
+            data['continued_recordings'] = (
+                list(data.get('continued_recordings') or []) + [recording_stem]
+            )
         if added_seconds and isinstance(si.get('duration_seconds'), int):
             si['duration_seconds'] += added_seconds
         _atomic_write_json(target, data)
@@ -1258,7 +1355,7 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
         # unusable (failed or silence sentinel). Any non-whitespace live content
         # is better than a silent failure — even a brief session deserves rescue.
         # Third case, added later: a batch that neither crashed nor returned
-        # silence, but lost most of its transcription windows. The onnx
+        # silence, but lost most of its audio. The onnx
         # backend skips a window whose recognize() raises on purpose, so one
         # bad window doesn't fail a meeting -- but the transcript then covers
         # less audio than the recording holds, and nothing said so. Such a
@@ -1375,6 +1472,7 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
                 Path(append_to),
                 segment_text,
                 duration_seconds,
+                recording_stem=Path(audio_file).stem,
             )
             audio_path = Path(audio_file)
             if not is_live_transcript and not _get_config().get_keep_recordings():
@@ -1513,9 +1611,6 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
         audio_path = Path(audio_file)
         summary_path = recorder.output_dir / f"{audio_path.stem}_summary.md"
 
-        # Parse the streamed markdown for title generation
-        parsed = MeetingPipeline._parse_streamed_markdown(streamed_md)
-
         # Save as .md only (primary format for new meetings)
         summary_path = summary_path.with_suffix('.md')
         processed_at = datetime.now().isoformat()
@@ -1549,6 +1644,7 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
             md_lines.append('')
             md_lines.append(notes_text)
         _atomic_write_text(summary_path, '\n'.join(md_lines))
+        _write_original_snapshot(summary_path)
 
         # Persist the raw diarization clusters/embeddings this run already
         # computed (zero extra diarization cost -- see
@@ -1707,6 +1803,51 @@ def prepare_apple_speech_cmd(language: str):
         print(json.dumps({"success": False, "error": str(e)}))
         sys.exit(1)
 
+@cli.command(name='get-diarization-engine')
+def get_diarization_engine_cmd():
+    """Get the macOS speaker-diarization engine ('sortformer' or 'nemotron3')."""
+    from src.config import get_config
+    config = get_config()
+    print(json.dumps({
+        "engine": config.get_diarization_engine(),
+        "valid_engines": list(config.VALID_DIARIZATION_ENGINES),
+    }))
+
+
+@cli.command(name='set-diarization-engine')
+@click.argument('engine')
+def set_diarization_engine_cmd(engine: str):
+    """Set the speaker-diarization engine. Used by Settings -> Transcribe.
+
+    Anything but the Sortformer default is only saved once its models are
+    ready: meeting processing never downloads models, so saving an engine
+    whose models are missing would silently degrade every later meeting to
+    channel-only "You"/"Others" labels.
+    """
+    from src.config import get_config
+    config = get_config()
+    if engine not in config.VALID_DIARIZATION_ENGINES:
+        print(json.dumps({
+            "success": False,
+            "error": f"Invalid engine: {engine}",
+            "valid_engines": list(config.VALID_DIARIZATION_ENGINES),
+        }))
+        return
+    if engine != "sortformer":
+        status = _run_speaker_model_command("model-status", timeout=15, engine=engine)
+        if not (status.get("success") and status.get("ready")):
+            print(json.dumps({
+                "success": False,
+                "models_ready": False,
+                "error": "The models for this speaker detection engine are not downloaded",
+            }))
+            return
+    if config.set_diarization_engine(engine):
+        print(json.dumps({"success": True, "engine": engine}))
+    else:
+        print(json.dumps({"success": False, "error": "Failed to persist setting"}))
+
+
 @cli.command(name='list-parakeet-models')
 def list_parakeet_models_cmd():
     """List Parakeet models with metadata + installed status (UI)."""
@@ -1730,6 +1871,99 @@ def parakeet_status_cmd():
         "model": DEFAULT_MODEL_ID,
         "installed": is_installed(DEFAULT_MODEL_ID),
     }))
+
+
+@cli.command(name='get-openai-asr-config')
+def get_openai_asr_config_cmd():
+    """Return the current OpenAI-compatible ASR endpoint config (non-secret)."""
+    from src.config import get_config
+    config = get_config()
+    print(json.dumps({
+        "success": True,
+        "api_url": config.get_openai_asr_api_url(),
+        # Never return the actual key. This reflects only whether the env-var
+        # key is present in THIS process; the Electron main process overrides
+        # it with its safeStorage-backed hasOpenAiAsrKey() check, which is the
+        # authoritative source of truth.
+        "api_key_set": bool(config.get_openai_asr_api_key()),
+        "model": config.get_openai_asr_model(),
+    }))
+
+
+@cli.command(name='set-openai-asr-config')
+@click.option('--api-url', default=None, help='Base URL of the OpenAI-compatible STT endpoint')
+@click.option('--model', default=None, help='Model name (e.g. whisper-1)')
+def set_openai_asr_config_cmd(api_url, model):
+    """Persist OpenAI-compatible ASR endpoint settings (url/model only).
+
+    The API key is intentionally NOT accepted here -- it is a credential and
+    is stored encrypted by the Electron main process (safeStorage), never
+    passed through argv or written to config.json. Omit an option to leave it
+    unchanged.
+    """
+    from src.config import get_config
+    config = get_config()
+    errors = []
+
+    # Every mutation needs an authoritative locked read. A model-only update
+    # must not turn an unreadable existing file into a defaults-based rewrite
+    # that drops a legacy key or unrelated settings.
+    if not config.begin_transaction(require_readable_disk=True):
+        errors.append("Failed to start config transaction")
+    else:
+        try:
+            if api_url is not None:
+                # This transaction has reloaded config.json while holding its
+                # cross-process lock. A legacy plaintext key added after the
+                # Electron migration must prevent an endpoint switch, because
+                # a later cleanup could otherwise bind it to the new origin.
+                if config.has_legacy_openai_asr_api_key():
+                    errors.append("Legacy ASR credential must be migrated before changing endpoint")
+                elif not config.set_openai_asr_api_url(api_url):
+                    errors.append("Failed to save api_url")
+            if model is not None:
+                if not config.set_openai_asr_model(model):
+                    errors.append("Failed to save model")
+
+            if errors:
+                config.rollback_transaction()
+            elif not config.commit_transaction():
+                errors.append("Failed to save config")
+        except Exception:
+            config.rollback_transaction()
+            raise
+
+    if errors:
+        print(json.dumps({"success": False, "error": "; ".join(errors)}))
+    else:
+        print(json.dumps({
+            "success": True,
+            "api_url": config.get_openai_asr_api_url(),
+            "api_key_set": bool(config.get_openai_asr_api_key()),
+            "model": config.get_openai_asr_model(),
+        }))
+
+
+@cli.command(name='remove-legacy-openai-asr-api-key')
+def remove_legacy_openai_asr_api_key_cmd():
+    """Remove a plaintext legacy ASR key after safeStorage migration.
+
+    The value is never accepted, printed, or logged by this CLI. Electron has
+    already encrypted and read it back before invoking this command. Its
+    SHA-256 snapshot digest reaches this command only through a targeted env
+    variable, so a concurrent replacement cannot be deleted by mistake.
+    """
+    import os
+
+    from src.config import get_config
+    config = get_config()
+    expected_snapshot_digest = os.environ.get(
+        "STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST", ""
+    )
+    if config.remove_legacy_openai_asr_api_key(expected_snapshot_digest):
+        print(json.dumps({"success": True}))
+    else:
+        print(json.dumps({"success": False, "error": "Legacy ASR key changed or was not removed"}))
 
 
 @cli.command(name='onnx-selftest')
@@ -1828,15 +2062,7 @@ def warmup_parakeet_cmd():
 @cli.command(name='download-parakeet-model')
 @click.argument('model_id', required=False)
 def download_parakeet_model_cmd(model_id):
-    """Download a Parakeet snapshot from HuggingFace.
-
-    Emits ``PARAKEET_PULL_STAGE:<stage>`` lines (parsed by main.js into a
-    parakeet-pull-progress IPC event) before the final JSON result. Stages
-    are coarse (``downloading`` / ``loading``) because the snapshot is
-    multiple files and threading byte-level progress through
-    huggingface_hub's tqdm isn't worth the wire complexity for a one-time
-    ~600 MB download.
-    """
+    """Download a snapshot, emitting structured progress before the result."""
     from src.parakeet_models import (
         DEFAULT_MODEL_ID,
         SUPPORTED_PARAKEET_MODELS,
@@ -1851,8 +2077,8 @@ def download_parakeet_model_cmd(model_id):
         print(json.dumps({"success": True, "model": target, "already_installed": True}))
         return
 
-    def emit(stage: str):
-        print(f"PARAKEET_PULL_STAGE:{stage}", flush=True)
+    def emit(progress: dict):
+        print("PARAKEET_PULL_PROGRESS:" + json.dumps(progress), flush=True)
 
     ok = download(target, emit)
     if ok:
@@ -3008,7 +3234,83 @@ def _parse_meeting_markdown(md_path):
         'diarised_text': sections.get('transcript', '') if meta.get('is_diarised') else None,
         'user_notes': sections.get('user notes'),
         'folders': meta.get('folders', []),
+        # Recording stems of continue-recording segments, in order (see
+        # _append_segment_to_note). Re-transcribe needs them to find every
+        # segment's audio.
+        'continued_recordings': (
+            meta['continued_recordings']
+            if isinstance(meta.get('continued_recordings'), list) else []
+        ),
     }
+
+
+def _single_line(text: str) -> str:
+    """Collapse any run of whitespace (including newlines/carriage returns) in
+    a single participant name or action item down to one space, so one entry
+    can only ever render as one `- ` line. Without this, a value containing
+    its own blank line and text (e.g. "Alice\\n\\nACTION ITEMS:\\n- ...")
+    would land in the assembled context looking like a second, forged section
+    header rather than one list entry.
+    """
+    return ' '.join(text.split())
+
+
+def _build_meeting_chat_context_parts(meeting_data: dict) -> list[str]:
+    """Assemble the labelled sections sent to the model for single-meeting
+    chat (the `query` / `query-streaming` commands), in the same order the
+    note itself lays them out: summary, participants, key topics, key
+    points, action items, transcript. Editing any of these sections in the
+    note editor changes what the chat sees, because both read from the same
+    parsed meeting_data dict.
+
+    A section with nothing to say is omitted entirely rather than emitting
+    an empty heading - that would waste context on a local model's small
+    window and invite it to invent content to fill the gap.
+    """
+    parts = []
+    if meeting_data.get('summary'):
+        parts.append(f"SUMMARY:\n{meeting_data['summary']}")
+    if meeting_data.get('participants'):
+        names = '\n'.join(f"- {_single_line(p)}" for p in meeting_data['participants'])
+        parts.append(f"PARTICIPANTS:\n{names}")
+    if meeting_data.get('discussion_areas'):
+        topics = '\n'.join(f"- {d['title']}: {d['analysis']}" for d in meeting_data['discussion_areas'])
+        parts.append(f"KEY TOPICS:\n{topics}")
+    if meeting_data.get('key_points'):
+        points = '\n'.join(f"- {p}" for p in meeting_data['key_points'])
+        parts.append(f"KEY POINTS:\n{points}")
+    if meeting_data.get('action_items'):
+        items = '\n'.join(f"- {_single_line(a)}" for a in meeting_data['action_items'])
+        parts.append(f"ACTION ITEMS:\n{items}")
+    if meeting_data.get('transcript'):
+        parts.append(f"TRANSCRIPT:\n{meeting_data['transcript']}")
+    return parts
+
+def _has_transfer_audio(summary_file, stem, receipt):
+    """Only report retained tracks in this meeting's own non-symlink media tree."""
+    if not isinstance(receipt, dict) or not re.fullmatch(
+        r"transfer_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", stem
+    ):
+        return False
+    tracks = receipt.get("audio")
+    if receipt.get("mediaDirectory") != stem or not isinstance(tracks, list) or len(tracks) > 15:
+        return False
+    try:
+        root = summary_file.parent.resolve() / ".meeting-transfer"
+        media = root / stem
+        for directory in (root, media):
+            if directory.is_symlink() or not directory.is_dir() or directory.resolve() != directory:
+                return False
+        for index, track in enumerate(tracks, 1):
+            name = f"track-{index}.caf"
+            if not isinstance(track, dict) or track.get("name") != name:
+                continue
+            candidate = media / name
+            if not candidate.is_symlink() and candidate.is_file() and candidate.stat().st_size > 0:
+                return True
+    except OSError:
+        pass
+    return False
 
 
 @cli.command()
@@ -3098,6 +3400,7 @@ def list_meetings():
     # Single-pass: read each file once, extract sort key and data together
     for summary_file, stem in summaries:
         try:
+            transfer_receipt = None
             if summary_file.suffix == '.md':
                 parsed = _parse_meeting_markdown(summary_file)
                 sort_key = parsed.get('session_info', {}).get('processed_at', '')
@@ -3112,6 +3415,7 @@ def list_meetings():
             else:
                 with open(summary_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                    transfer_receipt = data.get("steno_transfer")
                     sort_key = data.get('session_info', {}).get('processed_at', '')
                     essential_meeting = {
                         "session_info": data.get("session_info", {}),
@@ -3132,7 +3436,9 @@ def list_meetings():
             # future re-diarization) is silently unavailable without it,
             # with nothing in the list saying so until you open the note
             # and find the action missing.
-            essential_meeting['has_audio'] = stem in audio_stems
+            essential_meeting['has_audio'] = stem in audio_stems or _has_transfer_audio(
+                summary_file, stem, transfer_receipt
+            )
             meetings.append((sort_key, essential_meeting))
         except Exception as e:
             logger.warning(f"Failed to load {summary_file}: {e}")
@@ -3187,13 +3493,29 @@ def reprocess(summary_file, regenerate_title, retranscribe):
             if stem.endswith('_summary'):
                 stem = stem[:-len('_summary')]
             recording = _find_recording_for_stem(recorder.recordings_dir, stem)
-            if recording is None:
+            # A continued note (continue-recording) spans several recordings:
+            # the note's stem names only the first, the rest are listed in
+            # continued_recordings. Every segment is re-transcribed, or the
+            # rewrite below would replace the whole transcript with the first
+            # segment's and drop the rest.
+            continued_stems = existing_data.get('continued_recordings') or []
+            continued = [
+                _find_recording_for_stem(recorder.recordings_dir, s)
+                for s in continued_stems
+            ]
+            old_separators = _RESUMED_SEPARATOR_RE.findall(existing_data.get('transcript') or '')
+            # More separators than listed segments means a segment appended
+            # before continued_recordings existed: its audio can't be found,
+            # so refuse rather than drop that part of the transcript.
+            if len(old_separators) > len(continued_stems):
+                print("STREAM_ERROR:RETRANSCRIBE_UNLINKED_SEGMENTS", flush=True)
+                sys.exit(1)
+            if recording is None or None in continued:
                 # Distinct marker so the renderer surfaces "recording no longer
                 # available" rather than a generic failure — nothing is written.
                 print("STREAM_ERROR:RETRANSCRIBE_NO_AUDIO", flush=True)
                 sys.exit(1)
 
-            print(f"Re-transcribing recording: {recording.name}", flush=True)
             # Keep the Electron inactivity watchdog alive across ASR using the
             # backend's REAL per-chunk progress signal — the same mechanism
             # process-streaming uses (not the capped summary heartbeat, which
@@ -3211,32 +3533,50 @@ def reprocess(summary_file, regenerate_title, retranscribe):
                 sys.stdout.write(f"HEARTBEAT:transcribe:{done}/{total}\n")
                 sys.stdout.flush()
 
-            print("HEARTBEAT:transcribe:start", flush=True)
-            set_chunk_heartbeat(_transcribe_heartbeat)
-            try:
-                transcribe_result = asyncio.run(
-                    recorder.transcribe_audio(str(recording), session_name)
-                )
-            finally:
-                set_chunk_heartbeat(None)
+            results = []
+            for segment_recording in [recording] + continued:
+                print(f"Re-transcribing recording: {segment_recording.name}", flush=True)
+                print("HEARTBEAT:transcribe:start", flush=True)
+                set_chunk_heartbeat(_transcribe_heartbeat)
+                try:
+                    segment_result = asyncio.run(
+                        recorder.transcribe_audio(str(segment_recording), session_name)
+                    )
+                finally:
+                    set_chunk_heartbeat(None)
 
-            if transcribe_result.get("transcription_failed"):
-                err_msg = str(
-                    transcribe_result.get("error") or "transcription failed"
-                ).replace('\n', ' ').replace('\r', ' ')
-                print(f"STREAM_ERROR:{err_msg}", flush=True)
-                sys.exit(1)
+                if segment_result.get("transcription_failed"):
+                    err_msg = str(
+                        segment_result.get("error") or "transcription failed"
+                    ).replace('\n', ' ').replace('\r', ' ')
+                    print(f"STREAM_ERROR:{err_msg}", flush=True)
+                    sys.exit(1)
+                results.append(segment_result)
+            transcribe_result = results[0]
 
             # Mirror process_streaming's `## Transcript` content exactly:
             # diarised text when diarisation ran, else the flat transcript.
-            fresh_transcript = (
-                transcribe_result.get("diarised_text")
-                or transcribe_result.get("transcript_text")
-                or ""
-            )
+            def _segment_text(result):
+                return result.get("diarised_text") or result.get("transcript_text") or ""
+
+            fresh_transcript = _segment_text(transcribe_result)
+            # Rejoin continued segments the way _append_segment_to_note joined
+            # them, keeping their original "Resumed HH:MM" separators. Every
+            # segment keeps its place, even one that now comes back silent:
+            # dropping it would silently delete a part of the meeting the note
+            # already had, and would leave fewer separators than listed
+            # recordings for the next re-transcribe. A silent part reads as the
+            # silence sentinel, as a silent first recording already does.
+            segment_texts = [_segment_text(r).strip() or _SILENCE_SENTINEL for r in results[1:]]
+            if len(old_separators) != len(segment_texts):
+                old_separators = ["--- Resumed ---"] * len(segment_texts)
+            for separator, text in zip(old_separators, segment_texts):
+                fresh_transcript = f"{fresh_transcript.rstrip()}\n\n{separator}\n\n{text}"
             existing_data['transcript'] = fresh_transcript
             existing_data['is_diarised'] = transcribe_result.get("is_diarised", False)
-            existing_data['diarised_text'] = transcribe_result.get("diarised_text")
+            existing_data['diarised_text'] = (
+                fresh_transcript if existing_data['is_diarised'] else None
+            )
             # Refresh language provenance from the NEW transcribe result — the
             # transcript changed, so the persisted configured/detected/output
             # values no longer describe it. resolve_persisted_output_language
@@ -3272,6 +3612,11 @@ def reprocess(summary_file, regenerate_title, retranscribe):
             # get_data_dirs()["output"] and nowhere else, so a sidecar
             # beside a summary living anywhere else would be written and
             # then never found by anything.
+            #
+            # Only the first segment's clusters go to the sidecar: the
+            # continue-recording path never wrote a continued segment's
+            # clusters either, so the Speakers panel keeps describing the
+            # same part of the meeting it did before.
             from src.config import get_data_dirs as _get_data_dirs
             _persist_speaker_sidecar(_get_data_dirs()["output"], stem, transcribe_result)
 
@@ -3395,10 +3740,10 @@ def reprocess(summary_file, regenerate_title, retranscribe):
         if summary_path.suffix == '.md':
             session_name = existing_data.get('session_info', {}).get('name', 'Reprocessed')
             md_lines = ['---']
-            # This rebuild intentionally omits notes_generated: reprocessing a
-            # transcript-only note (#258) generates the summary, so the rewritten
-            # frontmatter naturally flips the meeting out of the "no notes yet"
-            # state. The state-flip is intended, not an accidental key drop.
+            # This rebuild intentionally omits notes_generated and notes_stale:
+            # reprocessing generates a current summary, so the rewritten
+            # frontmatter naturally flips the meeting out of both "no notes yet"
+            # and "notes are stale" states.
             md_meta = {
                 'title': session_name,
                 'date': existing_data.get('session_info', {}).get('processed_at', datetime.now().isoformat()),
@@ -3419,6 +3764,10 @@ def reprocess(summary_file, regenerate_title, retranscribe):
             # "only set when true, never explicit false" pattern used elsewhere.
             if existing_data.get('session_info', {}).get('is_live_transcript'):
                 md_meta['is_live_transcript'] = True
+            # Keep the continued segments' recordings findable for a later
+            # re-transcribe; only written for a continued note.
+            if existing_data.get('continued_recordings'):
+                md_meta['continued_recordings'] = existing_data['continued_recordings']
             for k, v in md_meta.items():
                 if v is None:
                     md_lines.append(f'{k}: null')
@@ -3445,6 +3794,7 @@ def reprocess(summary_file, regenerate_title, retranscribe):
                 md_lines.append('')
                 md_lines.append(notes_text)
             _atomic_write_text(summary_path, '\n'.join(md_lines))
+            _write_original_snapshot(summary_path)
         else:
             # JSON format: parse streamed markdown into structured fields
             parsed = recorder._parse_streamed_markdown(streamed_md)
@@ -3455,13 +3805,13 @@ def reprocess(summary_file, regenerate_title, retranscribe):
                 "key_points": parsed.get("key_points", []) or [],
                 "action_items": parsed.get("action_items", []) or [],
             })
-            # The regenerated summary now covers the full (possibly appended)
-            # transcript — clear the continue-recording stale marker. The .md
-            # branch clears it implicitly by omitting it from the rebuilt
-            # frontmatter (see the intentional-omission note above).
-            existing_data.get("session_info", {}).pop("notes_stale", None)
-            with open(summary_path, 'w') as f:
-                json.dump(existing_data, f, indent=2)
+            # The regenerated summary now covers the full transcript. Clear both
+            # cues that tell the UI to offer Generate notes; the .md branch does
+            # the same by omitting them from its rebuilt frontmatter.
+            session_info = existing_data.get("session_info", {})
+            session_info.pop("notes_generated", None)
+            session_info.pop("notes_stale", None)
+            _atomic_write_text(summary_path, json.dumps(existing_data, indent=2))
 
         # Signal completion only AFTER the note file is fully written. The
         # renderer reads the note the instant it sees STREAM_COMPLETE, so
@@ -3564,6 +3914,17 @@ def full_reprocess(meeting_stem, audio_file_override):
         existing_data = _parse_meeting_markdown(md_path)
     else:
         print(json.dumps({"success": False, "error": f"No summary found for meeting {meeting_stem!r}"}))
+        sys.exit(1)
+
+    # This maintenance command rebuilds from an owned recording and may delete
+    # its source. Transfer tracks instead belong to an immutable import receipt;
+    # do not hand one to that pipeline or replace its metadata with a new note.
+    if existing_data.get("steno_transfer") is not None:
+        print(json.dumps({
+            "success": False,
+            "error": "full-reprocess is not supported for imported Steno packages. "
+                     "Use reprocess to regenerate notes from the saved transcript.",
+        }))
         sys.exit(1)
 
     if audio_file_override:
@@ -3908,19 +4269,10 @@ def query(transcript_file, question):
         try:
             meeting_data = _parse_meeting_markdown(transcript_path)
             raw_transcript = meeting_data.get('transcript', '')
-            # Build rich context: summary + key points + transcript
-            parts = []
-            if meeting_data.get('summary'):
-                parts.append(f"SUMMARY:\n{meeting_data['summary']}")
-            if meeting_data.get('discussion_areas'):
-                topics = '\n'.join(f"- {d['title']}: {d['analysis']}" for d in meeting_data['discussion_areas'])
-                parts.append(f"KEY TOPICS:\n{topics}")
-            if meeting_data.get('key_points'):
-                points = '\n'.join(f"- {p}" for p in meeting_data['key_points'])
-                parts.append(f"KEY POINTS:\n{points}")
-            if raw_transcript:
-                parts.append(f"TRANSCRIPT:\n{raw_transcript}")
-            transcript_text = '\n\n'.join(parts)
+            # Build rich context: summary + participants + key topics + key
+            # points + action items + transcript (see
+            # _build_meeting_chat_context_parts for the shared assembly logic).
+            transcript_text = '\n\n'.join(_build_meeting_chat_context_parts(meeting_data))
             detect_text = raw_transcript
             session_info = meeting_data.get("session_info", {})
         except Exception as e:
@@ -4006,18 +4358,10 @@ def query_streaming(transcript_file, question):
             return
         try:
             meeting_data = _parse_meeting_markdown(transcript_path)
-            parts = []
-            if meeting_data.get('summary'):
-                parts.append(f"SUMMARY:\n{meeting_data['summary']}")
-            if meeting_data.get('discussion_areas'):
-                topics = '\n'.join(f"- {d['title']}: {d['analysis']}" for d in meeting_data['discussion_areas'])
-                parts.append(f"KEY TOPICS:\n{topics}")
-            if meeting_data.get('key_points'):
-                points = '\n'.join(f"- {p}" for p in meeting_data['key_points'])
-                parts.append(f"KEY POINTS:\n{points}")
-            if meeting_data.get('transcript'):
-                parts.append(f"TRANSCRIPT:\n{meeting_data['transcript']}")
-            transcript_text = '\n\n'.join(parts)
+            # Same shared assembly as `query` (see
+            # _build_meeting_chat_context_parts): summary + participants + key
+            # topics + key points + action items + transcript.
+            transcript_text = '\n\n'.join(_build_meeting_chat_context_parts(meeting_data))
             detect_text = meeting_data.get('transcript', '')
             session_info = meeting_data.get("session_info", {})
         except Exception as e:
@@ -4070,23 +4414,10 @@ def _chat_corpus_char_budget(ai_provider: str, model: str) -> int:
     return 400_000
 
 
-@cli.command(name='chat-global-streaming')
-@click.option('--question', '-q', required=True, help='Question to ask across notes')
-@click.option('--folder', '-f', default=None, help='Folder ID to scope the corpus to (default: all notes)')
-def chat_global_streaming(question, folder):
-    """Cross-note chat: gather meeting title + summary + key points, feed as
-    context to the configured LLM, stream the answer. Optionally scope to a
-    single folder; default queries every note.
-
-    Works with every provider — cloud / org adapter / local / remote Ollama.
-    The assembled corpus is capped to the active model's context window
-    (model-aware budget below), so a local model with a smaller window simply
-    answers over fewer (most-recent) notes rather than overflowing. We don't
-    have retrieval (RAG) yet, so older notes beyond the budget are omitted."""
-    import sys
-    import base64
-    from pathlib import Path
+def _build_chat_corpus(folder=None, budget=None):
+    """Bounded saved-note context, shared by global and recording-time chat."""
     from src.config import get_config, get_data_dirs
+    from src.reports import _item_text
 
     config = get_config()
     dirs = get_data_dirs()
@@ -4124,15 +4455,12 @@ def chat_global_streaming(question, folder):
         ]
 
     if not summaries:
-        if folder and folder != 'all':
-            print("CHAT_STREAM_ERROR:No notes in this folder yet. Pick another or remove the filter.", flush=True)
-        else:
-            print("CHAT_STREAM_ERROR:No notes found yet. Record a meeting first.", flush=True)
-        return
+        return ""
 
     # Most-recent first so the model weights newer context higher when token
-    # budget is tight. Each block is kept compact (title + summary + key
-    # points + action items) — full transcripts would blow even a 200k window.
+    # budget is tight. Each block is kept compact (title + summary +
+    # participants + key points + action items) - full transcripts would blow
+    # even a 200k window.
     def sort_key(item):
         _, data = item
         return data.get("session_info", {}).get("processed_at") or ""
@@ -4141,7 +4469,7 @@ def chat_global_streaming(question, folder):
 
     # Cap the assembled corpus so a user with hundreds of meetings can't blow
     # past the active model's context window (see _chat_corpus_char_budget).
-    CORPUS_CHAR_BUDGET = _chat_corpus_char_budget(
+    CORPUS_CHAR_BUDGET = budget if budget is not None else _chat_corpus_char_budget(
         config.get_ai_provider(), config.get_model()
     )
     blocks = []
@@ -4152,15 +4480,37 @@ def chat_global_streaming(question, folder):
         name = info.get("name") or "Untitled"
         date = (info.get("processed_at") or "")[:10]
         summary = (data.get("summary") or "").strip()
+        participants = data.get("participants") or []
         key_points = data.get("key_points") or []
         action_items = data.get("action_items") or []
         block = [f"## {name}" + (f" — {date}" if date else "")]
         if summary:
             block.append(summary)
+        # _item_text before _single_line on every list entry. Legacy `.json`
+        # notes are read here with a raw json.load, so an entry can be a dict
+        # ({'name': ...}, {'decision': ...}, {'description': ..., 'owner': ...})
+        # rather than a string - the same shapes src/reports.py and the note
+        # view already normalise. _item_text renders the dict's text (and
+        # str()s anything else), so _single_line always receives a str.
+        #
+        # _single_line then collapses embedded newlines: an entry carrying its
+        # own newlines would otherwise render as several lines here, and one of
+        # them can look like a forged "Action items:" label or a "## " block
+        # header for the NEXT meeting. The single-meeting builder
+        # (_build_meeting_chat_context_parts) does the same for participants
+        # and action items; it does not collapse key points, which only matters
+        # in this corpus because blocks here are separated by "## " headings.
+        # The entries are editable in the note editor, so this is reachable
+        # without any adversary.
+        if participants:
+            block.append("Participants:\n" + "\n".join(
+                f"- {_single_line(_item_text(p, 'name', 'text'))}" for p in participants))
         if key_points:
-            block.append("Key points:\n" + "\n".join(f"- {p}" for p in key_points))
+            block.append("Key points:\n" + "\n".join(
+                f"- {_single_line(_item_text(p, 'decision', 'point', 'text'))}" for p in key_points))
         if action_items:
-            block.append("Action items:\n" + "\n".join(f"- {a}" for a in action_items))
+            block.append("Action items:\n" + "\n".join(
+                f"- {_single_line(_item_text(a, 'description', 'text'))}" for a in action_items))
         block_text = "\n".join(block)
         # +5 accounts for the "\n\n---\n\n" separator added later.
         if used_chars + len(block_text) + 5 > CORPUS_CHAR_BUDGET:
@@ -4186,6 +4536,34 @@ def chat_global_streaming(question, folder):
             " to pull it in directly._"
         )
 
+    return corpus
+
+
+@cli.command(name='chat-global-streaming')
+@click.option('--question', '-q', required=True, help='Question to ask across notes')
+@click.option('--folder', '-f', default=None, help='Folder ID to scope the corpus to (default: all notes)')
+def chat_global_streaming(question, folder):
+    """Cross-note chat: gather meeting title + summary + participants + key
+    points + action items, feed as context to the configured LLM, stream the
+    answer. Optionally scope to a single folder; default queries every note.
+
+    Works with every provider — cloud / org adapter / local / remote Ollama.
+    The assembled corpus is capped to the active model's context window
+    (model-aware budget below), so a local model with a smaller window simply
+    answers over fewer (most-recent) notes rather than overflowing. We don't
+    have retrieval (RAG) yet, so older notes beyond the budget are omitted."""
+    import sys
+    import base64
+    from src.config import get_config
+
+    config = get_config()
+    corpus = _build_chat_corpus(folder)
+    if not corpus:
+        error = ("No notes in this folder yet. Pick another or remove the filter."
+                 if folder and folder != 'all' else "No notes found yet. Record a meeting first.")
+        print(f"CHAT_STREAM_ERROR:{error}", flush=True)
+        return
+
     language = config.get_language()
     if language == "auto":
         language = "en"
@@ -4199,6 +4577,13 @@ def chat_global_streaming(question, folder):
         print("CHAT_STREAM_COMPLETE", flush=True)
     except Exception as e:
         print(f"CHAT_STREAM_ERROR:{e}", flush=True)
+
+
+@cli.command(name='chat-context-streaming')
+def chat_context_streaming():
+    """Chat over explicit context. Content travels over bounded stdin, never argv."""
+    from src.chat_query import run_chat_query
+    run_chat_query(_parse_meeting_markdown, _build_chat_corpus, resolve_persisted_output_language)
 
 
 @cli.command()
@@ -4275,15 +4660,86 @@ def clear_state():
         print("SUCCESS: No state file found - already clear")
 
 
-def _run_speaker_model_command(command: str, timeout: int) -> dict:
+_SPEAKER_PROGRESS_PREFIX = "STENO_PROGRESS "
+_SPEAKER_PROGRESS_PHASES = {"listing", "downloading", "compiling"}
+
+
+def _parse_speaker_progress_line(line: str) -> Optional[dict]:
+    """Validate one sidecar ``STENO_PROGRESS {json}`` stderr line.
+
+    Only a whole percent and a known phase name are passed on; any other
+    stderr text (CoreML diagnostics, error detail) is dropped here so it never
+    reaches the renderer.
+    """
+    if not line.startswith(_SPEAKER_PROGRESS_PREFIX):
+        return None
+    try:
+        event = json.loads(line[len(_SPEAKER_PROGRESS_PREFIX):])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    percent, phase = event.get("percent"), event.get("phase")
+    if not isinstance(percent, int) or isinstance(percent, bool) or not 0 <= percent <= 100:
+        return None
+    if not isinstance(phase, str) or phase not in _SPEAKER_PROGRESS_PHASES:
+        return None
+    return {"percent": percent, "phase": phase}
+
+
+def _run_sidecar_with_progress(args: list, timeout: int, on_progress, env=None):
+    """Like ``subprocess.run(capture_output=True)`` but relays progress lines
+    from stderr to ``on_progress`` while the sidecar runs."""
+    import subprocess
+    import threading
+
+    stdout_chunks: list = []
+    stderr_lines: list = []
+    with subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    ) as proc:
+        def pump_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                event = _parse_speaker_progress_line(line.strip())
+                if event is not None:
+                    on_progress(event)
+
+        # Both pipes drain on threads so wait() below enforces the timeout
+        # even if the sidecar hangs with its pipes open.
+        pumps = [
+            threading.Thread(target=pump_stderr, daemon=True),
+            threading.Thread(target=lambda: stdout_chunks.append(proc.stdout.read()), daemon=True),
+        ]
+        for pump in pumps:
+            pump.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+        finally:
+            for pump in pumps:
+                pump.join(timeout=5)
+    return subprocess.CompletedProcess(args, proc.returncode, "".join(stdout_chunks), "".join(stderr_lines))
+
+
+def _run_speaker_model_command(
+    command: str, timeout: int, engine: Optional[str] = None, on_progress=None
+) -> dict:
     """Run a non-audio command on the macOS diarization sidecar.
 
     The sidecar is the single authority for its FluidAudio cache layout. Keep
     this wrapper deliberately narrow and return only validated JSON so stderr
-    from model loaders never crosses the renderer IPC boundary.
+    from model loaders never crosses the renderer IPC boundary. With
+    ``on_progress``, validated download progress is relayed as it arrives.
+
+    ``engine`` targets a specific diarization engine's models (Settings
+    preparing a choice before it is saved); unset uses the saved setting, the
+    same engine meeting processing will run.
     """
     import subprocess
-    from src.transcriber import _resolve_steno_diarize
+    from src.transcriber import _resolve_steno_diarize, _steno_diarize_env
 
     binary = _resolve_steno_diarize()
     if not binary:
@@ -4293,13 +4749,18 @@ def _run_speaker_model_command(command: str, timeout: int) -> dict:
             "error": "Speaker diarization is unavailable on this system",
         }
     try:
-        result = subprocess.run(
-            [binary, command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        env = _steno_diarize_env(engine=engine)
+        if on_progress is None:
+            result = subprocess.run(
+                [binary, command],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        else:
+            result = _run_sidecar_with_progress([binary, command], timeout, on_progress, env=env)
     except (OSError, subprocess.TimeoutExpired):
         logger.warning("Speaker diarization model command could not complete")
         return {
@@ -4346,16 +4807,35 @@ def _run_speaker_model_command(command: str, timeout: int) -> dict:
     return {"success": True, **payload}
 
 
+_DIARIZATION_ENGINE_OPTION = click.option(
+    "--engine",
+    type=click.Choice(["sortformer", "nemotron3"]),
+    default=None,
+    help="Diarization engine whose models to target (default: the saved setting).",
+)
+
+
 @cli.command(name="speaker-model-status")
-def speaker_model_status():
+@_DIARIZATION_ENGINE_OPTION
+def speaker_model_status(engine: Optional[str]):
     """Report whether the local speaker-diarization models are ready."""
-    print(json.dumps(_run_speaker_model_command("model-status", timeout=15)))
+    print(json.dumps(_run_speaker_model_command("model-status", timeout=15, engine=engine)))
 
 
 @cli.command(name="prepare-speaker-models")
-def prepare_speaker_models():
-    """Download and compile the macOS speaker-diarization models."""
-    payload = _run_speaker_model_command("prepare-models", timeout=60 * 60)
+@_DIARIZATION_ENGINE_OPTION
+def prepare_speaker_models(engine: Optional[str]):
+    """Download and compile the macOS speaker-diarization models.
+
+    Prints ``SPEAKER_MODELS_PROGRESS:{"percent": n, "phase": ...}`` lines while
+    it runs (main.js relays them to the UI), then the JSON status last.
+    """
+    def relay(event):
+        print(f"SPEAKER_MODELS_PROGRESS:{json.dumps(event)}", flush=True)
+
+    payload = _run_speaker_model_command(
+        "prepare-models", timeout=60 * 60, engine=engine, on_progress=relay
+    )
     print(json.dumps(payload))
     if not payload.get("success") or not payload.get("ready"):
         sys.exit(1)
@@ -9566,6 +10046,9 @@ def spike_parakeet_cmd():
                 err=True,
             )
             sys.exit(2)
+    # The spike imports parakeet_mlx directly; the bundle has no librosa.
+    from src._mel import install_librosa_shim
+    install_librosa_shim()
     sys.exit(spike_main())
 
 

@@ -76,24 +76,6 @@ private struct CollectedTranscript {
     let segments: [TranscriptSegment]
 }
 
-private let lexicalCharacterSet: CharacterSet = {
-    var set = CharacterSet.letters
-    set.formUnion(.decimalDigits)
-    return set
-}()
-
-private func hasLexicalContent(_ text: String) -> Bool {
-    for scalar in text.unicodeScalars {
-        if CharacterSet.whitespacesAndNewlines.contains(scalar) {
-            continue
-        }
-        if lexicalCharacterSet.contains(scalar) {
-            return true
-        }
-    }
-    return false
-}
-
 private actor LineEmitter {
     func emit(_ line: String) {
         guard let data = (line + "\n").data(using: .utf8) else { return }

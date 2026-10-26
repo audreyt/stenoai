@@ -37,6 +37,8 @@ if SPECPATH not in sys.path:
     sys.path.insert(0, SPECPATH)
 
 from scripts.sidecar_bundle_guard import require_macos_sidecar
+from scripts.diarize_bundle_guard import require_diarize_sidecar
+from scripts.verify_ollama_gpu_bundle import should_prune_ollama_gpu_path
 
 # Apple Silicon uses parakeet-mlx for ASR; Windows / Linux use onnx-asr via
 # ONNX Runtime. The two backends live in src/_parakeet_{mlx,onnx}.py and
@@ -80,11 +82,6 @@ hiddenimports = [
 
     # HuggingFace hub (both ASR backends pull weights through this)
     'huggingface_hub',
-
-    # ONNX Runtime — runs the bundled Silero VAD model directly on every
-    # platform; runs the Parakeet weights too on Windows / Linux via onnx-asr.
-    'onnxruntime',
-    'onnxruntime.capi',
 
     # Audio processing
     'sounddevice',
@@ -140,8 +137,12 @@ else:
     # onnx-asr (ASR via ONNX Runtime) — Windows / Linux. The package is laid
     # out so the top-level `onnx_asr` import pulls everything user-facing;
     # collect_submodules below catches the lazily-imported model adapters.
+    # ONNX Runtime also runs the Silero VAD model here. macOS runs Silero in
+    # numpy instead (src/silero_vad.py) and bundles no onnxruntime at all.
     hiddenimports += [
         'onnx_asr',
+        'onnxruntime',
+        'onnxruntime.capi',
     ]
 
 # Collect submodules — parakeet-mlx + mlx + huggingface_hub all have
@@ -151,13 +152,13 @@ else:
 hiddenimports += collect_submodules('pydantic')
 hiddenimports += collect_submodules('numpy')
 hiddenimports += collect_submodules('huggingface_hub')
-hiddenimports += collect_submodules('onnxruntime')
 
 if _IS_DARWIN:
     hiddenimports += collect_submodules('parakeet_mlx')
     hiddenimports += collect_submodules('mlx')
 else:
     hiddenimports += collect_submodules('onnx_asr')
+    hiddenimports += collect_submodules('onnxruntime')
 
 # Collect data files
 datas = []
@@ -173,11 +174,11 @@ datas += [('scripts', 'scripts')]
 # Collect data files (tokenizers, configs). parakeet-mlx ships tokenizer
 # JSON resources that get loaded by path; onnx-asr ships built-in model
 # alias configs the same way.
-_DATA_PKGS = ['huggingface_hub', 'pywhispercpp', 'onnxruntime']
+_DATA_PKGS = ['huggingface_hub', 'pywhispercpp']
 if _IS_DARWIN:
     _DATA_PKGS += ['parakeet_mlx', 'mlx']
 else:
-    _DATA_PKGS += ['onnx_asr']
+    _DATA_PKGS += ['onnx_asr', 'onnxruntime']
 for pkg in _DATA_PKGS:
     try:
         datas += collect_data_files(pkg)
@@ -217,33 +218,34 @@ for pkg in _METADATA_PKGS:
 # libwhisper.dylib via the same mechanism. onnxruntime ships its native
 # session DLLs on Windows; PyInstaller's hidden-import / collect-all
 # gotcha for onnxruntime is well-documented (microsoft/onnxruntime#25193)
-# so we always run collect_dynamic_libs on it.
+# so we always run collect_dynamic_libs on it off-darwin.
 binaries = []
-_DYLIB_PKGS = ['pywhispercpp', 'onnxruntime']
+_DYLIB_PKGS = ['pywhispercpp']
 if _IS_DARWIN:
     _DYLIB_PKGS += ['mlx', 'parakeet_mlx']
+else:
+    _DYLIB_PKGS += ['onnxruntime']
 for pkg in _DYLIB_PKGS:
     try:
         binaries += collect_dynamic_libs(pkg)
     except Exception:
         pass
 
-# Bundle Ollama binary and libraries.
+# Bundle Ollama binary and libraries. Linux keeps GPU backends, Windows prunes
+# them for installer limits, and macOS uses its separate Metal runner layout.
 # Walk bin/ recursively — Ollama for Windows ships its runner libs under
 # lib/ollama/ that must be preserved relative to ollama.exe.
 # Ollama's Windows bundle ships GPU runner libs under lib/ollama/. As of
-# v0.30.8 that's lib/ollama/{cuda_v12,cuda_v13,vulkan} (rocm is no longer
-# shipped). They're NVIDIA-/discrete-GPU-only and add multiple GB
+# v0.31.1 that's lib/ollama/{cuda_v12,cuda_v13,vulkan} (rocm is a separate
+# archive). They're NVIDIA-/discrete-GPU-only and add multiple GB
 # (each cuda_v*/ggml-cuda.dll is ~1.6 GB) — dead weight on the CPU-only path:
 # transcription is ONNX-CPU, and the bundled Ollama summarises on the CPU
 # runner (ggml-cpu-*.dll / ggml-base.dll, which we keep). Skipping them keeps
 # the Windows bundle small enough for the NSIS installer to build (makensis
 # can't mmap a multi-GB app .7z). GPU acceleration for NVIDIA users is a
-# tracked follow-up (separate build/pack). The substring markers match any
-# cuda_vNN dir; rocm is kept as a defensive marker in case a future Ollama
-# re-adds it. No-op on macOS — these dirs don't exist there (Metal is built
-# into the darwin binary + its mlx_metal_v3/ runner, which we keep).
-_OLLAMA_GPU_MARKERS = ('lib/ollama/cuda', 'lib/ollama/rocm', 'lib/ollama/vulkan')
+# tracked follow-up (separate build/pack). Linux must retain these libraries:
+# its standard Ollama archive uses them for GPU inference. macOS remains a
+# no-op because Metal is built into its binary + mlx_metal_v3/ runner.
 
 # On darwin, Ollama's runner tree is routed into a COLLECT-stage DATA TOC
 # (`ollama_datas`) instead of `Analysis.binaries`. This is load-bearing, not a
@@ -268,10 +270,8 @@ _OLLAMA_GPU_MARKERS = ('lib/ollama/cuda', 'lib/ollama/rocm', 'lib/ollama/vulkan'
 ollama_datas: list[tuple[str, str, str]] = []
 ollama_bin_dir = os.path.join(SPECPATH, 'bin')
 required_macos_sidecars: dict[str, Path | None] = {
-    'steno-diarize': require_macos_sidecar(
+    'steno-diarize': require_diarize_sidecar(
         Path(ollama_bin_dir) / 'steno-diarize',
-        name='speaker-diarization',
-        build_script='scripts/build-diarize-sidecar.sh',
         platform=sys.platform,
     ),
 }
@@ -287,16 +287,34 @@ else:
     # don't fail the bundle. The runtime (apple_speech_supported) will keep
     # the engine unavailable there, and Parakeet/Whisper remain the defaults.
     required_macos_sidecars['steno-transcribe'] = None
+if _IS_DARWIN and not (
+    os.path.isfile(os.path.join(ollama_bin_dir, 'steno-audio-encode'))
+    and os.access(os.path.join(ollama_bin_dir, 'steno-audio-encode'), os.X_OK)
+):
+    raise SystemExit('Build the native transfer helper with scripts/build-audio-helper.sh first.')
 if os.path.exists(ollama_bin_dir):
     for root, _dirs, files in os.walk(ollama_bin_dir):
         for filename in files:
             filepath = os.path.join(root, filename)
             rel = os.path.relpath(filepath, ollama_bin_dir)
             rel_fs = rel.replace(os.sep, '/').lower()
-            if any(marker in rel_fs for marker in _OLLAMA_GPU_MARKERS):
-                continue  # skip GPU runner libs (CUDA/ROCm/Vulkan)
+            if should_prune_ollama_gpu_path(rel_fs, platform=sys.platform):
+                continue  # Windows only: skip GPU runner libs
+            if _IS_DARWIN and rel_fs.startswith('mlx_metal_v4/'):
+                # Ollama ships two MLX runners: v3 (macOS 14+) and v4 (macOS
+                # 26.2+, Metal 4 shaders), preferring v4 when the OS allows.
+                # v3 runs every macOS we support (14.4+) and measured the same
+                # NVFP4 speed as v4 on an M3 Max (106 tok/s both), so v4's
+                # ~170 MB is left out. Revisit if M5-class GPUs show a real gap.
+                continue
             rel_dir = os.path.dirname(rel)
             base = os.path.basename(filename).lower()
+            if base == 'steno-transcribe' and not _REQUIRES_TRANSCRIBE_SIDECAR:
+                continue  # Never ship the macOS 26 helper in an older/non-macOS bundle.
+            if base == 'steno-audio-encode':
+                if _IS_DARWIN:
+                    binaries.append((filepath, '.'))
+                continue
             if base in ('ffmpeg', 'ffmpeg.exe'):
                 # Put ffmpeg at the root of the bundle for easy PATH access
                 binaries.append((filepath, '.'))
@@ -333,7 +351,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
+    # macOS runs Silero VAD in numpy; keep onnxruntime (~60 MB) out even if
+    # something imports it transitively.
+    excludes=(['onnxruntime', 'onnx_asr'] if _IS_DARWIN else []) + [
         # Exclude PyTorch and related heavy packages (not needed with whisper.cpp)
         'torch',
         'torchvision',
@@ -341,6 +361,14 @@ a = Analysis(
         'tensorflow',
         'keras',
         'transformers',
+        # parakeet-mlx's only librosa call (filters.mel) is served by the
+        # numpy shim in src/_mel.py; librosa would otherwise pull ~170 MB of
+        # numba/llvmlite/scipy/scikit-learn into the bundle.
+        'librosa',
+        'numba',
+        'llvmlite',
+        'scipy',
+        'sklearn',
         # Exclude other unnecessary packages
         'matplotlib',
         'PIL',
