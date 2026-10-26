@@ -1760,7 +1760,7 @@ def get_transcription_engine_cmd():
     config = get_config()
     print(json.dumps({
         "engine": config.get_transcription_engine(),
-        "valid_engines": list(config.VALID_TRANSCRIPTION_ENGINES),
+        "valid_engines": list(config.available_transcription_engines()),
     }))
 
 
@@ -1776,7 +1776,7 @@ def set_transcription_engine_cmd(engine: str):
         print(json.dumps({
             "success": False,
             "error": f"Invalid engine: {engine}",
-            "valid_engines": list(config.VALID_TRANSCRIPTION_ENGINES),
+            "valid_engines": list(config.available_transcription_engines()),
         }))
 
 

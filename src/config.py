@@ -2288,17 +2288,21 @@ class Config:
 
     def set_transcription_engine(self, engine: str) -> bool:
         """Persist a supported ASR engine for this platform."""
-        if (
-            engine not in self.VALID_TRANSCRIPTION_ENGINES
-            or (engine == "apple" and not apple_speech_supported())
-        ):
+        if engine not in self.available_transcription_engines():
             logger.error(
                 f"Invalid transcription engine for this platform: {engine}. "
-                f"Must be one of {self.VALID_TRANSCRIPTION_ENGINES}"
+                f"Must be one of {self.available_transcription_engines()}"
             )
             return False
         self._config["transcription_engine"] = engine
         return self._save()
+
+    @classmethod
+    def available_transcription_engines(cls) -> tuple[str, ...]:
+        """Engines selectable on this host, preserving the configured default."""
+        if apple_speech_supported():
+            return cls.VALID_TRANSCRIPTION_ENGINES
+        return tuple(engine for engine in cls.VALID_TRANSCRIPTION_ENGINES if engine != "apple")
 
     def get_diarization_engine(self) -> str:
         """Return the macOS speaker-diarization engine.

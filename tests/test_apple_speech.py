@@ -9,6 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from click.testing import CliRunner
+
+import simple_recorder
 from src import apple_speech
 from src.config import Config, apple_speech_supported
 from src.transcriber import WhisperTranscriber
@@ -48,6 +51,14 @@ class AppleSpeechResolverTests(unittest.TestCase):
             result = apple_speech.status("en")
         self.assertFalse(result["available"])
         self.assertFalse(result["supported"])
+        run.assert_not_called()
+
+    def test_unexpected_support_check_failure_is_not_reported_as_unavailable(self):
+        with patch("src.config.apple_speech_supported", side_effect=RuntimeError("broken gate")), patch(
+            "src.apple_speech.subprocess.run"
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "broken gate"):
+                apple_speech.status("en")
         run.assert_not_called()
 
     def test_macos_14_and_15_never_resolve_or_spawn_the_sidecar(self):
@@ -111,6 +122,17 @@ class AppleSpeechResolverTests(unittest.TestCase):
         ), patch("src.apple_speech.subprocess.run", return_value=completed):
             with self.assertRaisesRegex(RuntimeError, "unsupported locale"):
                 apple_speech.prepare("xx")
+
+    def test_unstructured_sidecar_error_reports_exit_without_stderr(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=86, stdout="", stderr="private/audio/path.wav"
+        )
+        with patch("src.apple_speech._is_supported", return_value=True), patch(
+            "src.apple_speech.resolve_sidecar", return_value="/sidecar"
+        ), patch("src.apple_speech.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "sidecar exit 86") as raised:
+                apple_speech.prepare("en")
+        self.assertNotIn("private/audio/path.wav", str(raised.exception))
 
     def test_transcribe_file_normalizes_json_contract(self):
         payload = {
@@ -205,6 +227,12 @@ class AppleSpeechConfigTests(unittest.TestCase):
                     expected,
                 )
 
+        namespace = {"sys": SimpleNamespace(platform="darwin")}
+        with patch("platform.mac_ver", return_value=("unknown", ("", "", ""), "arm64")):
+            with self.assertRaisesRegex(RuntimeError, "Cannot determine macOS version"):
+                exec(compile(ast.Module(body=[helper], type_ignores=[]), "stenoai.spec", "exec"), namespace)
+                namespace["_macos_is_26_or_newer"]()
+
     def test_backend_foundation_preserves_existing_parakeet_default(self):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "src.config.apple_speech_supported", return_value=True
@@ -227,6 +255,28 @@ class AppleSpeechConfigTests(unittest.TestCase):
         ):
             config = Config(Path(tmp) / "config.json")
             self.assertFalse(config.set_transcription_engine("apple"))
+            self.assertNotIn("apple", config.available_transcription_engines())
+
+    def test_available_engine_list_includes_apple_only_on_supported_host(self):
+        with patch("src.config.apple_speech_supported", return_value=True):
+            self.assertIn("apple", Config.available_transcription_engines())
+        with patch("src.config.apple_speech_supported", return_value=False):
+            self.assertNotIn("apple", Config.available_transcription_engines())
+
+    def test_cli_advertises_only_available_engines(self):
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "src.config.apple_speech_supported", return_value=False
+        ):
+            config = Config(Path(tmp) / "config.json")
+            with patch("src.config.get_config", return_value=config):
+                get_result = CliRunner().invoke(simple_recorder.get_transcription_engine_cmd)
+                set_result = CliRunner().invoke(
+                    simple_recorder.set_transcription_engine_cmd, ["apple"]
+                )
+            self.assertEqual(get_result.exit_code, 0)
+            self.assertEqual(set_result.exit_code, 0)
+            self.assertNotIn("apple", json.loads(get_result.output)["valid_engines"])
+            self.assertNotIn("apple", json.loads(set_result.output)["valid_engines"])
 
     def test_explicit_apple_choice_reads_as_parakeet_on_older_mac(self):
         with tempfile.TemporaryDirectory() as tmp:
